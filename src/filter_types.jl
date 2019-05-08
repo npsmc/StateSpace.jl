@@ -1,79 +1,109 @@
-abstract AbstractStateSpaceFilter
+abstract type AbstractStateSpaceFilter end
 
-abstract AbstractKalmanFilter <: AbstractStateSpaceFilter
-abstract LinearKalmanFilter <: AbstractKalmanFilter
-abstract NonlinearKalmanFilter <: AbstractKalmanFilter
-abstract NonlinearFilter <: AbstractStateSpaceFilter
+abstract type AbstractKalmanFilter <: AbstractStateSpaceFilter end
+abstract type LinearKalmanFilter <: AbstractKalmanFilter end
+abstract type NonlinearKalmanFilter <: AbstractKalmanFilter end
+abstract type NonlinearFilter <: AbstractStateSpaceFilter end
 
-# LinearGaussianSSM 	LinearKalmanFilter
+# LinearGaussianSSM     LinearKalmanFilter
 #
-# NonlinearGaussianSSM	NonlinearKalmanFilter
-# 						NonlinearFilter
+# NonlinearGaussianSSM    NonlinearKalmanFilter
+#                         NonlinearFilter
 #
-# NonlinearSSM 			NonlinearFilter
+# NonlinearSSM             NonlinearFilter
 
 ######################################################################
 # Kalman filter
 ######################################################################
 
-type KalmanFilter <: LinearKalmanFilter end
-typealias KF KalmanFilter
+struct KalmanFilter <: LinearKalmanFilter end
+const  KF = KalmanFilter
 
 ## methods
 
 # basic Kalman update, once we have the predicted state, an observation,
 # and the observation matrix/covariance.
 function update_kalman(pred, y, G, W)
+
     innovation = y - G * mean(pred)
     innovation_cov = G * cov(pred) * G' + W
     K = cov(pred) * G' * inv(innovation_cov)
     mean_update = mean(pred) + K * innovation
     cov_update = (eye(cov(pred)) - K * G) * cov(pred)
+
     return MvNormal(mean_update, cov_update)
+
 end
 
-function update(m::LinearGaussianSSM, pred::AbstractMvNormal, y::Vector,
-		filter::KalmanFilter=KalmanFilter(), t::Real=0.0)
-	return update_kalman(pred, y, m.G(t), m.W(t))
+function update( m      :: LinearGaussianSSM, 
+                 pred   :: AbstractMvNormal, 
+                 y      :: Vector,
+                 filter :: KalmanFilter, 
+                 t      :: Real = 0.0)
+
+    return update_kalman(pred, y, m.G(t), m.W(t))
+
 end
 
-function update(m::LinearGaussianSSM, pred::AbstractMvNormal, y::Vector, t::Real=0.0)
+function update( m    :: LinearGaussianSSM, 
+                 pred :: AbstractMvNormal, 
+                 y    :: Vector, 
+                 t    :: Real = 0.0)
+
     return update(m, pred, y, KalmanFilter(), t)
+
 end
 
-function update!(m::LinearGaussianSSM, fs::FilteredState, y::Vector;
-		u::Vector=zeros(m.nu), filter::KalmanFilter=KalmanFilter(), t::Real=0.0)
-	x_pred = predict(m, fs.state[end], u=u, t=t)
-	x_filt = update_kalman(x_pred, y, m.G(t), m.W(t))
-	push!(fs.state, x_filt)
-	fs.observations = [fs.observations y]
+function update!( m      :: LinearGaussianSSM, 
+                  fs     :: FilteredState, 
+                  y      :: Vector;
+                  u      :: Vector = zeros(m.nu), 
+                  filter :: KalmanFilter=KalmanFilter(), 
+                  t      :: Real=0.0)
+
+    x_pred = predict(m, fs.state[end], u=u, t=t)
+    x_filt = update_kalman(x_pred, y, m.G(t), m.W(t))
+    push!(fs.state, x_filt)
+    fs.observations = [fs.observations y]
+
 end
 
 
 ######################################################################
 # Extended Kalman filter
 ######################################################################
-type ExtendedKalmanFilter <: NonlinearKalmanFilter end
-typealias EKF ExtendedKalmanFilter
+struct ExtendedKalmanFilter <: NonlinearKalmanFilter end
 
+const EKF = ExtendedKalmanFilter
 
 ## methods
 
-function update(m::NonlinearGaussianSSM, pred::AbstractMvNormal, y::Vector,
-		filter::NonlinearKalmanFilter=EKF(), t::Real=0.0)
+function update( m      :: NonlinearGaussianSSM, 
+                 pred   :: AbstractMvNormal, 
+                 y      :: Vector,
+                 filter :: NonlinearKalmanFilter=EKF(), 
+                 t      :: Real=0.0)
+
     G = observation_matrix(m, pred, t)
     W = m.W(t)
-	return update_kalman(pred, y, G, W)
+    return update_kalman(pred, y, G, W)
+
 end
 
-function update!(m::NonlinearGaussianSSM, fs::FilteredState, y::Vector;
-		u::Vector=zeros(m.nu), filter::NonlinearKalmanFilter=EKF(), t::Real=0.0)
-	x_pred = predict(m, fs.state[end], u=u, t=t-1)
+function update!( m      :: NonlinearGaussianSSM, 
+                  fs     :: FilteredState, 
+                  y      :: Vector;
+                  u      :: Vector = zeros(m.nu), 
+                  filter :: NonlinearKalmanFilter=EKF(), 
+                  t      :: Real = 0.0)
+
+    x_pred = predict(m, fs.state[end], u=u, t=t-1)
     G = observation_matrix(m, x_pred, t)
     W = m.W(t)
-	x_filt = update_kalman(x_pred, y, G, W)
-	push!(fs.state, x_filt)
-	fs.observations = [fs.observations y]
+    x_filt = update_kalman(x_pred, y, G, W)
+    push!(fs.state, x_filt)
+    fs.observations = [fs.observations y]
+
 end
 
 
@@ -81,14 +111,21 @@ end
 # Unscented Kalman filter
 ######################################################################
 
+struct UnscentedKalmanFilter{T<:Real} <: NonlinearKalmanFilter
 
-type UnscentedKalmanFilter{T<:Real} <: NonlinearKalmanFilter
-	α::T
-	β::T
-	κ::T
+    α :: T
+    β :: T
+    κ :: T
+
 end
-typealias UKF UnscentedKalmanFilter
-UnscentedKalmanFilter{T}(α::T=1e-3, β::T=2.0, κ::T=0.0) = UKF(α, β, κ)
+
+const UKF = UnscentedKalmanFilter
+
+function UnscentedKalmanFilter{T}(α::T=1e-3, β::T=2.0, κ::T=0.0) where T 
+
+    UKF(α, β, κ)
+
+end
 
 
 """
@@ -99,10 +136,10 @@ Data structure containing sigma points and their respective weights for the Unsc
 - `wm` : Vector containing the weights for the corresponding sigma vectors required to reconsruct the predicted mean.
 - `wc` : Vector containing the weights for the corresponding sigma vectors required to reconsruct the predicted covariance.
 """
-type SigmaPoints{T<:Real}
-    χ::Matrix{T}
-    wm::Vector{T}
-    wc::Vector{T}
+struct SigmaPoints{T<:Real}
+    χ  :: Matrix{T}
+    wm :: Vector{T}
+    wc :: Vector{T}
 end
 
 """
@@ -121,14 +158,18 @@ Function to calculate the sigma points for the Unscented Transform
 - `state` : AbstractMvNormal type representing the current state estimate (mean vector with covariance matrix).
 - `filter` : UKFParameters type containing the α, β and κ parameters for the Unscented Kalman Filter.
 """
-function calcSigmaPoints{T}(state::AbstractMvNormal, α::T, β::T, κ::T)
-    x = mean(state)
-    p = cov(state)
-    L = length(x)
-    χ = zeros(L, 2L+1)
+function calcSigmaPoints( state :: AbstractMvNormal, 
+                          α     :: T, 
+                          β     :: T, 
+                          κ     :: T) where T
+
+    x  = mean(state)
+    p  = cov(state)
+    L  = length(x)
+    χ  = zeros(L, 2L+1)
     wm = zeros(2L+1)
     wc = zeros(2L+1)
-    λ = α^2 * (L+κ) - L
+    λ  = α^2 * (L+κ) - L
     χ[:,1] = x
     wm[1] = λ/(L+λ)
     wc[1] = wm[1] + (1 - α^2 + β)
@@ -141,7 +182,12 @@ function calcSigmaPoints{T}(state::AbstractMvNormal, α::T, β::T, κ::T)
     end
     return SigmaPoints(χ, wm, wc)
 end
-calcSigmaPoints(state::AbstractMvNormal, filter::UKF) = calcSigmaPoints(state, filter.α, filter.β, filter.κ)
+
+function calcSigmaPoints( state :: AbstractMvNormal, filter :: UKF) 
+
+    calcSigmaPoints(state, filter.α, filter.β, filter.κ)
+ 
+end
 
 """
 # timeUpdate
@@ -207,40 +253,49 @@ function update(m::AbstractGaussianSSM, x::AbstractMvNormal, sp::SigmaPoints, y:
     return innovate(m, x, yPred, P_xy, sp, y)
 end
 
-function filter{T}(m::AbstractGaussianSSM, y::Array{T}, x0::AbstractMvNormal,
-	filter::UKF=UKF())
+function filter( m      :: AbstractGaussianSSM, 
+                 y      :: Array{T}, 
+                 x0     :: AbstractMvNormal,
+                 filter :: UKF = UKF() ) where T
+
     x_filtered = Array(AbstractMvNormal, size(y, 2))
     loglik = 0.0
-	x_pred, sigma_points = predict(m, x0, filter)
-	x_filtered[1] = update(m, x_pred, sigma_points, y[:, 1])
-	for i in 2:size(y, 2)
-		x_pred, sigma_points = predict(m, x_filtered[i-1], filter)
-		# Check for missing values in observation
-		if any(isnan(y[:, i]))
+    x_pred, sigma_points = predict(m, x0, filter)
+    x_filtered[1] = update(m, x_pred, sigma_points, y[:, 1])
+    for i in 2:size(y, 2)
+        x_pred, sigma_points = predict(m, x_filtered[i-1], filter)
+        # Check for missing values in observation
+        if any(isnan(y[:, i]))
             x_filtered[i] = x_pred
         else
             x_filtered[i] = update(m, x_pred, sigma_points, y[:, i])
             loglik += logpdf(observe(m, x_filtered[i], calcSigmaPoints(x_filtered[i], filter.α, filter.β, filter.κ), y[:, 1])[1], y[:, 1])
         end
         loglik += logpdf(x_pred, mean(x_filtered[i]))
-	end
-	return FilteredState(y, x_filtered, loglik, false)
+    end
+    return FilteredState(y, x_filtered, loglik, false)
 end
 
 ######################################################################
 # Ensemble Kalman filter
 ######################################################################
 
+struct EnsembleKalmanFilter{I<:Integer} <: NonlinearFilter
 
-type EnsembleKalmanFilter{I<:Integer} <: NonlinearFilter
     nparticles::I
+
 end
-typealias EnKF EnsembleKalmanFilter
+
+const EnKF = EnsembleKalmanFilter
+
 EnsembleKalmanFilter() = EnsembleKalmanFilter(100)
 
+function predict( m        :: AbstractGaussianSSM, 
+                  ensemble :: Matrix, 
+                  filter   :: EnKF=EnKF();
+                  u        :: Vector=zeros(m.nu), 
+                  t        :: Real=0.0)
 
-function predict(m::AbstractGaussianSSM, ensemble::Matrix, filter::EnKF=EnKF();
-        u::Vector=zeros(m.nu), t::Real=0.0)
     ensemble_new = similar(ensemble)
     CI = control_input(m, u, t)
     for i in 1:size(ensemble, 2)
@@ -248,10 +303,15 @@ function predict(m::AbstractGaussianSSM, ensemble::Matrix, filter::EnKF=EnKF();
         ensemble_new[:, i] = F * ensemble[:, i] + CI
     end
     return ensemble_new
+
 end
 
-function update(m::AbstractGaussianSSM, ensemble::Matrix, y::Vector,
-        filt::EnKF=EnKF(), t::Real=0.0)
+function update( m        :: AbstractGaussianSSM, 
+                 ensemble :: Matrix, 
+                 y        :: Vector,
+                 filt     :: EnKF = EnKF(), 
+                 t        :: Real=0.0)
+
     P = cov(ensemble')
     ensemble_updated = similar(ensemble)
     for i in 1:filt.nparticles

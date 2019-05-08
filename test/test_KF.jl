@@ -1,14 +1,4 @@
-using StateSpace
-using Distributions
-using Base.Test
-
-println("Testing Kalman Filter...")
-
-function random_cov(n)
-	A = rand(n, n)
-	A = A + A'
-	return A + n * eye(n)
-end
+@testset "Testing Kalman Filter..." begin
 
 srand(0)
 

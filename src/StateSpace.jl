@@ -1,49 +1,47 @@
-module StateSpace
 using Distributions
 using ForwardDiff
-import Distributions: mean, var, cov, rand
+using Distributions
+using Statistics
+using LinearAlgebra
+using Random
 
-import Base: mean, filter, show
-import StatsBase: loglikelihood
+module StateSpace
 
+# model types
+export AbstractStateSpaceModel
+export AbstractSSM
+export AbstractGaussianSSM
+export LinearGaussianSSM
+export NonlinearGaussianSSM
+export NonlinearSSM
 
-export
-	# model types
-	AbstractStateSpaceModel,
-	AbstractSSM,
-	AbstractGaussianSSM,
-	LinearGaussianSSM,
-	NonlinearGaussianSSM,
-	NonlinearSSM,
-	# filter types
-	AbstractStateSpaceFilter,
-	AbstractKalmanFilter,
-	LinearKalmanFilter,
-	NonlinearKalmanFilter,
-	NonlinearFilter,
-	KalmanFilter,
-	KF,
-	ExtendedKalmanFilter,
-	EKF,
-	UnscentedKalmanFilter,
-	UKF,
-	EnsembleKalmanFilter,
-	EnKF,
-	ParticleFilter,
-
-
-	FilteredState,
-	show,
-	process_matrix,
-	observation_matrix,
-	predict,
-	observe,
-	update,
-	update!,
-	filter,
-	smooth,
-	loglikelihood,
-	simulate
+# filter types
+export AbstractStateSpaceFilter
+export AbstractKalmanFilter
+export LinearKalmanFilter
+export NonlinearKalmanFilter
+export NonlinearFilter
+export KalmanFilter
+export KF
+export ExtendedKalmanFilter
+export EKF
+export UnscentedKalmanFilter
+export UKF
+export EnsembleKalmanFilter
+export EnKF
+export ParticleFilter
+export FilteredState
+export show
+export process_matrix
+export observation_matrix
+export predict
+export observe
+export update
+export update!
+export filter
+export smooth
+export loglikelihood
+export simulate
 
 include("matrix_utils.jl")
 include("model_types.jl")
