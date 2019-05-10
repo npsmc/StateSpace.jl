@@ -34,6 +34,8 @@ function show(io::IO, fs::FilteredState{T}) where T
 end
 
 
+import Distributions:loglikelihood
+
 """
 Returns the log-likelihood of the FilteredState object.
 """

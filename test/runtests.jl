@@ -3,11 +3,12 @@ using Distributions
 using Test
 using Statistics
 using LinearAlgebra
+using Random
 
 function random_cov(n :: Int)
     A = rand(n, n)
     A = A + A'
-    A + n * eye(n)
+    A + n * Matrix(I,n,n)
 end
 
 include("test_dispatch.jl")

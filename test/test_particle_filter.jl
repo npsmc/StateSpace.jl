@@ -1,6 +1,9 @@
-println("Testing particle filter...")
+@testset "Testing particle filter..." begin
+
+using Random
+
 # Bearing-only tracking example from Gordon et al. 1993
-Phi = eye(4)
+Phi = Matrix(I, 4, 4)
 Phi[1, 2] = Phi[3, 4] = 1
 Gamma = [0.5 0; 1 0; 0 0.5; 0 1]
 q = 0.001
@@ -16,9 +19,9 @@ mod = NonlinearSSM(process, obs_loglik, 4, 1, 1)
 filt = ParticleFilter(4, 1000, () -> zeros(4))
 
 nt = 24
-srand(1234)
+Random.seed!(1234)
 xx = simulate(mod, nt, x0)
-yy = (bearing(xx) + randn(nt) * r)'
+yy = (bearing(xx) .+ randn(nt) * r)'
 
 # using PyPlot
 # subplot(111, aspect="equal")
@@ -26,7 +29,7 @@ yy = (bearing(xx) + randn(nt) * r)'
 # scatter(0, 0)
 
 
-x0_prior = MvNormal([0, 0, 0.4, -0.05], diagm([0.5, 0.005, 0.3, 0.01].^2))
+x0_prior = MvNormal([0, 0, 0.4, -0.05], Matrix(Diagonal([0.5, 0.005, 0.3, 0.01].^2)))
 ensemble_0 = rand(x0_prior, filt.nparticles)
 
 ensemble = predict(mod, ensemble_0)
@@ -45,5 +48,6 @@ fs = filter(mod, yy, ensemble_0, filt)
 fs_mean = mean(fs, 2)
 # plot(fs_mean[1,:]', fs_mean[3,:]')
 
+@test true
 
-println("Particle filter passed.")
+end

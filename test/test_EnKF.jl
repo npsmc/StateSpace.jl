@@ -1,6 +1,6 @@
-using StateSpace
+@testset "Testing Ensemble Kalman Filter..." begin
 
-println("Testing Ensemble Kalman Filter...")
+using StateSpace, LinearAlgebra
 
 # Define process model: Ricker growth model, with two populations
 r1 = 0.03 							# 10% intrinsic growth rate for pop 1
@@ -14,11 +14,11 @@ function f(x)
 	 x[2] .* exp(r2 * (1 - (x[2] ./ K2)))]
 end
 
-V = diagm([3000.0, 5000.0]) 		# covariance of (additive) process noise
+V = Matrix(Diagonal([3000.0, 5000.0])) 		# covariance of (additive) process noise
 
 # Define observation model
 g(x) = 0.01 .* x
-W = diagm([100.0, 250.0])
+W = Matrix(Diagonal([100.0, 250.0]))
 
 mod = NonlinearGaussianSSM(f, V, g, W)
 x0 = MvNormal([1000.0, 500.0], [100.0 0.0; 0.0 100.0])
@@ -37,12 +37,12 @@ yy[1, 50] = NaN
 filt = EnKF()
 fs = filter(mod, yy, x0, filt)
 fs_ensemble = filter(mod, yy, x0, filt, return_ensemble=true)
-@assert size(fs_ensemble) == (mod.nx, filt.nparticles, size(yy, 2))
+@test size(fs_ensemble) == (mod.nx, filt.nparticles, size(yy, 2))
 y_new = fs.observations[:, end] + randn(size(mod.V(1), 1)) / 10
 update!(mod, fs, y_new)
 
 ss = smooth(mod, fs)
-@assert loglikelihood(fs) < loglikelihood(ss)
+@test loglikelihood(fs) < loglikelihood(ss)
 
 
-println("Extended Kalman Filter passed.\n")
+end

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+ "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1"
+     width="45.0mm" height="25.0mm"
+     shape-rendering="crispEdges">
+<rect x="0.0mm" y="0.0mm"
+      width="14.0mm" height="25.0mm"
+      fill="#00BFFF" stroke="none" />
+<rect x="15.0mm" y="0.0mm"
+      width="14.0mm" height="25.0mm"
+      fill="#D4CA3A" stroke="none" />
+<rect x="30.0mm" y="0.0mm"
+      width="14.0mm" height="25.0mm"
+      fill="#FF5EA0" stroke="none" />
+</svg>

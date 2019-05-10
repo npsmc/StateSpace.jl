@@ -1,10 +1,13 @@
-println("Testing Unscented Kalman Filter...")
+@testset "Testing Unscented Kalman Filter..." begin
+
+using LinearAlgebra
+using Random
 
 Δt = 0.1 # Set the time step
 
 #Set the process function
 function processFunction(x::Vector, Δt::Float64=0.1, μ::Float64=0.3)
-    x1 = zeros(x)
+    x1 = zero(x)
     x1[1] = x[1] + Δt * -x[2]
     x1[2] = x[2] + Δt * (-μ * (1 - x[1]^2) * x[2] + x[1])
     x1
@@ -14,11 +17,10 @@ end
 observationFunction(x::Vector) = x
 
 #Set process noise covariance matrix
-processCovariance = 1e-2*[0.1 0;
-    0 1e-3]
+processCovariance = 1e-2*[0.1 0; 0 1e-3]
 
 #Set the observation noise covariance
-observationCovariance = 1e-1*eye(2)
+observationCovariance = 1e-1 * Matrix(I,2,2)
 
 #Create additive noise UKF model
 ukfStateModel = NonlinearGaussianSSM(processFunction, processCovariance,
@@ -50,7 +52,7 @@ end
 ################################################################################
 #Section: Set guess of initial state
 #-------------------------------------------------------------------------------
-initial_guess = MvNormal([0.0,5.0], 5.0*eye(2))
+initial_guess = MvNormal([0.0,5.0], 5.0 * Matrix(I, 2, 2))
 #End Section: Set guess of initial state
 ################################################################################
 
@@ -62,5 +64,7 @@ filtered_state = filter(ukfStateModel, noisyObs, initial_guess)
 #End Section: Execute the Additive noise Unscented Kalman Filter
 ################################################################################
 
+@test true
 
-println("Unscented Kalman Filter passed.\n")
+
+end

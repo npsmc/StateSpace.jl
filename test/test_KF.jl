@@ -1,37 +1,38 @@
 @testset "Testing Kalman Filter..." begin
 
-srand(0)
+using LinearAlgebra, Statistics, Plots
 
-F = diagm(ones(4)) * 0.9
+Random.seed!(0)
+
+F = Matrix(I,4,4) * 0.9
 V = random_cov(4)
 G = [1.0 0.0 0.5 0.1;
 	 0.0 0.5 1.0 1.0]
 W = random_cov(2)
 
 m = LinearGaussianSSM(F, V, G, W)
-x0 = MvNormal(randn(4), diagm(ones(4) * 100.0))
+x0 = MvNormal(randn(4), Matrix(I,4,4) .* 100.0)
 
 x1 = predict(m, x0)
-# println(mean(x1))
+println(mean(x1))
 
 y1 = m.G(1) * mean(x1) + randn(2) / 10
 u1 = update(m, x1, y1)
-# println(mean(u1))
+println(mean(u1))
 
 xx, yy = simulate(m, 100, x0)
 yy[1, 50] = NaN  # throw in a missing value
 
-# using PyPlot
-# plot(xx', "k")
-# plot(yy', "r")
-# readline()
+plot(xx')
+savefig("xx.png")
+plot(yy')
+savefig("yy.png")
 
 fs = filter(m, yy, x0)
-# print(fs)
+ print(fs)
 
 # plot(xx', "k")
 # plot(mean(fs)', "r")
-# readline()
 
 y_new = fs.observations[:, end] + randn(2) / 10
 update!(m, fs, y_new)
@@ -39,7 +40,7 @@ update!(m, fs, y_new)
 ss = smooth(m, fs)
 
 
-@assert loglikelihood(fs) < loglikelihood(ss)
+@test loglikelihood(fs) < loglikelihood(ss)
 
 
-println("Kalman Filter passed.\n")
+end

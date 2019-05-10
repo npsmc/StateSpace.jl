@@ -1,17 +1,24 @@
-language: cpp
-compiler:
-  - clang
+language: julia
+
+os: 
+  - osx
+  - linux
+
+julia: 1.1
+
 notifications:
-  email: false
-env:
-  matrix:
-    - JULIAVERSION="juliareleases"
-    - JULIAVERSION="julianightlies"
-before_install:
-  - sudo add-apt-repository ppa:staticfloat/julia-deps -y
-  - sudo add-apt-repository ppa:staticfloat/${JULIAVERSION} -y
-  - sudo apt-get update -qq -y
-  - sudo apt-get install libpcre3-dev julia -y
-  - if [[ -a .git/shallow ]]; then git fetch --unshallow; fi
-script:
-  - julia -e 'Pkg.init(); Pkg.clone(pwd()); Pkg.test("StateSpace")'
+  email: true
+
+after_success:
+  - julia -e 'using Pkg; cd(Pkg.dir("StateSpace")); Pkg.add("Coverage"); using Coverage; Codecov.submit(Codecov.process_folder())';
+
+jobs:
+  include:
+    - stage: "Documentation"
+      julia: 1.0
+      os: linux
+      script:
+        - julia --project=docs/ -e 'include("deps/build.jl"); Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+        - julia --project=docs/ docs/make.jl
+      name: "HTML"
+      after_success: skip

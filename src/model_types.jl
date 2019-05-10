@@ -1,3 +1,5 @@
+using ForwardDiff
+
 import Distributions: AbstractMvNormal
 
 abstract type AbstractStateSpaceModel end
@@ -18,7 +20,7 @@ abstract type AbstractGaussianSSM <: AbstractStateSpaceModel end
 # Linear Gaussian 
 ###########################################################################
 
-struct LinearGaussianSSM{T <: Any} <: AbstractGaussianSSM
+struct LinearGaussianSSM <: AbstractGaussianSSM
     # Process transition matrix, control matrix, and noise covariance
     F :: Function
     B :: Function
@@ -37,37 +39,47 @@ struct LinearGaussianSSM{T <: Any} <: AbstractGaussianSSM
                                 B :: Function, 
                                 V :: Function,
                                 G :: Function, 
-                                W :: Function ) where T
+                                W :: Function ) 
 
         @assert ispossemidef(V(1))
         @assert ispossemidef(W(1))
 
         nx, ny, nu = confirm_matrix_sizes(F(1), B(1), V(1), G(1), W(1))
-        new{T}(F, B, V, G, W, nx, ny, nu)
+        new(F, B, V, G, W, nx, ny, nu)
 
     end
 
     ## Time-dependent constructor
-    function LinearGaussianSSM{T}( F :: Function, 
-                                   V :: Function, 
-                                   G :: Function, 
-                                   W :: Function,
-                                   B :: Function = _ -> begin 
-                                      zeros(T, (size(V(1), 1), 1)) where T 
-                                   end ) where T
+    function LinearGaussianSSM( F :: Function, 
+                                V :: Function, 
+                                G :: Function, 
+                                W :: Function ) 
     
-        LinearGaussianSSM{T}(F, B, V, G, W)
+        B = _ -> begin zeros(T, (size(V(1), 1), 1)) end where T
+
+        LinearGaussianSSM(F, B, V, G, W)
     
     end
     
     # Time-independent constructor
-    function LinearGaussianSSM{T}( F :: Matrix{T}, 
-                                   V :: Matrix{T}, 
-                                   G :: Matrix{T}, 
-                                   W :: Matrix{T};
-                                   B :: Matrix{T} = zeros(T, size(F, 1), 1)) where T
+    function LinearGaussianSSM( F :: Matrix{T}, 
+                                V :: Matrix{T}, 
+                                G :: Matrix{T}, 
+                                W :: Matrix{T}) where T
+
+        B = zeros(T, size(F, 1), 1)
     
-        LinearGaussianSSM{T}(_->F, _->B, _->V, _->G, _->W)
+        LinearGaussianSSM(_->F, _->B, _->V, _->G, _->W)
+    
+    end
+
+    function LinearGaussianSSM( F :: Matrix{T}, 
+                                V :: Matrix{T}, 
+                                G :: Matrix{T}, 
+                                W :: Matrix{T},
+                                B :: Matrix{T}) where T
+
+        LinearGaussianSSM(_->F, _->B, _->V, _->G, _->W)
     
     end
 
@@ -105,7 +117,7 @@ control_input(m::LinearGaussianSSM, u, t::Real=0.0) = m.B(t) * u
 # Nonlinear Gaussian 
 ###########################################################################
 
-struct NonlinearGaussianSSM{T <: Any} <: AbstractGaussianSSM
+struct NonlinearGaussianSSM <: AbstractGaussianSSM
     # Process transition function, jacobian, and noise covariance matrix
     f :: Function
     V :: Function
@@ -128,29 +140,31 @@ struct NonlinearGaussianSSM{T <: Any} <: AbstractGaussianSSM
                                    W  :: Function, 
                                    nx :: Int, 
                                    ny :: Int, 
-                                   nu :: Int) where T
+                                   nu :: Int) 
 
         @assert ispossemidef(V(1))
         @assert ispossemidef(W(1))
         @assert (nx, nx) == size(V(1))
         @assert (ny, ny) == size(W(1))
 
-        new{T}(f, V, b, g, W, nx, ny, nu)
+        new(f, V, b, g, W, nx, ny, nu)
 
     end
 
-end
 
-function NonlinearGaussianSSM{T}( f  :: Function, 
-                                  V  :: Matrix{T}, 
-                                  g  :: Function,
-                                  W  :: Matrix{T}; 
-                                  b  :: Function= begin _ -> 0 end, 
-                                  nu :: Int=0) where T
-    nx = size(V, 1)
-    ny = size(W, 1)
+    function NonlinearGaussianSSM( f  :: Function, 
+                                   V  :: Matrix{T}, 
+                                   g  :: Function,
+                                   W  :: Matrix{T}; 
+                                   nu :: Int=0) where T
 
-    return NonlinearGaussianSSM{T}(f, _-> V, b, g, _-> W, nx, ny, nu)
+        b  = _ -> 0
+        nx = size(V, 1)
+        ny = size(W, 1)
+    
+        new(f, _-> V, b, g, _-> W, nx, ny, nu)
+    
+    end
 
 end
 

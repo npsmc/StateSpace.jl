@@ -1,3 +1,5 @@
+import Distributions.MvNormal
+
 """
 Forecast the state of the process at the next time step.
 
@@ -12,12 +14,12 @@ Forecast the state of the process at the next time step.
 """
 function predict( m :: AbstractGaussianSSM, 
                   x :: AbstractMvNormal;
-          u :: Vector = zeros(m.nu), 
+                  u :: Vector = zeros(m.nu), 
                   t :: Real = 0.0)
 
     F  = process_matrix(m, x, t)
     CI = control_input(m, u, t)
-    return MvNormal(F * mean(x) + CI, F * cov(x) * F' + m.V(t))
+    return MvNormal(F * mean(x) .+ CI, F * cov(x) * F' + m.V(t))
 end
 
 
@@ -39,12 +41,12 @@ function observe(m::AbstractGaussianSSM, x::AbstractMvNormal, t::Real=0.0)
     return MvNormal(G * mean(x), G * cov(x) * G' + m.W(t))
 end
 
-function _filter{T}(m      :: AbstractGaussianSSM, 
-                    y      :: Array{T}, 
-                    x0     :: AbstractMvNormal,
-            u      :: Array{T}, 
-                    times  :: Vector{T}, 
-                    filter :: AbstractKalmanFilter)
+function _filter(m      :: AbstractGaussianSSM, 
+                 y      :: Array{T}, 
+                 x0     :: AbstractMvNormal,
+                 u      :: Array{T}, 
+                 times  :: Vector{T}, 
+                 filter :: AbstractKalmanFilter) where T
 
     x_filtered = Array(AbstractMvNormal, size(y, 2))
     loglik = 0.0
@@ -95,23 +97,23 @@ This function only does forward-pass filtering--that is, the state estimate at t
 t incorporates data from 1:t, but not from t+1:T.  For full forward-and-backward
 filtering, run `smooth` on the FilteredState produced by this function.
 """
-function filter{T}( m      :: LinearGaussianSSM, 
-                    y      :: Array{T}, 
-                    x0     :: AbstractMvNormal;
-            filter :: LinearKalmanFilter=KF(), 
-                    u      :: Matrix{T}=zeros(m.nu, size(y, 2)),
-            times  :: Vector{T}=zeros(size(y, 2)))
+function filter( m      :: LinearGaussianSSM, 
+                 y      :: Array{T}, 
+                 x0     :: AbstractMvNormal;
+                 filter :: LinearKalmanFilter=KF(), 
+                 u      :: Matrix{T}=zeros(m.nu, size(y, 2)),
+                 times  :: Vector{T}=zeros(size(y, 2))) where T
 
     return _filter(m, y, x0, u, times, filter)
 
 end
 
-function filter{T}( m      :: NonlinearGaussianSSM, 
-                    y      :: Array{T}, 
-                    x0     :: AbstractMvNormal;
-            filter :: NonlinearKalmanFilter=EKF(), 
-                    u      :: Matrix{T}=zeros(m.nu, size(y, 2)),
-            times  :: Vector{T}=zeros(size(y, 2)))
+function filter( m      :: NonlinearGaussianSSM, 
+                 y      :: Array{T}, 
+                 x0     :: AbstractMvNormal;
+                 filter :: NonlinearKalmanFilter=EKF(), 
+                 u      :: Matrix{T}=zeros(m.nu, size(y, 2)),
+                 times  :: Vector{T}=zeros(size(y, 2))) where T
 
     return _filter(m, y, x0, u, times, filter)
 
@@ -128,8 +130,8 @@ set, and initial state estimate, in which case it does the forward and backward
 passes at once.
 
 """
-function _smooth{T}( m  :: AbstractGaussianSSM, 
-                     fs :: FilteredState{T})
+function _smooth( m  :: AbstractGaussianSSM, 
+                  fs :: FilteredState{T}) where T
 
     n = size(fs.observations, 2)
     smooth_dist = Array(AbstractMvNormal, n)
@@ -158,22 +160,34 @@ function _smooth{T}( m  :: AbstractGaussianSSM,
 end
 
 
-function smooth{T}(m::AbstractGaussianSSM, fs::FilteredState{T})
+function smooth(m::AbstractGaussianSSM, fs::FilteredState{T}) where T
     return _smooth(m, fs)
 end
 
 ## Linear Gaussian method
-function smooth{T}(m::LinearGaussianSSM, y::Array{T}, x0::AbstractMvNormal;
-        u::Matrix{T}=zeros(m.nu, size(y, 2)), filter::LinearKalmanFilter=KF())
+function smooth( m      :: LinearGaussianSSM, 
+                 y      :: Array{T}, 
+                 x0     :: AbstractMvNormal;
+                 u      :: Matrix{T}=zeros(m.nu, size(y, 2)), 
+                 filter :: LinearKalmanFilter=KF()) where T
+
     fs = filter(m, y, x0, u=u, filter=filter)
+
     return _smooth(m, fs)
+
 end
 
 ## Nonlinear Gaussian method
-function smooth{T}(m::NonlinearGaussianSSM, y::Array{T}, x0::AbstractMvNormal;
-        u::Matrix{T}=zeros(m.nu, size(y, 2)), filter::NonlinearKalmanFilter=EKF())
+function smooth( m  :: NonlinearGaussianSSM, 
+                 y  :: Array{T}, 
+                 x0 :: AbstractMvNormal;
+                 u  :: Matrix{T} = zeros(m.nu, size(y, 2)), 
+                 filter::NonlinearKalmanFilter=EKF())  where T
+
     fs = filter(m, y, x0, u=u, filter=filter)
+
     return _smooth(m, fs)
+
 end
 
 

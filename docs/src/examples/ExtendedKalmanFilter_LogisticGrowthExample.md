@@ -1,0 +1,7608 @@
+
+#Extended Kalman Filter Example
+
+###Introduction
+
+This notebook is designed to demonstrate how to use the StateSpace.jl package to execute the Extended Kalman filter for a non-linear State Space model. The example that has been used here closely follows Markus Gesmann's
+Mages' blog titled [Extended Kalman filter example in R](http://www.magesblog.com/2015/01/extended-kalman-filter-example-in-r.html) which in turn
+was based on a blog post titled [Fun with (Extended Kalman) Filters](https://idontgetoutmuch.wordpress.com/2014/09/09/fun-with-extended-kalman-filters-4/)
+by Dominic Steinitz.
+
+For those of you that do not need/want the explanation of the model and the code, you can skip right to the end of this notebook where the entire section of code required to run this example is given.
+
+###The Problem
+The problem that we will consider here is that of predicting the true value of a population (say of bacteria, but it could be anything) from some noisy measurements of the population. We also would like to predict the growth rate of the population, however we are faced with the problem that we do not observe the growth rate
+
+#####Process  Model
+It is assumed that the population evolves according to the logistic growth model. This is written mathematically as an ordinary differential equation:
+
+$$\frac{\mathrm{d}p}{\mathrm{d}t} = rp\left(1 - \frac{p}{k} \right),$$
+
+where $p$ is the population number, $t$ is the time, and $k$ is the carrying capacity.   
+The solution to the above differetial equation is given by
+
+$$p(t) = \frac{kp_0\exp(rt)}{k+p_0[\exp(rt) - 1]},$$
+
+where $p_0$ is the initial population.   
+This is almost in the form that we need. The only problem is that it needs to be formulated in a discrete manner whereby the population at the current time, $p_n$, is written in terms of the population and growth rate at the previous state, $p_{n-1}$ and $r_{n-1}$ respectively. This can be done like so:
+
+$$p_n = \frac{kp_{n-1}\exp(r_{n-1}\Delta t)}{k+p_{n-1}[\exp(r_{n-1}\Delta t) - 1]},$$
+
+where $\Delta t$ is the change in time from one measurement of the population to the next. This is our transistion (process) equation for the population.   
+
+As mentioned previously, we also want to know the growth rate, and hence it is both the population number and the growth rate value together that define the state of our system. Hence we need to also define how the growth rate evolves. Here we will simply assume that the growth rate stays constant. Hence the transition equation for the growth rate will be written as:
+
+$$r_n = r_{n-1}.$$
+
+We will assume that these processes experience some noise. This will be in the form of zero mean Gaussian noise. We'll set the variance at 0.001 for both of these processes and hence we can write the full process equations as:
+
+$$p_n = \frac{kp_{n-1}\exp(r_{n-1}\Delta t)}{k+p_{n-1}[\exp(r_{n-1}\Delta t) - 1]} + V_n \qquad V_n \sim \mathcal{N}(0, 0.001)$$
+
+$$r_n = r_{t-n} + W_n \qquad W_n \sim \mathcal{N}(0, 0.001)$$
+
+#####Observation Model
+We assume that we observe the population directly but there is some zero mean Gaussian noise with variance = 25. Hence our observation model is:
+
+$$y_n = p_n + Q_n \qquad Q_n \sim \mathcal{N}(0, 25),$$
+
+where $y_n$ is the observation at the current time step.   
+
+We do not observe the growth rate :(.
+
+###Setting up the problem
+First we'll import the required modules
+
+
+```julia
+using StateSpace
+using Distributions
+using Gadfly
+using DataFrames
+using Colors
+```
+
+#####Generate noisy observations
+First thing we'll do is create the logistic function required to describe the evolution of the population
+
+
+```julia
+function logisticGrowth(r, p, k, t)
+    k * p * exp(r*t) / (k + p * (exp(r*t) - 1))
+end
+logisticGrowth(state) = logisticGrowth(state[1], state[2], k, Δt)
+```
+
+
+
+
+    logisticGrowth (generic function with 2 methods)
+
+
+
+The second definition of the logistic function will come in useful when we are defining the process function.
+
+Let's set the values of the parameters that we're going to use for the logistic function
+
+
+```julia
+r = 0.2
+k = 100.0
+p0 = 0.1 * k
+Δt = 0.1
+```
+
+
+
+
+    0.1
+
+
+
+Now we'll set the variance of the observations (measurement noise)
+
+
+```julia
+measurement_noise_variance = 25.0
+```
+
+
+
+
+    25.0
+
+
+
+We can now define the number of observations and generate the true and observed population values. 
+
+
+```julia
+numObs = 100
+true_values = Vector{Float64}(numObs)
+population_measurements = Vector{Float64}(numObs)
+for i in 1:numObs
+    true_values[i] = logisticGrowth(r, p0, k, i*Δt)
+    population_measurements[i] = true_values[i] + randn() * sqrt(measurement_noise_variance)
+end
+```
+
+We don't observe the growth rate so we'll set these values to zero
+
+
+
+```julia
+growth_rate_measurements = zeros(numObs);
+```
+
+Finally we need to concatenate both population and growth rate arrays and ensure that have the correct dimensions
+
+
+```julia
+measurements = [growth_rate_measurements population_measurements]'
+```
+
+
+
+
+    2x100 Array{Float64,2}:
+     0.0       0.0      0.0     0.0     …   0.0      0.0      0.0      0.0   
+     6.49186  13.6619  17.757  13.3812     41.9066  50.2168  54.3545  42.2444
+
+
+
+#####Define Kalman Filter Parameters
+We now need to define the process and observation model according to the model described earlier.
+
+
+```julia
+function process_fcn(state)
+    predict_growth_rate = state[1]
+    predict_population = logisticGrowth(state[1], state[2], k, Δt)
+    new_state = [predict_growth_rate, predict_population]
+    return new_state
+end
+process_noise_mat = diagm([0.001, 0.001])
+
+function observation_fcn(state)
+    growth_rate_observation = 0.0
+    population_observation = 1.0 * state[2]
+    observation = [growth_rate_observation, population_observation]
+    return observation
+end
+observation_noise_mat = diagm([1.0, measurement_noise_variance])
+```
+
+
+
+
+    2x2 Array{Float64,2}:
+     1.0   0.0
+     0.0  25.0
+
+
+
+some couple of things to note about the above code:   
+-The process of the growth and population are assumed uncorrelated, hence the off **diagonal terms are zero**. This is why the process noise matrix (and the observation noise matrix) are created as diagonal matrices.   
+-Although the growth rate is not observed, we've still given the observation noise for the growth rate a **non-zero** value. It could be any non-zero value, I've just picked 1.0 (It shouldn't change the overall results). The problem with setting this value to zero is that you end up getting a singularity and hence the matrix algebra doesn't work and it will crash. So it must be a non zero value.   
+
+We can now create an instance of the Nonlinear State Space Model
+
+
+```julia
+nonLinSSM = NonlinearGaussianSSM(process_fcn, process_noise_mat, observation_fcn, observation_noise_mat)
+```
+
+
+
+
+    StateSpace.NonlinearGaussianSSM{Float64}(process_fcn,j,2x2 Array{Float64,2}:
+     0.001  0.0  
+     0.0    0.001,observation_fcn,j,2x2 Array{Float64,2}:
+     1.0   0.0
+     0.0  25.0)
+
+
+
+#####Initial Guess
+Now we can create an initial guess for the growth rate and the initial population along with the corresponding covariance matrix. 
+
+
+```julia
+initial_guess = MvNormal([0.5, 10], diagm([1.0,20.0]))
+```
+
+
+
+
+    FullNormal(
+    dim: 2
+    μ: [0.5,10.0]
+    Σ: 2x2 Array{Float64,2}:
+     1.0   0.0
+     0.0  20.0
+    )
+
+
+
+
+#####Perform Extended Kalman Filter Algorithm
+Now we have all of the parameters:
+1. noisy observations
+2. process (transition) and observation (emission) model paramaters
+3. initial guess of state   
+
+We can use the Kalman Filter to predict the true underlying state (growth rate and population).
+
+
+```julia
+filtered_state = filter(nonLinSSM, measurements, initial_guess)
+```
+
+    SmoothedState{Float64}
+
+
+
+
+    
+
+
+
+    
+    100 estimates of 2-D process from 2-D observations
+    Log-likelihood: -441.11333508162375
+
+
+###Plot the results
+Now we will plot the results. First we will look at the population estimates
+
+First we extract the filtered population values along with their corresponding $2\sigma$ values (the give the area that we would expect the true value to lie with 95% confidence)
+
+
+```julia
+x_data = 1:numObs
+population_array = Vector{Float64}(numObs+1)
+confidence_array = Vector{Float64}(numObs+1)
+population_array[1] = initial_guess.μ[2]
+confidence_array[1] = 2*sqrt(initial_guess.Σ.mat[2,2])
+for i in x_data
+    current_state = filtered_state.state[i]
+    population_array[i+1] = current_state.μ[2]
+    confidence_array[i+1] = 2*sqrt(current_state.Σ.mat[2,2])
+end
+```
+
+Next we will create a dataframe. This is simply so the syntax is simple for plotting the ribbon digram which will represent the state along with the confidence interval
+
+
+```julia
+df_fs = DataFrame(
+    x = [0;x_data],
+    y = population_array,
+    ymin = population_array - confidence_array,
+    ymax = population_array + confidence_array,
+    f = "Filtered values"
+    )
+```
+
+
+
+
+<table class="data-frame"><tr><th></th><th>x</th><th>y</th><th>ymin</th><th>ymax</th><th>f</th></tr><tr><th>1</th><td>0</td><td>10.0</td><td>1.0557280900008408</td><td>18.94427190999916</td><td>Filtered values</td></tr><tr><th>2</th><td>1</td><td>8.796600648506226</td><td>1.9114002257577924</td><td>15.681801071254661</td><td>Filtered values</td></tr><tr><th>3</th><td>2</td><td>10.972258356409807</td><td>4.952517318025152</td><td>16.991999394794462</td><td>Filtered values</td></tr><tr><th>4</th><td>3</td><td>13.949648140354803</td><td>8.152917973763953</td><td>19.74637830694565</td><td>Filtered values</td></tr><tr><th>5</th><td>4</td><td>14.970404161876191</td><td>8.959340939954808</td><td>20.981467383797572</td><td>Filtered values</td></tr><tr><th>6</th><td>5</td><td>13.802203147459021</td><td>7.622809645586843</td><td>19.981596649331202</td><td>Filtered values</td></tr><tr><th>7</th><td>6</td><td>14.19604116119214</td><td>8.135363082652642</td><td>20.256719239731638</td><td>Filtered values</td></tr><tr><th>8</th><td>7</td><td>11.688780445673014</td><td>5.740986833420697</td><td>17.63657405792533</td><td>Filtered values</td></tr><tr><th>9</th><td>8</td><td>11.947764465104306</td><td>6.347935513611374</td><td>17.547593416597238</td><td>Filtered values</td></tr><tr><th>10</th><td>9</td><td>8.866023827800326</td><td>3.4828317747813466</td><td>14.249215880819307</td><td>Filtered values</td></tr><tr><th>11</th><td>10</td><td>9.876578467778526</td><td>4.904759931064713</td><td>14.848397004492337</td><td>Filtered values</td></tr><tr><th>12</th><td>11</td><td>10.501630362812955</td><td>5.71743705112133</td><td>15.28582367450458</td><td>Filtered values</td></tr><tr><th>13</th><td>12</td><td>10.82743577781253</td><td>6.135441817348007</td><td>15.519429738277054</td><td>Filtered values</td></tr><tr><th>14</th><td>13</td><td>12.538067021906294</td><td>7.906621376628244</td><td>17.169512667184343</td><td>Filtered values</td></tr><tr><th>15</th><td>14</td><td>12.239814834295487</td><td>7.5690816242903125</td><td>16.91054804430066</td><td>Filtered values</td></tr><tr><th>16</th><td>15</td><td>13.29504763689521</td><td>8.65136347013786</td><td>17.938731803652562</td><td>Filtered values</td></tr><tr><th>17</th><td>16</td><td>15.130543272605506</td><td>10.485390823591313</td><td>19.775695721619698</td><td>Filtered values</td></tr><tr><th>18</th><td>17</td><td>13.87547369107542</td><td>9.185906477148608</td><td>18.565040905002235</td><td>Filtered values</td></tr><tr><th>19</th><td>18</td><td>13.859567896695294</td><td>9.23462779370125</td><td>18.484507999689338</td><td>Filtered values</td></tr><tr><th>20</th><td>19</td><td>15.142812488607197</td><td>10.59689173798218</td><td>19.688733239232214</td><td>Filtered values</td></tr><tr><th>21</th><td>20</td><td>15.314756959758213</td><td>10.80860956480534</td><td>19.820904354711086</td><td>Filtered values</td></tr><tr><th>22</th><td>21</td><td>13.293038029771793</td><td>8.840045608064948</td><td>17.74603045147864</td><td>Filtered values</td></tr><tr><th>23</th><td>22</td><td>12.71493400248115</td><td>8.390620924901299</td><td>17.039247080061003</td><td>Filtered values</td></tr><tr><th>24</th><td>23</td><td>13.088742658525875</td><td>8.894244845226293</td><td>17.283240471825458</td><td>Filtered values</td></tr><tr><th>25</th><td>24</td><td>12.334948728835771</td><td>8.239159789715107</td><td>16.430737667956436</td><td>Filtered values</td></tr><tr><th>26</th><td>25</td><td>14.10036152906585</td><td>10.11319496458765</td><td>18.08752809354405</td><td>Filtered values</td></tr><tr><th>27</th><td>26</td><td>13.752879890673292</td><td>9.808671428014</td><td>17.697088353332585</td><td>Filtered values</td></tr><tr><th>28</th><td>27</td><td>14.116808725249241</td><td>10.225302233087167</td><td>18.008315217411315</td><td>Filtered values</td></tr><tr><th>29</th><td>28</td><td>14.652061741521518</td><td>10.800931859258903</td><td>18.503191623784133</td><td>Filtered values</td></tr><tr><th>30</th><td>29</td><td>14.512895370619745</td><td>10.688400122483472</td><td>18.337390618756018</td><td>Filtered values</td></tr><tr><th>&vellip;</th><td>&vellip;</td><td>&vellip;</td><td>&vellip;</td><td>&vellip;</td><td>&vellip;</td></tr></table>
+
+
+
+Next we will create separate colours for the observations and the true value. Here we will generate the default distinguishable colors used by Gadfly.
+
+
+```julia
+n = 3 #We will require 3 different colors
+getColors = distinguishable_colors(n, Color[LCHab(70, 60, 240)],
+                                   transform=c -> deuteranopic(c, 0.5),
+                                   lchoices=Float64[65, 70, 75, 80],
+                                   cchoices=Float64[0, 50, 60, 70],
+                                   hchoices=linspace(0, 330, 24))
+```
+
+
+
+
+![svg](ExtendedKalmanFilter_LogisticGrowthExample_files/ExtendedKalmanFilter_LogisticGrowthExample_28_0.svg)
+
+
+
+Finally we will plot the results of the filtered population estimates
+
+
+```julia
+population_state_plot = plot(
+    layer(x=0:numObs, y=[p0;measurements[2,:]'], Geom.point, Theme(default_color=getColors[2])),
+    layer(x=0:numObs, y=[p0;true_values], Geom.line, Theme(default_color=getColors[3])),
+    layer(df_fs, x=:x, y=:y, ymin=:ymin, ymax=:ymax, Geom.line, Geom.ribbon),
+    Guide.xlabel("Measurement Number"), Guide.ylabel("Population"),
+    Guide.manual_color_key("Colour Key",["Filtered Estimate", "Measurements","True Value "],[getColors[1],getColors[2],getColors[3]]),
+    Guide.title("Extended Kalman Filter Example")
+    )
+display(population_state_plot)
+```
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:gadfly="http://www.gadflyjl.org/ns"
+     version="1.2"
+     width="141.42mm" height="100mm" viewBox="0 0 141.42 100"
+     stroke="none"
+     fill="#000000"
+     stroke-width="0.3"
+     font-size="3.88"
+
+     id="fig-120ab1c99b4b4f928527c2e84d608c83">
+<g class="plotroot xscalable yscalable" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-1">
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-2">
+    <text x="64.98" y="88.39" text-anchor="middle" dy="0.6em">Measurement Number</text>
+  </g>
+  <g class="guide xlabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-3">
+    <text x="-115.12" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-150</text>
+    <text x="-70.09" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-100</text>
+    <text x="-25.07" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-50</text>
+    <text x="19.96" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="64.98" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">50</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">100</text>
+    <text x="155.03" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">150</text>
+    <text x="200.06" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">200</text>
+    <text x="245.08" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">250</text>
+    <text x="-70.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-100</text>
+    <text x="-65.59" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-95</text>
+    <text x="-61.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-90</text>
+    <text x="-56.58" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-85</text>
+    <text x="-52.08" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-80</text>
+    <text x="-47.58" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-75</text>
+    <text x="-43.08" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-70</text>
+    <text x="-38.57" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-65</text>
+    <text x="-34.07" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="-29.57" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-55</text>
+    <text x="-25.07" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="-20.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-45</text>
+    <text x="-16.06" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="-11.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-35</text>
+    <text x="-7.06" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="-2.55" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-25</text>
+    <text x="1.95" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="6.45" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-15</text>
+    <text x="10.95" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="15.46" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-5</text>
+    <text x="19.96" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="24.46" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">5</text>
+    <text x="28.96" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="33.47" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">15</text>
+    <text x="37.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="42.47" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">25</text>
+    <text x="46.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="51.48" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">35</text>
+    <text x="55.98" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="60.48" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">45</text>
+    <text x="64.98" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="69.49" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">55</text>
+    <text x="73.99" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="78.49" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">65</text>
+    <text x="82.99" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="87.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">75</text>
+    <text x="92" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="96.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">85</text>
+    <text x="101" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="105.51" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">95</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="114.51" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">105</text>
+    <text x="119.01" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="123.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">115</text>
+    <text x="128.02" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="132.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">125</text>
+    <text x="137.02" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">130</text>
+    <text x="141.53" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">135</text>
+    <text x="146.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">140</text>
+    <text x="150.53" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">145</text>
+    <text x="155.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">150</text>
+    <text x="159.54" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">155</text>
+    <text x="164.04" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">160</text>
+    <text x="168.54" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">165</text>
+    <text x="173.04" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">170</text>
+    <text x="177.55" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">175</text>
+    <text x="182.05" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">180</text>
+    <text x="186.55" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">185</text>
+    <text x="191.05" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">190</text>
+    <text x="195.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">195</text>
+    <text x="200.06" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">200</text>
+    <text x="-70.09" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="19.96" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="200.06" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="-70.09" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-100</text>
+    <text x="-61.09" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-90</text>
+    <text x="-52.08" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-80</text>
+    <text x="-43.08" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-70</text>
+    <text x="-34.07" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="-25.07" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="-16.06" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="-7.06" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="1.95" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="10.95" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="19.96" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="28.96" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="37.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="46.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="55.98" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="64.98" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="73.99" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="82.99" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="92" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="101" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="119.01" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="128.02" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">120</text>
+    <text x="137.02" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">130</text>
+    <text x="146.03" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">140</text>
+    <text x="155.03" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">150</text>
+    <text x="164.04" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">160</text>
+    <text x="173.04" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">170</text>
+    <text x="182.05" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">180</text>
+    <text x="191.05" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">190</text>
+    <text x="200.06" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">200</text>
+  </g>
+  <g class="guide colorkey" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-4">
+    <g fill="#4C404B" font-size="2.82" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-5">
+      <text x="115.82" y="44.85" dy="0.35em">Filtered Estimate</text>
+      <text x="115.82" y="48.48" dy="0.35em">Measurements</text>
+      <text x="115.82" y="52.1" dy="0.35em">True Value </text>
+    </g>
+    <g stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-6">
+      <rect x="113.01" y="43.94" width="1.81" height="1.81" fill="#00BFFF"/>
+      <rect x="113.01" y="47.57" width="1.81" height="1.81" fill="#D4CA3A"/>
+      <rect x="113.01" y="51.2" width="1.81" height="1.81" fill="#FF5EA0"/>
+    </g>
+    <g fill="#362A35" font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-7">
+      <text x="113.01" y="41.03">Colour Key</text>
+    </g>
+  </g>
+  <g clip-path="url(#fig-120ab1c99b4b4f928527c2e84d608c83-element-9)" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-8">
+    <g pointer-events="visible" opacity="1" fill="#000000" fill-opacity="0.000" stroke="#000000" stroke-opacity="0.000" class="guide background" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-10">
+      <rect x="17.96" y="12.61" width="94.05" height="68.1"/>
+    </g>
+    <g class="guide ygridlines xfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-11">
+      <path fill="none" d="M17.96,153.5 L 112.01 153.5" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,142.82 L 112.01 142.82" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,132.13 L 112.01 132.13" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,121.45 L 112.01 121.45" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,110.77 L 112.01 110.77" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,100.08 L 112.01 100.08" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,89.4 L 112.01 89.4" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,78.72 L 112.01 78.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,68.03 L 112.01 68.03" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,57.35 L 112.01 57.35" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,46.66 L 112.01 46.66" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,35.98 L 112.01 35.98" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,25.3 L 112.01 25.3" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,14.61 L 112.01 14.61" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.96,3.93 L 112.01 3.93" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-6.76 L 112.01 -6.76" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-17.44 L 112.01 -17.44" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-28.12 L 112.01 -28.12" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-38.81 L 112.01 -38.81" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-49.49 L 112.01 -49.49" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-60.18 L 112.01 -60.18" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,142.82 L 112.01 142.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,140.68 L 112.01 140.68" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,138.54 L 112.01 138.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,136.41 L 112.01 136.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,134.27 L 112.01 134.27" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,132.13 L 112.01 132.13" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,130 L 112.01 130" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,127.86 L 112.01 127.86" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,125.72 L 112.01 125.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,123.59 L 112.01 123.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,121.45 L 112.01 121.45" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,119.31 L 112.01 119.31" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,117.18 L 112.01 117.18" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,115.04 L 112.01 115.04" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,112.9 L 112.01 112.9" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,110.77 L 112.01 110.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,108.63 L 112.01 108.63" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,106.49 L 112.01 106.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,104.36 L 112.01 104.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,102.22 L 112.01 102.22" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,100.08 L 112.01 100.08" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,97.95 L 112.01 97.95" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,95.81 L 112.01 95.81" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,93.67 L 112.01 93.67" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,91.54 L 112.01 91.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,89.4 L 112.01 89.4" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,87.26 L 112.01 87.26" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,85.13 L 112.01 85.13" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,82.99 L 112.01 82.99" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,80.85 L 112.01 80.85" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,78.72 L 112.01 78.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,76.58 L 112.01 76.58" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,74.44 L 112.01 74.44" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,72.3 L 112.01 72.3" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,70.17 L 112.01 70.17" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,68.03 L 112.01 68.03" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,65.89 L 112.01 65.89" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,63.76 L 112.01 63.76" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,61.62 L 112.01 61.62" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,59.48 L 112.01 59.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,57.35 L 112.01 57.35" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,55.21 L 112.01 55.21" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,53.07 L 112.01 53.07" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,50.94 L 112.01 50.94" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,48.8 L 112.01 48.8" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,46.66 L 112.01 46.66" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,44.53 L 112.01 44.53" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,42.39 L 112.01 42.39" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,40.25 L 112.01 40.25" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,38.12 L 112.01 38.12" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,35.98 L 112.01 35.98" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,33.84 L 112.01 33.84" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,31.71 L 112.01 31.71" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,29.57 L 112.01 29.57" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,27.43 L 112.01 27.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,25.3 L 112.01 25.3" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,23.16 L 112.01 23.16" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,21.02 L 112.01 21.02" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,18.89 L 112.01 18.89" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,16.75 L 112.01 16.75" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,14.61 L 112.01 14.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,12.47 L 112.01 12.47" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,10.34 L 112.01 10.34" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,8.2 L 112.01 8.2" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,6.06 L 112.01 6.06" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,3.93 L 112.01 3.93" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,1.79 L 112.01 1.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-0.35 L 112.01 -0.35" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-2.48 L 112.01 -2.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-4.62 L 112.01 -4.62" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-6.76 L 112.01 -6.76" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-8.89 L 112.01 -8.89" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-11.03 L 112.01 -11.03" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-13.17 L 112.01 -13.17" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-15.3 L 112.01 -15.3" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-17.44 L 112.01 -17.44" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-19.58 L 112.01 -19.58" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-21.71 L 112.01 -21.71" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-23.85 L 112.01 -23.85" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-25.99 L 112.01 -25.99" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-28.12 L 112.01 -28.12" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-30.26 L 112.01 -30.26" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-32.4 L 112.01 -32.4" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-34.53 L 112.01 -34.53" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-36.67 L 112.01 -36.67" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-38.81 L 112.01 -38.81" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-40.94 L 112.01 -40.94" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-43.08 L 112.01 -43.08" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-45.22 L 112.01 -45.22" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-47.35 L 112.01 -47.35" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-49.49 L 112.01 -49.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,185.55 L 112.01 185.55" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.96,78.72 L 112.01 78.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.96,-28.12 L 112.01 -28.12" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.96,-134.96 L 112.01 -134.96" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.96,142.82 L 112.01 142.82" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,137.48 L 112.01 137.48" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,132.13 L 112.01 132.13" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,126.79 L 112.01 126.79" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,121.45 L 112.01 121.45" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,116.11 L 112.01 116.11" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,110.77 L 112.01 110.77" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,105.42 L 112.01 105.42" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,100.08 L 112.01 100.08" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,94.74 L 112.01 94.74" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,89.4 L 112.01 89.4" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,84.06 L 112.01 84.06" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,78.72 L 112.01 78.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,73.37 L 112.01 73.37" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,68.03 L 112.01 68.03" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,62.69 L 112.01 62.69" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,57.35 L 112.01 57.35" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,52.01 L 112.01 52.01" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,46.66 L 112.01 46.66" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,41.32 L 112.01 41.32" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,35.98 L 112.01 35.98" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,30.64 L 112.01 30.64" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,25.3 L 112.01 25.3" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,19.95 L 112.01 19.95" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,14.61 L 112.01 14.61" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,9.27 L 112.01 9.27" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,3.93 L 112.01 3.93" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-1.41 L 112.01 -1.41" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-6.76 L 112.01 -6.76" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-12.1 L 112.01 -12.1" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-17.44 L 112.01 -17.44" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-22.78 L 112.01 -22.78" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-28.12 L 112.01 -28.12" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-33.47 L 112.01 -33.47" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-38.81 L 112.01 -38.81" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-44.15 L 112.01 -44.15" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.96,-49.49 L 112.01 -49.49" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="guide xgridlines yfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-12">
+      <path fill="none" d="M-115.12,12.61 L -115.12 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-70.09,12.61 L -70.09 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-25.07,12.61 L -25.07 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.96,12.61 L 19.96 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M64.98,12.61 L 64.98 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M155.03,12.61 L 155.03 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M200.06,12.61 L 200.06 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M245.08,12.61 L 245.08 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-70.09,12.61 L -70.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-65.59,12.61 L -65.59 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-61.09,12.61 L -61.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-56.58,12.61 L -56.58 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-52.08,12.61 L -52.08 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-47.58,12.61 L -47.58 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-43.08,12.61 L -43.08 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-38.57,12.61 L -38.57 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-34.07,12.61 L -34.07 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-29.57,12.61 L -29.57 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-25.07,12.61 L -25.07 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-20.56,12.61 L -20.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-16.06,12.61 L -16.06 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-11.56,12.61 L -11.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-7.06,12.61 L -7.06 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-2.55,12.61 L -2.55 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M1.95,12.61 L 1.95 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M6.45,12.61 L 6.45 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M10.95,12.61 L 10.95 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M15.46,12.61 L 15.46 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.96,12.61 L 19.96 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M24.46,12.61 L 24.46 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M28.96,12.61 L 28.96 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M33.47,12.61 L 33.47 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M37.97,12.61 L 37.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M42.47,12.61 L 42.47 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M46.97,12.61 L 46.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M51.48,12.61 L 51.48 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M55.98,12.61 L 55.98 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M60.48,12.61 L 60.48 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M64.98,12.61 L 64.98 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M69.49,12.61 L 69.49 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M73.99,12.61 L 73.99 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M78.49,12.61 L 78.49 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M82.99,12.61 L 82.99 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M87.5,12.61 L 87.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M92,12.61 L 92 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M96.5,12.61 L 96.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M101,12.61 L 101 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M105.51,12.61 L 105.51 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M114.51,12.61 L 114.51 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M119.01,12.61 L 119.01 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M123.52,12.61 L 123.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M128.02,12.61 L 128.02 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M132.52,12.61 L 132.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M137.02,12.61 L 137.02 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M141.53,12.61 L 141.53 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M146.03,12.61 L 146.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M150.53,12.61 L 150.53 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M155.03,12.61 L 155.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M159.54,12.61 L 159.54 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M164.04,12.61 L 164.04 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M168.54,12.61 L 168.54 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M173.04,12.61 L 173.04 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M177.55,12.61 L 177.55 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M182.05,12.61 L 182.05 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M186.55,12.61 L 186.55 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M191.05,12.61 L 191.05 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M195.56,12.61 L 195.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M200.06,12.61 L 200.06 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-70.09,12.61 L -70.09 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.96,12.61 L 19.96 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M200.06,12.61 L 200.06 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M-70.09,12.61 L -70.09 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-61.09,12.61 L -61.09 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-52.08,12.61 L -52.08 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-43.08,12.61 L -43.08 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-34.07,12.61 L -34.07 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-25.07,12.61 L -25.07 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-16.06,12.61 L -16.06 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-7.06,12.61 L -7.06 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M1.95,12.61 L 1.95 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M10.95,12.61 L 10.95 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.96,12.61 L 19.96 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M28.96,12.61 L 28.96 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M37.97,12.61 L 37.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M46.97,12.61 L 46.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M55.98,12.61 L 55.98 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M64.98,12.61 L 64.98 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M73.99,12.61 L 73.99 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M82.99,12.61 L 82.99 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M92,12.61 L 92 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M101,12.61 L 101 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M119.01,12.61 L 119.01 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M128.02,12.61 L 128.02 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M137.02,12.61 L 137.02 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M146.03,12.61 L 146.03 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M155.03,12.61 L 155.03 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M164.04,12.61 L 164.04 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M173.04,12.61 L 173.04 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M182.05,12.61 L 182.05 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M191.05,12.61 L 191.05 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M200.06,12.61 L 200.06 80.72" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="plotpanel" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-13">
+      <g stroke-width="0.3" stroke="#000000" stroke-opacity="0.000" class="geometry" fill="#BDE8FF" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-14">
+        <path d="M110.01,33.77 L 109.11 33.72 108.21 36.07 107.31 37.89 106.41 38.34 105.51 39.23 104.61 40.25 103.7 41.92 102.8 42.42 101.9 42.61 101 42.94 100.1 41.82 99.2 43.12 98.3 42.71 97.4 42.26 96.5 42.11 95.6 42.95 94.7 43.22 93.8 45.51 92.9 44.85 92 46.06 91.1 46.67 90.2 48.39 89.3 49.11 88.4 49.53 87.5 48.11 86.6 47.84 85.69 48.45 84.79 48.55 83.89 49.98 82.99 51.13 82.09 52.13 81.19 52.5 80.29 52.55 79.39 51.68 78.49 49.19 77.59 48.72 76.69 48.38 75.79 48.76 74.89 49.43 73.99 50.92 73.09 51.96 72.19 53.61 71.29 54.68 70.39 55.1 69.49 54.88 68.59 55.21 67.68 56.29 66.78 56.96 65.88 56.84 64.98 58.5 64.08 59.45 63.18 60.28 62.28 60.67 61.38 61.71 60.48 62.1 59.58 61.72 58.68 61.75 57.78 61.55 56.88 62.49 55.98 63.73 55.08 63.65 54.18 63.4 53.28 65.09 52.38 64.93 51.48 65.25 50.58 64.92 49.67 64.41 48.77 64.8 47.87 65.84 46.97 66.86 46.07 67.3 45.17 67.18 44.27 67.79 43.37 68.24 42.47 67.91 41.57 69.91 40.67 69.21 39.77 69.75 38.87 69.27 37.97 67.17 37.07 67.39 36.17 68.85 35.27 68.9 34.37 67.51 33.47 69.47 32.57 70.63 31.66 70.27 30.76 72.16 29.86 72.61 28.96 73.47 28.06 74.99 27.16 71.93 26.26 72.58 25.36 70.02 24.46 70.57 23.56 69.14 22.66 70 21.76 73.42 20.86 76.67 19.96 77.59 19.96 58.48 20.86 61.96 21.76 60.56 22.66 57.62 23.56 56.3 24.46 57.37 25.36 57.07 26.26 59.87 27.16 59.97 28.06 63.49 28.96 62.85 29.86 62.38 30.76 62.13 31.66 60.37 32.57 60.65 33.47 59.55 34.37 57.59 35.27 58.88 36.17 58.97 37.07 57.68 37.97 57.54 38.87 59.76 39.77 60.51 40.67 60.25 41.57 61.16 42.47 59.39 43.37 59.81 44.27 59.48 45.17 58.95 46.07 59.12 46.97 58.75 47.87 57.79 48.77 56.75 49.67 56.35 50.58 56.84 51.48 57.19 52.38 56.91 53.28 57.11 54.18 55.46 55.08 55.69 55.98 55.78 56.88 54.55 57.78 53.58 58.68 53.74 59.58 53.69 60.48 54.06 61.38 53.69 62.28 52.66 63.18 52.25 64.08 51.4 64.98 50.41 65.88 48.7 66.78 48.75 67.68 48.03 68.59 46.9 69.49 46.53 70.39 46.71 71.29 46.28 72.19 45.2 73.09 43.53 73.99 42.45 74.89 40.92 75.79 40.2 76.69 39.78 77.59 40.11 78.49 40.57 79.39 43.08 80.29 44.02 81.19 44.04 82.09 43.73 82.99 42.77 83.89 41.64 84.79 40.19 85.69 40.06 86.6 39.42 87.5 39.67 88.4 41.08 89.3 40.67 90.2 39.96 91.1 38.24 92 37.6 92.9 36.36 93.8 36.99 94.7 34.68 95.6 34.39 96.5 33.52 97.4 33.65 98.3 34.08 99.2 34.49 100.1 33.2 101 34.32 101.9 34.01 102.8 33.83 103.7 33.34 104.61 31.67 105.51 30.64 106.41 29.73 107.31 29.27 108.21 27.44 109.11 25.08 110.01 25.11 z"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#00BFFF" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-15">
+        <path fill="none" d="M19.96,68.03 L 20.86 69.32 21.76 66.99 22.66 63.81 23.56 62.72 24.46 63.97 25.36 63.55 26.26 66.23 27.16 65.95 28.06 69.24 28.96 68.16 29.86 67.5 30.76 67.15 31.66 65.32 32.57 65.64 33.47 64.51 34.37 62.55 35.27 63.89 36.17 63.91 37.07 62.54 37.97 62.35 38.87 64.51 39.77 65.13 40.67 64.73 41.57 65.54 42.47 63.65 43.37 64.02 44.27 63.63 45.17 63.06 46.07 63.21 46.97 62.8 47.87 61.81 48.77 60.77 49.67 60.38 50.58 60.88 51.48 61.22 52.38 60.92 53.28 61.1 54.18 59.43 55.08 59.67 55.98 59.75 56.88 58.52 57.78 57.56 58.68 57.74 59.58 57.7 60.48 58.08 61.38 57.7 62.28 56.66 63.18 56.26 64.08 55.42 64.98 54.46 65.88 52.77 66.78 52.86 67.68 52.16 68.59 51.06 69.49 50.71 70.39 50.9 71.29 50.48 72.19 49.4 73.09 47.75 73.99 46.68 74.89 45.17 75.79 44.48 76.69 44.08 77.59 44.42 78.49 44.88 79.39 47.38 80.29 48.29 81.19 48.27 82.09 47.93 82.99 46.95 83.89 45.81 84.79 44.37 85.69 44.25 86.6 43.63 87.5 43.89 88.4 45.31 89.3 44.89 90.2 44.17 91.1 42.45 92 41.83 92.9 40.61 93.8 41.25 94.7 38.95 95.6 38.67 96.5 37.82 97.4 37.95 98.3 38.4 99.2 38.81 100.1 37.51 101 38.63 101.9 38.31 102.8 38.13 103.7 37.63 104.61 35.96 105.51 34.94 106.41 34.04 107.31 33.58 108.21 31.75 109.11 29.4 110.01 29.44"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#FF5EA0" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-16">
+        <path fill="none" d="M19.96,68.03 L 20.86 67.84 21.76 67.64 22.66 67.44 23.56 67.24 24.46 67.03 25.36 66.82 26.26 66.61 27.16 66.39 28.06 66.17 28.96 65.95 29.86 65.72 30.76 65.49 31.66 65.26 32.57 65.02 33.47 64.78 34.37 64.54 35.27 64.29 36.17 64.04 37.07 63.78 37.97 63.52 38.87 63.26 39.77 62.99 40.67 62.72 41.57 62.45 42.47 62.17 43.37 61.89 44.27 61.61 45.17 61.32 46.07 61.02 46.97 60.73 47.87 60.43 48.77 60.12 49.67 59.81 50.58 59.5 51.48 59.18 52.38 58.86 53.28 58.53 54.18 58.2 55.08 57.87 55.98 57.53 56.88 57.19 57.78 56.85 58.68 56.5 59.58 56.14 60.48 55.78 61.38 55.42 62.28 55.06 63.18 54.68 64.08 54.31 64.98 53.93 65.88 53.55 66.78 53.16 67.68 52.77 68.59 52.38 69.49 51.98 70.39 51.57 71.29 51.17 72.19 50.76 73.09 50.34 73.99 49.92 74.89 49.5 75.79 49.07 76.69 48.64 77.59 48.21 78.49 47.77 79.39 47.33 80.29 46.89 81.19 46.44 82.09 45.98 82.99 45.53 83.89 45.07 84.79 44.61 85.69 44.14 86.6 43.67 87.5 43.2 88.4 42.72 89.3 42.24 90.2 41.76 91.1 41.28 92 40.79 92.9 40.3 93.8 39.81 94.7 39.31 95.6 38.81 96.5 38.31 97.4 37.81 98.3 37.3 99.2 36.79 100.1 36.28 101 35.77 101.9 35.25 102.8 34.74 103.7 34.22 104.61 33.7 105.51 33.18 106.41 32.65 107.31 32.13 108.21 31.6 109.11 31.07 110.01 30.55"/>
+      </g>
+      <g class="geometry" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-17">
+        <g class="color_RGBA{Float32}(0.83092886f0,0.79346967f0,0.22566344f0,1.0f0)" stroke="#FFFFFF" stroke-width="0.3" fill="#D4CA3A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-18">
+          <circle cx="19.96" cy="68.03" r="0.9"/>
+          <circle cx="20.86" cy="71.78" r="0.9"/>
+          <circle cx="21.76" cy="64.12" r="0.9"/>
+          <circle cx="22.66" cy="59.74" r="0.9"/>
+          <circle cx="23.56" cy="64.42" r="0.9"/>
+          <circle cx="24.46" cy="68.83" r="0.9"/>
+          <circle cx="25.36" cy="63.73" r="0.9"/>
+          <circle cx="26.26" cy="72.04" r="0.9"/>
+          <circle cx="27.16" cy="64.36" r="0.9"/>
+          <circle cx="28.06" cy="76.67" r="0.9"/>
+          <circle cx="28.96" cy="62.45" r="0.9"/>
+          <circle cx="29.86" cy="63.64" r="0.9"/>
+          <circle cx="30.76" cy="65.02" r="0.9"/>
+          <circle cx="31.66" cy="58.16" r="0.9"/>
+          <circle cx="32.57" cy="67.89" r="0.9"/>
+          <circle cx="33.47" cy="61.03" r="0.9"/>
+          <circle cx="34.37" cy="56.82" r="0.9"/>
+          <circle cx="35.27" cy="71.36" r="0.9"/>
+          <circle cx="36.17" cy="65.17" r="0.9"/>
+          <circle cx="37.07" cy="58.3" r="0.9"/>
+          <circle cx="37.97" cy="63.5" r="0.9"/>
+          <circle cx="38.87" cy="74.99" r="0.9"/>
+          <circle cx="39.77" cy="67.95" r="0.9"/>
+          <circle cx="40.67" cy="62.61" r="0.9"/>
+          <circle cx="41.57" cy="69.54" r="0.9"/>
+          <circle cx="42.47" cy="53.18" r="0.9"/>
+          <circle cx="43.37" cy="66.86" r="0.9"/>
+          <circle cx="44.27" cy="61.93" r="0.9"/>
+          <circle cx="45.17" cy="60.48" r="0.9"/>
+          <circle cx="46.07" cy="65.14" r="0.9"/>
+          <circle cx="46.97" cy="61.23" r="0.9"/>
+          <circle cx="47.87" cy="56.9" r="0.9"/>
+          <circle cx="48.77" cy="56.19" r="0.9"/>
+          <circle cx="49.67" cy="60.38" r="0.9"/>
+          <circle cx="50.58" cy="66.26" r="0.9"/>
+          <circle cx="51.48" cy="64.93" r="0.9"/>
+          <circle cx="52.38" cy="60.35" r="0.9"/>
+          <circle cx="53.28" cy="63.55" r="0.9"/>
+          <circle cx="54.18" cy="50.08" r="0.9"/>
+          <circle cx="55.08" cy="63.4" r="0.9"/>
+          <circle cx="55.98" cy="62.08" r="0.9"/>
+          <circle cx="56.88" cy="52.32" r="0.9"/>
+          <circle cx="57.78" cy="53.97" r="0.9"/>
+          <circle cx="58.68" cy="61.64" r="0.9"/>
+          <circle cx="59.58" cy="59.77" r="0.9"/>
+          <circle cx="60.48" cy="62.4" r="0.9"/>
+          <circle cx="61.38" cy="56.86" r="0.9"/>
+          <circle cx="62.28" cy="51.97" r="0.9"/>
+          <circle cx="63.18" cy="56.07" r="0.9"/>
+          <circle cx="64.08" cy="52.62" r="0.9"/>
+          <circle cx="64.98" cy="51.34" r="0.9"/>
+          <circle cx="65.88" cy="45.91" r="0.9"/>
+          <circle cx="66.78" cy="57.31" r="0.9"/>
+          <circle cx="67.68" cy="51.51" r="0.9"/>
+          <circle cx="68.59" cy="48.28" r="0.9"/>
+          <circle cx="69.49" cy="52.57" r="0.9"/>
+          <circle cx="70.39" cy="55.5" r="0.9"/>
+          <circle cx="71.29" cy="51.07" r="0.9"/>
+          <circle cx="72.19" cy="46.37" r="0.9"/>
+          <circle cx="73.09" cy="42.04" r="0.9"/>
+          <circle cx="73.99" cy="44.97" r="0.9"/>
+          <circle cx="74.89" cy="41.35" r="0.9"/>
+          <circle cx="75.79" cy="45.51" r="0.9"/>
+          <circle cx="76.69" cy="46.49" r="0.9"/>
+          <circle cx="77.59" cy="50.31" r="0.9"/>
+          <circle cx="78.49" cy="50.67" r="0.9"/>
+          <circle cx="79.39" cy="62.99" r="0.9"/>
+          <circle cx="80.29" cy="53.85" r="0.9"/>
+          <circle cx="81.19" cy="48.29" r="0.9"/>
+          <circle cx="82.09" cy="46.14" r="0.9"/>
+          <circle cx="82.99" cy="41.8" r="0.9"/>
+          <circle cx="83.89" cy="40.45" r="0.9"/>
+          <circle cx="84.79" cy="38.03" r="0.9"/>
+          <circle cx="85.69" cy="46.02" r="0.9"/>
+          <circle cx="86.6" cy="42.41" r="0.9"/>
+          <circle cx="87.5" cy="47.62" r="0.9"/>
+          <circle cx="88.4" cy="54.77" r="0.9"/>
+          <circle cx="89.3" cy="43.3" r="0.9"/>
+          <circle cx="90.2" cy="41.11" r="0.9"/>
+          <circle cx="91.1" cy="34.38" r="0.9"/>
+          <circle cx="92" cy="40.69" r="0.9"/>
+          <circle cx="92.9" cy="36.44" r="0.9"/>
+          <circle cx="93.8" cy="47.5" r="0.9"/>
+          <circle cx="94.7" cy="28.9" r="0.9"/>
+          <circle cx="95.6" cy="40.44" r="0.9"/>
+          <circle cx="96.5" cy="36.38" r="0.9"/>
+          <circle cx="97.4" cy="41.79" r="0.9"/>
+          <circle cx="98.3" cy="43.33" r="0.9"/>
+          <circle cx="99.2" cy="42.99" r="0.9"/>
+          <circle cx="100.1" cy="32.42" r="0.9"/>
+          <circle cx="101" cy="46.6" r="0.9"/>
+          <circle cx="101.9" cy="37.92" r="0.9"/>
+          <circle cx="102.8" cy="38.46" r="0.9"/>
+          <circle cx="103.7" cy="36.33" r="0.9"/>
+          <circle cx="104.61" cy="28.69" r="0.9"/>
+          <circle cx="105.51" cy="31.84" r="0.9"/>
+          <circle cx="106.41" cy="31.93" r="0.9"/>
+          <circle cx="107.31" cy="33.94" r="0.9"/>
+          <circle cx="108.21" cy="25.06" r="0.9"/>
+          <circle cx="109.11" cy="20.64" r="0.9"/>
+          <circle cx="110.01" cy="33.58" r="0.9"/>
+        </g>
+      </g>
+    </g>
+    <g opacity="0" class="guide zoomslider" stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-19">
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-20">
+        <rect x="105.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-21">
+          <path d="M105.81,17.21 L 106.61 17.21 106.61 16.41 107.41 16.41 107.41 17.21 108.21 17.21 108.21 18.01 107.41 18.01 107.41 18.81 106.61 18.81 106.61 18.01 105.81 18.01 z"/>
+        </g>
+      </g>
+      <g fill="#EAEAEA" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-22">
+        <rect x="85.51" y="15.61" width="19" height="4"/>
+      </g>
+      <g class="zoomslider_thumb" fill="#6A6A6A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-23">
+        <rect x="94.01" y="15.61" width="2" height="4"/>
+      </g>
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-24">
+        <rect x="81.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-25">
+          <path d="M81.81,17.21 L 84.21 17.21 84.21 18.01 81.81 18.01 z"/>
+        </g>
+      </g>
+    </g>
+  </g>
+  <g class="guide ylabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-26">
+    <text x="16.96" y="153.5" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-70</text>
+    <text x="16.96" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-60</text>
+    <text x="16.96" y="132.13" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-50</text>
+    <text x="16.96" y="121.45" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-40</text>
+    <text x="16.96" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-30</text>
+    <text x="16.96" y="100.08" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-20</text>
+    <text x="16.96" y="89.4" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-10</text>
+    <text x="16.96" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="16.96" y="68.03" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">10</text>
+    <text x="16.96" y="57.35" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">20</text>
+    <text x="16.96" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">30</text>
+    <text x="16.96" y="35.98" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">40</text>
+    <text x="16.96" y="25.3" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">50</text>
+    <text x="16.96" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">60</text>
+    <text x="16.96" y="3.93" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">70</text>
+    <text x="16.96" y="-6.76" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">80</text>
+    <text x="16.96" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">90</text>
+    <text x="16.96" y="-28.12" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">100</text>
+    <text x="16.96" y="-38.81" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">110</text>
+    <text x="16.96" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">120</text>
+    <text x="16.96" y="-60.18" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">130</text>
+    <text x="16.96" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="16.96" y="140.68" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-58</text>
+    <text x="16.96" y="138.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-56</text>
+    <text x="16.96" y="136.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-54</text>
+    <text x="16.96" y="134.27" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-52</text>
+    <text x="16.96" y="132.13" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="16.96" y="130" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-48</text>
+    <text x="16.96" y="127.86" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-46</text>
+    <text x="16.96" y="125.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-44</text>
+    <text x="16.96" y="123.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-42</text>
+    <text x="16.96" y="121.45" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="16.96" y="119.31" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-38</text>
+    <text x="16.96" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-36</text>
+    <text x="16.96" y="115.04" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-34</text>
+    <text x="16.96" y="112.9" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-32</text>
+    <text x="16.96" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="16.96" y="108.63" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-28</text>
+    <text x="16.96" y="106.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-26</text>
+    <text x="16.96" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-24</text>
+    <text x="16.96" y="102.22" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-22</text>
+    <text x="16.96" y="100.08" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="16.96" y="97.95" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-18</text>
+    <text x="16.96" y="95.81" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-16</text>
+    <text x="16.96" y="93.67" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-14</text>
+    <text x="16.96" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-12</text>
+    <text x="16.96" y="89.4" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="16.96" y="87.26" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-8</text>
+    <text x="16.96" y="85.13" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6</text>
+    <text x="16.96" y="82.99" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4</text>
+    <text x="16.96" y="80.85" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2</text>
+    <text x="16.96" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="16.96" y="76.58" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2</text>
+    <text x="16.96" y="74.44" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4</text>
+    <text x="16.96" y="72.3" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6</text>
+    <text x="16.96" y="70.17" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">8</text>
+    <text x="16.96" y="68.03" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="16.96" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">12</text>
+    <text x="16.96" y="63.76" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">14</text>
+    <text x="16.96" y="61.62" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">16</text>
+    <text x="16.96" y="59.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">18</text>
+    <text x="16.96" y="57.35" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="16.96" y="55.21" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">22</text>
+    <text x="16.96" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">24</text>
+    <text x="16.96" y="50.94" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">26</text>
+    <text x="16.96" y="48.8" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">28</text>
+    <text x="16.96" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="16.96" y="44.53" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">32</text>
+    <text x="16.96" y="42.39" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">34</text>
+    <text x="16.96" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">36</text>
+    <text x="16.96" y="38.12" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">38</text>
+    <text x="16.96" y="35.98" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="16.96" y="33.84" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">42</text>
+    <text x="16.96" y="31.71" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">44</text>
+    <text x="16.96" y="29.57" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">46</text>
+    <text x="16.96" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">48</text>
+    <text x="16.96" y="25.3" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="16.96" y="23.16" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">52</text>
+    <text x="16.96" y="21.02" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">54</text>
+    <text x="16.96" y="18.89" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">56</text>
+    <text x="16.96" y="16.75" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">58</text>
+    <text x="16.96" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="16.96" y="12.47" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">62</text>
+    <text x="16.96" y="10.34" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">64</text>
+    <text x="16.96" y="8.2" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">66</text>
+    <text x="16.96" y="6.06" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">68</text>
+    <text x="16.96" y="3.93" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="16.96" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">72</text>
+    <text x="16.96" y="-0.35" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">74</text>
+    <text x="16.96" y="-2.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">76</text>
+    <text x="16.96" y="-4.62" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">78</text>
+    <text x="16.96" y="-6.76" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="16.96" y="-8.89" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">82</text>
+    <text x="16.96" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">84</text>
+    <text x="16.96" y="-13.17" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">86</text>
+    <text x="16.96" y="-15.3" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">88</text>
+    <text x="16.96" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="16.96" y="-19.58" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">92</text>
+    <text x="16.96" y="-21.71" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">94</text>
+    <text x="16.96" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">96</text>
+    <text x="16.96" y="-25.99" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">98</text>
+    <text x="16.96" y="-28.12" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="16.96" y="-30.26" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">102</text>
+    <text x="16.96" y="-32.4" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">104</text>
+    <text x="16.96" y="-34.53" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">106</text>
+    <text x="16.96" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">108</text>
+    <text x="16.96" y="-38.81" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="16.96" y="-40.94" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">112</text>
+    <text x="16.96" y="-43.08" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">114</text>
+    <text x="16.96" y="-45.22" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">116</text>
+    <text x="16.96" y="-47.35" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">118</text>
+    <text x="16.96" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="16.96" y="185.55" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="16.96" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="16.96" y="-28.12" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="16.96" y="-134.96" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="16.96" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="16.96" y="137.48" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-55</text>
+    <text x="16.96" y="132.13" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="16.96" y="126.79" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-45</text>
+    <text x="16.96" y="121.45" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="16.96" y="116.11" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-35</text>
+    <text x="16.96" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="16.96" y="105.42" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-25</text>
+    <text x="16.96" y="100.08" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="16.96" y="94.74" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-15</text>
+    <text x="16.96" y="89.4" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="16.96" y="84.06" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5</text>
+    <text x="16.96" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="16.96" y="73.37" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5</text>
+    <text x="16.96" y="68.03" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="16.96" y="62.69" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">15</text>
+    <text x="16.96" y="57.35" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="16.96" y="52.01" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">25</text>
+    <text x="16.96" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="16.96" y="41.32" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">35</text>
+    <text x="16.96" y="35.98" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="16.96" y="30.64" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">45</text>
+    <text x="16.96" y="25.3" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="16.96" y="19.95" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">55</text>
+    <text x="16.96" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="16.96" y="9.27" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">65</text>
+    <text x="16.96" y="3.93" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="16.96" y="-1.41" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">75</text>
+    <text x="16.96" y="-6.76" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="16.96" y="-12.1" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">85</text>
+    <text x="16.96" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="16.96" y="-22.78" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">95</text>
+    <text x="16.96" y="-28.12" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="16.96" y="-33.47" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">105</text>
+    <text x="16.96" y="-38.81" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="16.96" y="-44.15" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">115</text>
+    <text x="16.96" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">120</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-27">
+    <text x="8.81" y="44.66" text-anchor="middle" dy="0.35em" transform="rotate(-90, 8.81, 46.66)">Population</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-120ab1c99b4b4f928527c2e84d608c83-element-28">
+    <text x="64.98" y="10.61" text-anchor="middle">Extended Kalman Filter Example</text>
+  </g>
+</g>
+<defs>
+<clipPath id="fig-120ab1c99b4b4f928527c2e84d608c83-element-9">
+  <path d="M17.96,12.61 L 112.01 12.61 112.01 80.72 17.96 80.72" />
+</clipPath
+></defs>
+<script> <![CDATA[
+(function(N){var k=/[\.\/]/,L=/\s*,\s*/,C=function(a,d){return a-d},a,v,y={n:{}},M=function(){for(var a=0,d=this.length;a<d;a++)if("undefined"!=typeof this[a])return this[a]},A=function(){for(var a=this.length;--a;)if("undefined"!=typeof this[a])return this[a]},w=function(k,d){k=String(k);var f=v,n=Array.prototype.slice.call(arguments,2),u=w.listeners(k),p=0,b,q=[],e={},l=[],r=a;l.firstDefined=M;l.lastDefined=A;a=k;for(var s=v=0,x=u.length;s<x;s++)"zIndex"in u[s]&&(q.push(u[s].zIndex),0>u[s].zIndex&&
+(e[u[s].zIndex]=u[s]));for(q.sort(C);0>q[p];)if(b=e[q[p++] ],l.push(b.apply(d,n)),v)return v=f,l;for(s=0;s<x;s++)if(b=u[s],"zIndex"in b)if(b.zIndex==q[p]){l.push(b.apply(d,n));if(v)break;do if(p++,(b=e[q[p] ])&&l.push(b.apply(d,n)),v)break;while(b)}else e[b.zIndex]=b;else if(l.push(b.apply(d,n)),v)break;v=f;a=r;return l};w._events=y;w.listeners=function(a){a=a.split(k);var d=y,f,n,u,p,b,q,e,l=[d],r=[];u=0;for(p=a.length;u<p;u++){e=[];b=0;for(q=l.length;b<q;b++)for(d=l[b].n,f=[d[a[u] ],d["*"] ],n=2;n--;)if(d=
+f[n])e.push(d),r=r.concat(d.f||[]);l=e}return r};w.on=function(a,d){a=String(a);if("function"!=typeof d)return function(){};for(var f=a.split(L),n=0,u=f.length;n<u;n++)(function(a){a=a.split(k);for(var b=y,f,e=0,l=a.length;e<l;e++)b=b.n,b=b.hasOwnProperty(a[e])&&b[a[e] ]||(b[a[e] ]={n:{}});b.f=b.f||[];e=0;for(l=b.f.length;e<l;e++)if(b.f[e]==d){f=!0;break}!f&&b.f.push(d)})(f[n]);return function(a){+a==+a&&(d.zIndex=+a)}};w.f=function(a){var d=[].slice.call(arguments,1);return function(){w.apply(null,
+[a,null].concat(d).concat([].slice.call(arguments,0)))}};w.stop=function(){v=1};w.nt=function(k){return k?(new RegExp("(?:\\.|\\/|^)"+k+"(?:\\.|\\/|$)")).test(a):a};w.nts=function(){return a.split(k)};w.off=w.unbind=function(a,d){if(a){var f=a.split(L);if(1<f.length)for(var n=0,u=f.length;n<u;n++)w.off(f[n],d);else{for(var f=a.split(k),p,b,q,e,l=[y],n=0,u=f.length;n<u;n++)for(e=0;e<l.length;e+=q.length-2){q=[e,1];p=l[e].n;if("*"!=f[n])p[f[n] ]&&q.push(p[f[n] ]);else for(b in p)p.hasOwnProperty(b)&&
+q.push(p[b]);l.splice.apply(l,q)}n=0;for(u=l.length;n<u;n++)for(p=l[n];p.n;){if(d){if(p.f){e=0;for(f=p.f.length;e<f;e++)if(p.f[e]==d){p.f.splice(e,1);break}!p.f.length&&delete p.f}for(b in p.n)if(p.n.hasOwnProperty(b)&&p.n[b].f){q=p.n[b].f;e=0;for(f=q.length;e<f;e++)if(q[e]==d){q.splice(e,1);break}!q.length&&delete p.n[b].f}}else for(b in delete p.f,p.n)p.n.hasOwnProperty(b)&&p.n[b].f&&delete p.n[b].f;p=p.n}}}else w._events=y={n:{}}};w.once=function(a,d){var f=function(){w.unbind(a,f);return d.apply(this,
+arguments)};return w.on(a,f)};w.version="0.4.2";w.toString=function(){return"You are running Eve 0.4.2"};"undefined"!=typeof module&&module.exports?module.exports=w:"function"===typeof define&&define.amd?define("eve",[],function(){return w}):N.eve=w})(this);
+(function(N,k){"function"===typeof define&&define.amd?define("Snap.svg",["eve"],function(L){return k(N,L)}):k(N,N.eve)})(this,function(N,k){var L=function(a){var k={},y=N.requestAnimationFrame||N.webkitRequestAnimationFrame||N.mozRequestAnimationFrame||N.oRequestAnimationFrame||N.msRequestAnimationFrame||function(a){setTimeout(a,16)},M=Array.isArray||function(a){return a instanceof Array||"[object Array]"==Object.prototype.toString.call(a)},A=0,w="M"+(+new Date).toString(36),z=function(a){if(null==
+a)return this.s;var b=this.s-a;this.b+=this.dur*b;this.B+=this.dur*b;this.s=a},d=function(a){if(null==a)return this.spd;this.spd=a},f=function(a){if(null==a)return this.dur;this.s=this.s*a/this.dur;this.dur=a},n=function(){delete k[this.id];this.update();a("mina.stop."+this.id,this)},u=function(){this.pdif||(delete k[this.id],this.update(),this.pdif=this.get()-this.b)},p=function(){this.pdif&&(this.b=this.get()-this.pdif,delete this.pdif,k[this.id]=this)},b=function(){var a;if(M(this.start)){a=[];
+for(var b=0,e=this.start.length;b<e;b++)a[b]=+this.start[b]+(this.end[b]-this.start[b])*this.easing(this.s)}else a=+this.start+(this.end-this.start)*this.easing(this.s);this.set(a)},q=function(){var l=0,b;for(b in k)if(k.hasOwnProperty(b)){var e=k[b],f=e.get();l++;e.s=(f-e.b)/(e.dur/e.spd);1<=e.s&&(delete k[b],e.s=1,l--,function(b){setTimeout(function(){a("mina.finish."+b.id,b)})}(e));e.update()}l&&y(q)},e=function(a,r,s,x,G,h,J){a={id:w+(A++).toString(36),start:a,end:r,b:s,s:0,dur:x-s,spd:1,get:G,
+set:h,easing:J||e.linear,status:z,speed:d,duration:f,stop:n,pause:u,resume:p,update:b};k[a.id]=a;r=0;for(var K in k)if(k.hasOwnProperty(K)&&(r++,2==r))break;1==r&&y(q);return a};e.time=Date.now||function(){return+new Date};e.getById=function(a){return k[a]||null};e.linear=function(a){return a};e.easeout=function(a){return Math.pow(a,1.7)};e.easein=function(a){return Math.pow(a,0.48)};e.easeinout=function(a){if(1==a)return 1;if(0==a)return 0;var b=0.48-a/1.04,e=Math.sqrt(0.1734+b*b);a=e-b;a=Math.pow(Math.abs(a),
+1/3)*(0>a?-1:1);b=-e-b;b=Math.pow(Math.abs(b),1/3)*(0>b?-1:1);a=a+b+0.5;return 3*(1-a)*a*a+a*a*a};e.backin=function(a){return 1==a?1:a*a*(2.70158*a-1.70158)};e.backout=function(a){if(0==a)return 0;a-=1;return a*a*(2.70158*a+1.70158)+1};e.elastic=function(a){return a==!!a?a:Math.pow(2,-10*a)*Math.sin(2*(a-0.075)*Math.PI/0.3)+1};e.bounce=function(a){a<1/2.75?a*=7.5625*a:a<2/2.75?(a-=1.5/2.75,a=7.5625*a*a+0.75):a<2.5/2.75?(a-=2.25/2.75,a=7.5625*a*a+0.9375):(a-=2.625/2.75,a=7.5625*a*a+0.984375);return a};
+return N.mina=e}("undefined"==typeof k?function(){}:k),C=function(){function a(c,t){if(c){if(c.tagName)return x(c);if(y(c,"array")&&a.set)return a.set.apply(a,c);if(c instanceof e)return c;if(null==t)return c=G.doc.querySelector(c),x(c)}return new s(null==c?"100%":c,null==t?"100%":t)}function v(c,a){if(a){"#text"==c&&(c=G.doc.createTextNode(a.text||""));"string"==typeof c&&(c=v(c));if("string"==typeof a)return"xlink:"==a.substring(0,6)?c.getAttributeNS(m,a.substring(6)):"xml:"==a.substring(0,4)?c.getAttributeNS(la,
+a.substring(4)):c.getAttribute(a);for(var da in a)if(a[h](da)){var b=J(a[da]);b?"xlink:"==da.substring(0,6)?c.setAttributeNS(m,da.substring(6),b):"xml:"==da.substring(0,4)?c.setAttributeNS(la,da.substring(4),b):c.setAttribute(da,b):c.removeAttribute(da)}}else c=G.doc.createElementNS(la,c);return c}function y(c,a){a=J.prototype.toLowerCase.call(a);return"finite"==a?isFinite(c):"array"==a&&(c instanceof Array||Array.isArray&&Array.isArray(c))?!0:"null"==a&&null===c||a==typeof c&&null!==c||"object"==
+a&&c===Object(c)||$.call(c).slice(8,-1).toLowerCase()==a}function M(c){if("function"==typeof c||Object(c)!==c)return c;var a=new c.constructor,b;for(b in c)c[h](b)&&(a[b]=M(c[b]));return a}function A(c,a,b){function m(){var e=Array.prototype.slice.call(arguments,0),f=e.join("\u2400"),d=m.cache=m.cache||{},l=m.count=m.count||[];if(d[h](f)){a:for(var e=l,l=f,B=0,H=e.length;B<H;B++)if(e[B]===l){e.push(e.splice(B,1)[0]);break a}return b?b(d[f]):d[f]}1E3<=l.length&&delete d[l.shift()];l.push(f);d[f]=c.apply(a,
+e);return b?b(d[f]):d[f]}return m}function w(c,a,b,m,e,f){return null==e?(c-=b,a-=m,c||a?(180*I.atan2(-a,-c)/C+540)%360:0):w(c,a,e,f)-w(b,m,e,f)}function z(c){return c%360*C/180}function d(c){var a=[];c=c.replace(/(?:^|\s)(\w+)\(([^)]+)\)/g,function(c,b,m){m=m.split(/\s*,\s*|\s+/);"rotate"==b&&1==m.length&&m.push(0,0);"scale"==b&&(2<m.length?m=m.slice(0,2):2==m.length&&m.push(0,0),1==m.length&&m.push(m[0],0,0));"skewX"==b?a.push(["m",1,0,I.tan(z(m[0])),1,0,0]):"skewY"==b?a.push(["m",1,I.tan(z(m[0])),
+0,1,0,0]):a.push([b.charAt(0)].concat(m));return c});return a}function f(c,t){var b=O(c),m=new a.Matrix;if(b)for(var e=0,f=b.length;e<f;e++){var h=b[e],d=h.length,B=J(h[0]).toLowerCase(),H=h[0]!=B,l=H?m.invert():0,E;"t"==B&&2==d?m.translate(h[1],0):"t"==B&&3==d?H?(d=l.x(0,0),B=l.y(0,0),H=l.x(h[1],h[2]),l=l.y(h[1],h[2]),m.translate(H-d,l-B)):m.translate(h[1],h[2]):"r"==B?2==d?(E=E||t,m.rotate(h[1],E.x+E.width/2,E.y+E.height/2)):4==d&&(H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.rotate(h[1],H,l)):m.rotate(h[1],
+h[2],h[3])):"s"==B?2==d||3==d?(E=E||t,m.scale(h[1],h[d-1],E.x+E.width/2,E.y+E.height/2)):4==d?H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.scale(h[1],h[1],H,l)):m.scale(h[1],h[1],h[2],h[3]):5==d&&(H?(H=l.x(h[3],h[4]),l=l.y(h[3],h[4]),m.scale(h[1],h[2],H,l)):m.scale(h[1],h[2],h[3],h[4])):"m"==B&&7==d&&m.add(h[1],h[2],h[3],h[4],h[5],h[6])}return m}function n(c,t){if(null==t){var m=!0;t="linearGradient"==c.type||"radialGradient"==c.type?c.node.getAttribute("gradientTransform"):"pattern"==c.type?c.node.getAttribute("patternTransform"):
+c.node.getAttribute("transform");if(!t)return new a.Matrix;t=d(t)}else t=a._.rgTransform.test(t)?J(t).replace(/\.{3}|\u2026/g,c._.transform||aa):d(t),y(t,"array")&&(t=a.path?a.path.toString.call(t):J(t)),c._.transform=t;var b=f(t,c.getBBox(1));if(m)return b;c.matrix=b}function u(c){c=c.node.ownerSVGElement&&x(c.node.ownerSVGElement)||c.node.parentNode&&x(c.node.parentNode)||a.select("svg")||a(0,0);var t=c.select("defs"),t=null==t?!1:t.node;t||(t=r("defs",c.node).node);return t}function p(c){return c.node.ownerSVGElement&&
+x(c.node.ownerSVGElement)||a.select("svg")}function b(c,a,m){function b(c){if(null==c)return aa;if(c==+c)return c;v(B,{width:c});try{return B.getBBox().width}catch(a){return 0}}function h(c){if(null==c)return aa;if(c==+c)return c;v(B,{height:c});try{return B.getBBox().height}catch(a){return 0}}function e(b,B){null==a?d[b]=B(c.attr(b)||0):b==a&&(d=B(null==m?c.attr(b)||0:m))}var f=p(c).node,d={},B=f.querySelector(".svg---mgr");B||(B=v("rect"),v(B,{x:-9E9,y:-9E9,width:10,height:10,"class":"svg---mgr",
+fill:"none"}),f.appendChild(B));switch(c.type){case "rect":e("rx",b),e("ry",h);case "image":e("width",b),e("height",h);case "text":e("x",b);e("y",h);break;case "circle":e("cx",b);e("cy",h);e("r",b);break;case "ellipse":e("cx",b);e("cy",h);e("rx",b);e("ry",h);break;case "line":e("x1",b);e("x2",b);e("y1",h);e("y2",h);break;case "marker":e("refX",b);e("markerWidth",b);e("refY",h);e("markerHeight",h);break;case "radialGradient":e("fx",b);e("fy",h);break;case "tspan":e("dx",b);e("dy",h);break;default:e(a,
+b)}f.removeChild(B);return d}function q(c){y(c,"array")||(c=Array.prototype.slice.call(arguments,0));for(var a=0,b=0,m=this.node;this[a];)delete this[a++];for(a=0;a<c.length;a++)"set"==c[a].type?c[a].forEach(function(c){m.appendChild(c.node)}):m.appendChild(c[a].node);for(var h=m.childNodes,a=0;a<h.length;a++)this[b++]=x(h[a]);return this}function e(c){if(c.snap in E)return E[c.snap];var a=this.id=V(),b;try{b=c.ownerSVGElement}catch(m){}this.node=c;b&&(this.paper=new s(b));this.type=c.tagName;this.anims=
+{};this._={transform:[]};c.snap=a;E[a]=this;"g"==this.type&&(this.add=q);if(this.type in{g:1,mask:1,pattern:1})for(var e in s.prototype)s.prototype[h](e)&&(this[e]=s.prototype[e])}function l(c){this.node=c}function r(c,a){var b=v(c);a.appendChild(b);return x(b)}function s(c,a){var b,m,f,d=s.prototype;if(c&&"svg"==c.tagName){if(c.snap in E)return E[c.snap];var l=c.ownerDocument;b=new e(c);m=c.getElementsByTagName("desc")[0];f=c.getElementsByTagName("defs")[0];m||(m=v("desc"),m.appendChild(l.createTextNode("Created with Snap")),
+b.node.appendChild(m));f||(f=v("defs"),b.node.appendChild(f));b.defs=f;for(var ca in d)d[h](ca)&&(b[ca]=d[ca]);b.paper=b.root=b}else b=r("svg",G.doc.body),v(b.node,{height:a,version:1.1,width:c,xmlns:la});return b}function x(c){return!c||c instanceof e||c instanceof l?c:c.tagName&&"svg"==c.tagName.toLowerCase()?new s(c):c.tagName&&"object"==c.tagName.toLowerCase()&&"image/svg+xml"==c.type?new s(c.contentDocument.getElementsByTagName("svg")[0]):new e(c)}a.version="0.3.0";a.toString=function(){return"Snap v"+
+this.version};a._={};var G={win:N,doc:N.document};a._.glob=G;var h="hasOwnProperty",J=String,K=parseFloat,U=parseInt,I=Math,P=I.max,Q=I.min,Y=I.abs,C=I.PI,aa="",$=Object.prototype.toString,F=/^\s*((#[a-f\d]{6})|(#[a-f\d]{3})|rgba?\(\s*([\d\.]+%?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+%?(?:\s*,\s*[\d\.]+%?)?)\s*\)|hsba?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\)|hsla?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\))\s*$/i;a._.separator=
+RegExp("[,\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]+");var S=RegExp("[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*"),X={hs:1,rg:1},W=RegExp("([a-z])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)",
+"ig"),ma=RegExp("([rstm])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)","ig"),Z=RegExp("(-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?)[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*",
+"ig"),na=0,ba="S"+(+new Date).toString(36),V=function(){return ba+(na++).toString(36)},m="http://www.w3.org/1999/xlink",la="http://www.w3.org/2000/svg",E={},ca=a.url=function(c){return"url('#"+c+"')"};a._.$=v;a._.id=V;a.format=function(){var c=/\{([^\}]+)\}/g,a=/(?:(?:^|\.)(.+?)(?=\[|\.|$|\()|\[('|")(.+?)\2\])(\(\))?/g,b=function(c,b,m){var h=m;b.replace(a,function(c,a,b,m,t){a=a||m;h&&(a in h&&(h=h[a]),"function"==typeof h&&t&&(h=h()))});return h=(null==h||h==m?c:h)+""};return function(a,m){return J(a).replace(c,
+function(c,a){return b(c,a,m)})}}();a._.clone=M;a._.cacher=A;a.rad=z;a.deg=function(c){return 180*c/C%360};a.angle=w;a.is=y;a.snapTo=function(c,a,b){b=y(b,"finite")?b:10;if(y(c,"array"))for(var m=c.length;m--;){if(Y(c[m]-a)<=b)return c[m]}else{c=+c;m=a%c;if(m<b)return a-m;if(m>c-b)return a-m+c}return a};a.getRGB=A(function(c){if(!c||(c=J(c)).indexOf("-")+1)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};if("none"==c)return{r:-1,g:-1,b:-1,hex:"none",toString:ka};!X[h](c.toLowerCase().substring(0,
+2))&&"#"!=c.charAt()&&(c=T(c));if(!c)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};var b,m,e,f,d;if(c=c.match(F)){c[2]&&(e=U(c[2].substring(5),16),m=U(c[2].substring(3,5),16),b=U(c[2].substring(1,3),16));c[3]&&(e=U((d=c[3].charAt(3))+d,16),m=U((d=c[3].charAt(2))+d,16),b=U((d=c[3].charAt(1))+d,16));c[4]&&(d=c[4].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b*=2.55),m=K(d[1]),"%"==d[1].slice(-1)&&(m*=2.55),e=K(d[2]),"%"==d[2].slice(-1)&&(e*=2.55),"rgba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),
+d[3]&&"%"==d[3].slice(-1)&&(f/=100));if(c[5])return d=c[5].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsb2rgb(b,m,e,f);if(c[6])return d=c[6].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),
+"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsla"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsl2rgb(b,m,e,f);b=Q(I.round(b),255);m=Q(I.round(m),255);e=Q(I.round(e),255);f=Q(P(f,0),1);c={r:b,g:m,b:e,toString:ka};c.hex="#"+(16777216|e|m<<8|b<<16).toString(16).slice(1);c.opacity=y(f,"finite")?f:1;return c}return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka}},a);a.hsb=A(function(c,b,m){return a.hsb2rgb(c,b,m).hex});a.hsl=A(function(c,b,m){return a.hsl2rgb(c,
+b,m).hex});a.rgb=A(function(c,a,b,m){if(y(m,"finite")){var e=I.round;return"rgba("+[e(c),e(a),e(b),+m.toFixed(2)]+")"}return"#"+(16777216|b|a<<8|c<<16).toString(16).slice(1)});var T=function(c){var a=G.doc.getElementsByTagName("head")[0]||G.doc.getElementsByTagName("svg")[0];T=A(function(c){if("red"==c.toLowerCase())return"rgb(255, 0, 0)";a.style.color="rgb(255, 0, 0)";a.style.color=c;c=G.doc.defaultView.getComputedStyle(a,aa).getPropertyValue("color");return"rgb(255, 0, 0)"==c?null:c});return T(c)},
+qa=function(){return"hsb("+[this.h,this.s,this.b]+")"},ra=function(){return"hsl("+[this.h,this.s,this.l]+")"},ka=function(){return 1==this.opacity||null==this.opacity?this.hex:"rgba("+[this.r,this.g,this.b,this.opacity]+")"},D=function(c,b,m){null==b&&y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&(m=c.b,b=c.g,c=c.r);null==b&&y(c,string)&&(m=a.getRGB(c),c=m.r,b=m.g,m=m.b);if(1<c||1<b||1<m)c/=255,b/=255,m/=255;return[c,b,m]},oa=function(c,b,m,e){c=I.round(255*c);b=I.round(255*b);m=I.round(255*m);c={r:c,
+g:b,b:m,opacity:y(e,"finite")?e:1,hex:a.rgb(c,b,m),toString:ka};y(e,"finite")&&(c.opacity=e);return c};a.color=function(c){var b;y(c,"object")&&"h"in c&&"s"in c&&"b"in c?(b=a.hsb2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):y(c,"object")&&"h"in c&&"s"in c&&"l"in c?(b=a.hsl2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):(y(c,"string")&&(c=a.getRGB(c)),y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&!("error"in c)?(b=a.rgb2hsl(c),c.h=b.h,c.s=b.s,c.l=b.l,b=a.rgb2hsb(c),c.v=b.b):(c={hex:"none"},
+c.r=c.g=c.b=c.h=c.s=c.v=c.l=-1,c.error=1));c.toString=ka;return c};a.hsb2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"b"in c&&(b=c.b,a=c.s,c=c.h,m=c.o);var e,h,d;c=360*c%360/60;d=b*a;a=d*(1-Y(c%2-1));b=e=h=b-d;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.hsl2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"l"in c&&(b=c.l,a=c.s,c=c.h);if(1<c||1<a||1<b)c/=360,a/=100,b/=100;var e,h,d;c=360*c%360/60;d=2*a*(0.5>b?b:1-b);a=d*(1-Y(c%2-1));b=e=
+h=b-d/2;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.rgb2hsb=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e;m=P(c,a,b);e=m-Q(c,a,b);c=((0==e?0:m==c?(a-b)/e:m==a?(b-c)/e+2:(c-a)/e+4)+360)%6*60/360;return{h:c,s:0==e?0:e/m,b:m,toString:qa}};a.rgb2hsl=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e,h;m=P(c,a,b);e=Q(c,a,b);h=m-e;c=((0==h?0:m==c?(a-b)/h:m==a?(b-c)/h+2:(c-a)/h+4)+360)%6*60/360;m=(m+e)/2;return{h:c,s:0==h?0:0.5>m?h/(2*m):h/(2-2*
+m),l:m,toString:ra}};a.parsePathString=function(c){if(!c)return null;var b=a.path(c);if(b.arr)return a.path.clone(b.arr);var m={a:7,c:6,o:2,h:1,l:2,m:2,r:4,q:4,s:4,t:2,v:1,u:3,z:0},e=[];y(c,"array")&&y(c[0],"array")&&(e=a.path.clone(c));e.length||J(c).replace(W,function(c,a,b){var h=[];c=a.toLowerCase();b.replace(Z,function(c,a){a&&h.push(+a)});"m"==c&&2<h.length&&(e.push([a].concat(h.splice(0,2))),c="l",a="m"==a?"l":"L");"o"==c&&1==h.length&&e.push([a,h[0] ]);if("r"==c)e.push([a].concat(h));else for(;h.length>=
+m[c]&&(e.push([a].concat(h.splice(0,m[c]))),m[c]););});e.toString=a.path.toString;b.arr=a.path.clone(e);return e};var O=a.parseTransformString=function(c){if(!c)return null;var b=[];y(c,"array")&&y(c[0],"array")&&(b=a.path.clone(c));b.length||J(c).replace(ma,function(c,a,m){var e=[];a.toLowerCase();m.replace(Z,function(c,a){a&&e.push(+a)});b.push([a].concat(e))});b.toString=a.path.toString;return b};a._.svgTransform2string=d;a._.rgTransform=RegExp("^[a-z][\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*-?\\.?\\d",
+"i");a._.transform2matrix=f;a._unit2px=b;a._.getSomeDefs=u;a._.getSomeSVG=p;a.select=function(c){return x(G.doc.querySelector(c))};a.selectAll=function(c){c=G.doc.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};setInterval(function(){for(var c in E)if(E[h](c)){var a=E[c],b=a.node;("svg"!=a.type&&!b.ownerSVGElement||"svg"==a.type&&(!b.parentNode||"ownerSVGElement"in b.parentNode&&!b.ownerSVGElement))&&delete E[c]}},1E4);(function(c){function m(c){function a(c,
+b){var m=v(c.node,b);(m=(m=m&&m.match(d))&&m[2])&&"#"==m.charAt()&&(m=m.substring(1))&&(f[m]=(f[m]||[]).concat(function(a){var m={};m[b]=ca(a);v(c.node,m)}))}function b(c){var a=v(c.node,"xlink:href");a&&"#"==a.charAt()&&(a=a.substring(1))&&(f[a]=(f[a]||[]).concat(function(a){c.attr("xlink:href","#"+a)}))}var e=c.selectAll("*"),h,d=/^\s*url\(("|'|)(.*)\1\)\s*$/;c=[];for(var f={},l=0,E=e.length;l<E;l++){h=e[l];a(h,"fill");a(h,"stroke");a(h,"filter");a(h,"mask");a(h,"clip-path");b(h);var t=v(h.node,
+"id");t&&(v(h.node,{id:h.id}),c.push({old:t,id:h.id}))}l=0;for(E=c.length;l<E;l++)if(e=f[c[l].old])for(h=0,t=e.length;h<t;h++)e[h](c[l].id)}function e(c,a,b){return function(m){m=m.slice(c,a);1==m.length&&(m=m[0]);return b?b(m):m}}function d(c){return function(){var a=c?"<"+this.type:"",b=this.node.attributes,m=this.node.childNodes;if(c)for(var e=0,h=b.length;e<h;e++)a+=" "+b[e].name+'="'+b[e].value.replace(/"/g,'\\"')+'"';if(m.length){c&&(a+=">");e=0;for(h=m.length;e<h;e++)3==m[e].nodeType?a+=m[e].nodeValue:
+1==m[e].nodeType&&(a+=x(m[e]).toString());c&&(a+="</"+this.type+">")}else c&&(a+="/>");return a}}c.attr=function(c,a){if(!c)return this;if(y(c,"string"))if(1<arguments.length){var b={};b[c]=a;c=b}else return k("snap.util.getattr."+c,this).firstDefined();for(var m in c)c[h](m)&&k("snap.util.attr."+m,this,c[m]);return this};c.getBBox=function(c){if(!a.Matrix||!a.path)return this.node.getBBox();var b=this,m=new a.Matrix;if(b.removed)return a._.box();for(;"use"==b.type;)if(c||(m=m.add(b.transform().localMatrix.translate(b.attr("x")||
+0,b.attr("y")||0))),b.original)b=b.original;else var e=b.attr("xlink:href"),b=b.original=b.node.ownerDocument.getElementById(e.substring(e.indexOf("#")+1));var e=b._,h=a.path.get[b.type]||a.path.get.deflt;try{if(c)return e.bboxwt=h?a.path.getBBox(b.realPath=h(b)):a._.box(b.node.getBBox()),a._.box(e.bboxwt);b.realPath=h(b);b.matrix=b.transform().localMatrix;e.bbox=a.path.getBBox(a.path.map(b.realPath,m.add(b.matrix)));return a._.box(e.bbox)}catch(d){return a._.box()}};var f=function(){return this.string};
+c.transform=function(c){var b=this._;if(null==c){var m=this;c=new a.Matrix(this.node.getCTM());for(var e=n(this),h=[e],d=new a.Matrix,l=e.toTransformString(),b=J(e)==J(this.matrix)?J(b.transform):l;"svg"!=m.type&&(m=m.parent());)h.push(n(m));for(m=h.length;m--;)d.add(h[m]);return{string:b,globalMatrix:c,totalMatrix:d,localMatrix:e,diffMatrix:c.clone().add(e.invert()),global:c.toTransformString(),total:d.toTransformString(),local:l,toString:f}}c instanceof a.Matrix?this.matrix=c:n(this,c);this.node&&
+("linearGradient"==this.type||"radialGradient"==this.type?v(this.node,{gradientTransform:this.matrix}):"pattern"==this.type?v(this.node,{patternTransform:this.matrix}):v(this.node,{transform:this.matrix}));return this};c.parent=function(){return x(this.node.parentNode)};c.append=c.add=function(c){if(c){if("set"==c.type){var a=this;c.forEach(function(c){a.add(c)});return this}c=x(c);this.node.appendChild(c.node);c.paper=this.paper}return this};c.appendTo=function(c){c&&(c=x(c),c.append(this));return this};
+c.prepend=function(c){if(c){if("set"==c.type){var a=this,b;c.forEach(function(c){b?b.after(c):a.prepend(c);b=c});return this}c=x(c);var m=c.parent();this.node.insertBefore(c.node,this.node.firstChild);this.add&&this.add();c.paper=this.paper;this.parent()&&this.parent().add();m&&m.add()}return this};c.prependTo=function(c){c=x(c);c.prepend(this);return this};c.before=function(c){if("set"==c.type){var a=this;c.forEach(function(c){var b=c.parent();a.node.parentNode.insertBefore(c.node,a.node);b&&b.add()});
+this.parent().add();return this}c=x(c);var b=c.parent();this.node.parentNode.insertBefore(c.node,this.node);this.parent()&&this.parent().add();b&&b.add();c.paper=this.paper;return this};c.after=function(c){c=x(c);var a=c.parent();this.node.nextSibling?this.node.parentNode.insertBefore(c.node,this.node.nextSibling):this.node.parentNode.appendChild(c.node);this.parent()&&this.parent().add();a&&a.add();c.paper=this.paper;return this};c.insertBefore=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,
+c.node);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.insertAfter=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,c.node.nextSibling);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.remove=function(){var c=this.parent();this.node.parentNode&&this.node.parentNode.removeChild(this.node);delete this.paper;this.removed=!0;c&&c.add();return this};c.select=function(c){return x(this.node.querySelector(c))};c.selectAll=
+function(c){c=this.node.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};c.asPX=function(c,a){null==a&&(a=this.attr(c));return+b(this,c,a)};c.use=function(){var c,a=this.node.id;a||(a=this.id,v(this.node,{id:a}));c="linearGradient"==this.type||"radialGradient"==this.type||"pattern"==this.type?r(this.type,this.node.parentNode):r("use",this.node.parentNode);v(c.node,{"xlink:href":"#"+a});c.original=this;return c};var l=/\S+/g;c.addClass=function(c){var a=(c||
+"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h,d;if(a.length){for(e=0;d=a[e++];)h=m.indexOf(d),~h||m.push(d);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.removeClass=function(c){var a=(c||"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h;if(m.length){for(e=0;h=a[e++];)h=m.indexOf(h),~h&&m.splice(h,1);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.hasClass=function(c){return!!~(this.node.className.baseVal.match(l)||[]).indexOf(c)};
+c.toggleClass=function(c,a){if(null!=a)return a?this.addClass(c):this.removeClass(c);var b=(c||"").match(l)||[],m=this.node,e=m.className.baseVal,h=e.match(l)||[],d,f,E;for(d=0;E=b[d++];)f=h.indexOf(E),~f?h.splice(f,1):h.push(E);b=h.join(" ");e!=b&&(m.className.baseVal=b);return this};c.clone=function(){var c=x(this.node.cloneNode(!0));v(c.node,"id")&&v(c.node,{id:c.id});m(c);c.insertAfter(this);return c};c.toDefs=function(){u(this).appendChild(this.node);return this};c.pattern=c.toPattern=function(c,
+a,b,m){var e=r("pattern",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,c=c.x);v(e.node,{x:c,y:a,width:b,height:m,patternUnits:"userSpaceOnUse",id:e.id,viewBox:[c,a,b,m].join(" ")});e.node.appendChild(this.node);return e};c.marker=function(c,a,b,m,e,h){var d=r("marker",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,e=c.refX||c.cx,h=c.refY||c.cy,c=c.x);v(d.node,{viewBox:[c,a,b,m].join(" "),markerWidth:b,markerHeight:m,
+orient:"auto",refX:e||0,refY:h||0,id:d.id});d.node.appendChild(this.node);return d};var E=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);this.attr=c;this.dur=a;b&&(this.easing=b);m&&(this.callback=m)};a._.Animation=E;a.animation=function(c,a,b,m){return new E(c,a,b,m)};c.inAnim=function(){var c=[],a;for(a in this.anims)this.anims[h](a)&&function(a){c.push({anim:new E(a._attrs,a.dur,a.easing,a._callback),mina:a,curStatus:a.status(),status:function(c){return a.status(c)},stop:function(){a.stop()}})}(this.anims[a]);
+return c};a.animate=function(c,a,b,m,e,h){"function"!=typeof e||e.length||(h=e,e=L.linear);var d=L.time();c=L(c,a,d,d+m,L.time,b,e);h&&k.once("mina.finish."+c.id,h);return c};c.stop=function(){for(var c=this.inAnim(),a=0,b=c.length;a<b;a++)c[a].stop();return this};c.animate=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);c instanceof E&&(m=c.callback,b=c.easing,a=b.dur,c=c.attr);var d=[],f=[],l={},t,ca,n,T=this,q;for(q in c)if(c[h](q)){T.equal?(n=T.equal(q,J(c[q])),t=n.from,ca=
+n.to,n=n.f):(t=+T.attr(q),ca=+c[q]);var la=y(t,"array")?t.length:1;l[q]=e(d.length,d.length+la,n);d=d.concat(t);f=f.concat(ca)}t=L.time();var p=L(d,f,t,t+a,L.time,function(c){var a={},b;for(b in l)l[h](b)&&(a[b]=l[b](c));T.attr(a)},b);T.anims[p.id]=p;p._attrs=c;p._callback=m;k("snap.animcreated."+T.id,p);k.once("mina.finish."+p.id,function(){delete T.anims[p.id];m&&m.call(T)});k.once("mina.stop."+p.id,function(){delete T.anims[p.id]});return T};var T={};c.data=function(c,b){var m=T[this.id]=T[this.id]||
+{};if(0==arguments.length)return k("snap.data.get."+this.id,this,m,null),m;if(1==arguments.length){if(a.is(c,"object")){for(var e in c)c[h](e)&&this.data(e,c[e]);return this}k("snap.data.get."+this.id,this,m[c],c);return m[c]}m[c]=b;k("snap.data.set."+this.id,this,b,c);return this};c.removeData=function(c){null==c?T[this.id]={}:T[this.id]&&delete T[this.id][c];return this};c.outerSVG=c.toString=d(1);c.innerSVG=d()})(e.prototype);a.parse=function(c){var a=G.doc.createDocumentFragment(),b=!0,m=G.doc.createElement("div");
+c=J(c);c.match(/^\s*<\s*svg(?:\s|>)/)||(c="<svg>"+c+"</svg>",b=!1);m.innerHTML=c;if(c=m.getElementsByTagName("svg")[0])if(b)a=c;else for(;c.firstChild;)a.appendChild(c.firstChild);m.innerHTML=aa;return new l(a)};l.prototype.select=e.prototype.select;l.prototype.selectAll=e.prototype.selectAll;a.fragment=function(){for(var c=Array.prototype.slice.call(arguments,0),b=G.doc.createDocumentFragment(),m=0,e=c.length;m<e;m++){var h=c[m];h.node&&h.node.nodeType&&b.appendChild(h.node);h.nodeType&&b.appendChild(h);
+"string"==typeof h&&b.appendChild(a.parse(h).node)}return new l(b)};a._.make=r;a._.wrap=x;s.prototype.el=function(c,a){var b=r(c,this.node);a&&b.attr(a);return b};k.on("snap.util.getattr",function(){var c=k.nt(),c=c.substring(c.lastIndexOf(".")+1),a=c.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});return pa[h](a)?this.node.ownerDocument.defaultView.getComputedStyle(this.node,null).getPropertyValue(a):v(this.node,c)});var pa={"alignment-baseline":0,"baseline-shift":0,clip:0,"clip-path":0,
+"clip-rule":0,color:0,"color-interpolation":0,"color-interpolation-filters":0,"color-profile":0,"color-rendering":0,cursor:0,direction:0,display:0,"dominant-baseline":0,"enable-background":0,fill:0,"fill-opacity":0,"fill-rule":0,filter:0,"flood-color":0,"flood-opacity":0,font:0,"font-family":0,"font-size":0,"font-size-adjust":0,"font-stretch":0,"font-style":0,"font-variant":0,"font-weight":0,"glyph-orientation-horizontal":0,"glyph-orientation-vertical":0,"image-rendering":0,kerning:0,"letter-spacing":0,
+"lighting-color":0,marker:0,"marker-end":0,"marker-mid":0,"marker-start":0,mask:0,opacity:0,overflow:0,"pointer-events":0,"shape-rendering":0,"stop-color":0,"stop-opacity":0,stroke:0,"stroke-dasharray":0,"stroke-dashoffset":0,"stroke-linecap":0,"stroke-linejoin":0,"stroke-miterlimit":0,"stroke-opacity":0,"stroke-width":0,"text-anchor":0,"text-decoration":0,"text-rendering":0,"unicode-bidi":0,visibility:0,"word-spacing":0,"writing-mode":0};k.on("snap.util.attr",function(c){var a=k.nt(),b={},a=a.substring(a.lastIndexOf(".")+
+1);b[a]=c;var m=a.replace(/-(\w)/gi,function(c,a){return a.toUpperCase()}),a=a.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});pa[h](a)?this.node.style[m]=null==c?aa:c:v(this.node,b)});a.ajax=function(c,a,b,m){var e=new XMLHttpRequest,h=V();if(e){if(y(a,"function"))m=b,b=a,a=null;else if(y(a,"object")){var d=[],f;for(f in a)a.hasOwnProperty(f)&&d.push(encodeURIComponent(f)+"="+encodeURIComponent(a[f]));a=d.join("&")}e.open(a?"POST":"GET",c,!0);a&&(e.setRequestHeader("X-Requested-With","XMLHttpRequest"),
+e.setRequestHeader("Content-type","application/x-www-form-urlencoded"));b&&(k.once("snap.ajax."+h+".0",b),k.once("snap.ajax."+h+".200",b),k.once("snap.ajax."+h+".304",b));e.onreadystatechange=function(){4==e.readyState&&k("snap.ajax."+h+"."+e.status,m,e)};if(4==e.readyState)return e;e.send(a);return e}};a.load=function(c,b,m){a.ajax(c,function(c){c=a.parse(c.responseText);m?b.call(m,c):b(c)})};a.getElementByPoint=function(c,a){var b,m,e=G.doc.elementFromPoint(c,a);if(G.win.opera&&"svg"==e.tagName){b=
+e;m=b.getBoundingClientRect();b=b.ownerDocument;var h=b.body,d=b.documentElement;b=m.top+(g.win.pageYOffset||d.scrollTop||h.scrollTop)-(d.clientTop||h.clientTop||0);m=m.left+(g.win.pageXOffset||d.scrollLeft||h.scrollLeft)-(d.clientLeft||h.clientLeft||0);h=e.createSVGRect();h.x=c-m;h.y=a-b;h.width=h.height=1;b=e.getIntersectionList(h,null);b.length&&(e=b[b.length-1])}return e?x(e):null};a.plugin=function(c){c(a,e,s,G,l)};return G.win.Snap=a}();C.plugin(function(a,k,y,M,A){function w(a,d,f,b,q,e){null==
+d&&"[object SVGMatrix]"==z.call(a)?(this.a=a.a,this.b=a.b,this.c=a.c,this.d=a.d,this.e=a.e,this.f=a.f):null!=a?(this.a=+a,this.b=+d,this.c=+f,this.d=+b,this.e=+q,this.f=+e):(this.a=1,this.c=this.b=0,this.d=1,this.f=this.e=0)}var z=Object.prototype.toString,d=String,f=Math;(function(n){function k(a){return a[0]*a[0]+a[1]*a[1]}function p(a){var d=f.sqrt(k(a));a[0]&&(a[0]/=d);a[1]&&(a[1]/=d)}n.add=function(a,d,e,f,n,p){var k=[[],[],[] ],u=[[this.a,this.c,this.e],[this.b,this.d,this.f],[0,0,1] ];d=[[a,
+e,n],[d,f,p],[0,0,1] ];a&&a instanceof w&&(d=[[a.a,a.c,a.e],[a.b,a.d,a.f],[0,0,1] ]);for(a=0;3>a;a++)for(e=0;3>e;e++){for(f=n=0;3>f;f++)n+=u[a][f]*d[f][e];k[a][e]=n}this.a=k[0][0];this.b=k[1][0];this.c=k[0][1];this.d=k[1][1];this.e=k[0][2];this.f=k[1][2];return this};n.invert=function(){var a=this.a*this.d-this.b*this.c;return new w(this.d/a,-this.b/a,-this.c/a,this.a/a,(this.c*this.f-this.d*this.e)/a,(this.b*this.e-this.a*this.f)/a)};n.clone=function(){return new w(this.a,this.b,this.c,this.d,this.e,
+this.f)};n.translate=function(a,d){return this.add(1,0,0,1,a,d)};n.scale=function(a,d,e,f){null==d&&(d=a);(e||f)&&this.add(1,0,0,1,e,f);this.add(a,0,0,d,0,0);(e||f)&&this.add(1,0,0,1,-e,-f);return this};n.rotate=function(b,d,e){b=a.rad(b);d=d||0;e=e||0;var l=+f.cos(b).toFixed(9);b=+f.sin(b).toFixed(9);this.add(l,b,-b,l,d,e);return this.add(1,0,0,1,-d,-e)};n.x=function(a,d){return a*this.a+d*this.c+this.e};n.y=function(a,d){return a*this.b+d*this.d+this.f};n.get=function(a){return+this[d.fromCharCode(97+
+a)].toFixed(4)};n.toString=function(){return"matrix("+[this.get(0),this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)].join()+")"};n.offset=function(){return[this.e.toFixed(4),this.f.toFixed(4)]};n.determinant=function(){return this.a*this.d-this.b*this.c};n.split=function(){var b={};b.dx=this.e;b.dy=this.f;var d=[[this.a,this.c],[this.b,this.d] ];b.scalex=f.sqrt(k(d[0]));p(d[0]);b.shear=d[0][0]*d[1][0]+d[0][1]*d[1][1];d[1]=[d[1][0]-d[0][0]*b.shear,d[1][1]-d[0][1]*b.shear];b.scaley=f.sqrt(k(d[1]));
+p(d[1]);b.shear/=b.scaley;0>this.determinant()&&(b.scalex=-b.scalex);var e=-d[0][1],d=d[1][1];0>d?(b.rotate=a.deg(f.acos(d)),0>e&&(b.rotate=360-b.rotate)):b.rotate=a.deg(f.asin(e));b.isSimple=!+b.shear.toFixed(9)&&(b.scalex.toFixed(9)==b.scaley.toFixed(9)||!b.rotate);b.isSuperSimple=!+b.shear.toFixed(9)&&b.scalex.toFixed(9)==b.scaley.toFixed(9)&&!b.rotate;b.noRotation=!+b.shear.toFixed(9)&&!b.rotate;return b};n.toTransformString=function(a){a=a||this.split();if(+a.shear.toFixed(9))return"m"+[this.get(0),
+this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)];a.scalex=+a.scalex.toFixed(4);a.scaley=+a.scaley.toFixed(4);a.rotate=+a.rotate.toFixed(4);return(a.dx||a.dy?"t"+[+a.dx.toFixed(4),+a.dy.toFixed(4)]:"")+(1!=a.scalex||1!=a.scaley?"s"+[a.scalex,a.scaley,0,0]:"")+(a.rotate?"r"+[+a.rotate.toFixed(4),0,0]:"")}})(w.prototype);a.Matrix=w;a.matrix=function(a,d,f,b,k,e){return new w(a,d,f,b,k,e)}});C.plugin(function(a,v,y,M,A){function w(h){return function(d){k.stop();d instanceof A&&1==d.node.childNodes.length&&
+("radialGradient"==d.node.firstChild.tagName||"linearGradient"==d.node.firstChild.tagName||"pattern"==d.node.firstChild.tagName)&&(d=d.node.firstChild,b(this).appendChild(d),d=u(d));if(d instanceof v)if("radialGradient"==d.type||"linearGradient"==d.type||"pattern"==d.type){d.node.id||e(d.node,{id:d.id});var f=l(d.node.id)}else f=d.attr(h);else f=a.color(d),f.error?(f=a(b(this).ownerSVGElement).gradient(d))?(f.node.id||e(f.node,{id:f.id}),f=l(f.node.id)):f=d:f=r(f);d={};d[h]=f;e(this.node,d);this.node.style[h]=
+x}}function z(a){k.stop();a==+a&&(a+="px");this.node.style.fontSize=a}function d(a){var b=[];a=a.childNodes;for(var e=0,f=a.length;e<f;e++){var l=a[e];3==l.nodeType&&b.push(l.nodeValue);"tspan"==l.tagName&&(1==l.childNodes.length&&3==l.firstChild.nodeType?b.push(l.firstChild.nodeValue):b.push(d(l)))}return b}function f(){k.stop();return this.node.style.fontSize}var n=a._.make,u=a._.wrap,p=a.is,b=a._.getSomeDefs,q=/^url\(#?([^)]+)\)$/,e=a._.$,l=a.url,r=String,s=a._.separator,x="";k.on("snap.util.attr.mask",
+function(a){if(a instanceof v||a instanceof A){k.stop();a instanceof A&&1==a.node.childNodes.length&&(a=a.node.firstChild,b(this).appendChild(a),a=u(a));if("mask"==a.type)var d=a;else d=n("mask",b(this)),d.node.appendChild(a.node);!d.node.id&&e(d.node,{id:d.id});e(this.node,{mask:l(d.id)})}});(function(a){k.on("snap.util.attr.clip",a);k.on("snap.util.attr.clip-path",a);k.on("snap.util.attr.clipPath",a)})(function(a){if(a instanceof v||a instanceof A){k.stop();if("clipPath"==a.type)var d=a;else d=
+n("clipPath",b(this)),d.node.appendChild(a.node),!d.node.id&&e(d.node,{id:d.id});e(this.node,{"clip-path":l(d.id)})}});k.on("snap.util.attr.fill",w("fill"));k.on("snap.util.attr.stroke",w("stroke"));var G=/^([lr])(?:\(([^)]*)\))?(.*)$/i;k.on("snap.util.grad.parse",function(a){a=r(a);var b=a.match(G);if(!b)return null;a=b[1];var e=b[2],b=b[3],e=e.split(/\s*,\s*/).map(function(a){return+a==a?+a:a});1==e.length&&0==e[0]&&(e=[]);b=b.split("-");b=b.map(function(a){a=a.split(":");var b={color:a[0]};a[1]&&
+(b.offset=parseFloat(a[1]));return b});return{type:a,params:e,stops:b}});k.on("snap.util.attr.d",function(b){k.stop();p(b,"array")&&p(b[0],"array")&&(b=a.path.toString.call(b));b=r(b);b.match(/[ruo]/i)&&(b=a.path.toAbsolute(b));e(this.node,{d:b})})(-1);k.on("snap.util.attr.#text",function(a){k.stop();a=r(a);for(a=M.doc.createTextNode(a);this.node.firstChild;)this.node.removeChild(this.node.firstChild);this.node.appendChild(a)})(-1);k.on("snap.util.attr.path",function(a){k.stop();this.attr({d:a})})(-1);
+k.on("snap.util.attr.class",function(a){k.stop();this.node.className.baseVal=a})(-1);k.on("snap.util.attr.viewBox",function(a){a=p(a,"object")&&"x"in a?[a.x,a.y,a.width,a.height].join(" "):p(a,"array")?a.join(" "):a;e(this.node,{viewBox:a});k.stop()})(-1);k.on("snap.util.attr.transform",function(a){this.transform(a);k.stop()})(-1);k.on("snap.util.attr.r",function(a){"rect"==this.type&&(k.stop(),e(this.node,{rx:a,ry:a}))})(-1);k.on("snap.util.attr.textpath",function(a){k.stop();if("text"==this.type){var d,
+f;if(!a&&this.textPath){for(a=this.textPath;a.node.firstChild;)this.node.appendChild(a.node.firstChild);a.remove();delete this.textPath}else if(p(a,"string")?(d=b(this),a=u(d.parentNode).path(a),d.appendChild(a.node),d=a.id,a.attr({id:d})):(a=u(a),a instanceof v&&(d=a.attr("id"),d||(d=a.id,a.attr({id:d})))),d)if(a=this.textPath,f=this.node,a)a.attr({"xlink:href":"#"+d});else{for(a=e("textPath",{"xlink:href":"#"+d});f.firstChild;)a.appendChild(f.firstChild);f.appendChild(a);this.textPath=u(a)}}})(-1);
+k.on("snap.util.attr.text",function(a){if("text"==this.type){for(var b=this.node,d=function(a){var b=e("tspan");if(p(a,"array"))for(var f=0;f<a.length;f++)b.appendChild(d(a[f]));else b.appendChild(M.doc.createTextNode(a));b.normalize&&b.normalize();return b};b.firstChild;)b.removeChild(b.firstChild);for(a=d(a);a.firstChild;)b.appendChild(a.firstChild)}k.stop()})(-1);k.on("snap.util.attr.fontSize",z)(-1);k.on("snap.util.attr.font-size",z)(-1);k.on("snap.util.getattr.transform",function(){k.stop();
+return this.transform()})(-1);k.on("snap.util.getattr.textpath",function(){k.stop();return this.textPath})(-1);(function(){function b(d){return function(){k.stop();var b=M.doc.defaultView.getComputedStyle(this.node,null).getPropertyValue("marker-"+d);return"none"==b?b:a(M.doc.getElementById(b.match(q)[1]))}}function d(a){return function(b){k.stop();var d="marker"+a.charAt(0).toUpperCase()+a.substring(1);if(""==b||!b)this.node.style[d]="none";else if("marker"==b.type){var f=b.node.id;f||e(b.node,{id:b.id});
+this.node.style[d]=l(f)}}}k.on("snap.util.getattr.marker-end",b("end"))(-1);k.on("snap.util.getattr.markerEnd",b("end"))(-1);k.on("snap.util.getattr.marker-start",b("start"))(-1);k.on("snap.util.getattr.markerStart",b("start"))(-1);k.on("snap.util.getattr.marker-mid",b("mid"))(-1);k.on("snap.util.getattr.markerMid",b("mid"))(-1);k.on("snap.util.attr.marker-end",d("end"))(-1);k.on("snap.util.attr.markerEnd",d("end"))(-1);k.on("snap.util.attr.marker-start",d("start"))(-1);k.on("snap.util.attr.markerStart",
+d("start"))(-1);k.on("snap.util.attr.marker-mid",d("mid"))(-1);k.on("snap.util.attr.markerMid",d("mid"))(-1)})();k.on("snap.util.getattr.r",function(){if("rect"==this.type&&e(this.node,"rx")==e(this.node,"ry"))return k.stop(),e(this.node,"rx")})(-1);k.on("snap.util.getattr.text",function(){if("text"==this.type||"tspan"==this.type){k.stop();var a=d(this.node);return 1==a.length?a[0]:a}})(-1);k.on("snap.util.getattr.#text",function(){return this.node.textContent})(-1);k.on("snap.util.getattr.viewBox",
+function(){k.stop();var b=e(this.node,"viewBox");if(b)return b=b.split(s),a._.box(+b[0],+b[1],+b[2],+b[3])})(-1);k.on("snap.util.getattr.points",function(){var a=e(this.node,"points");k.stop();if(a)return a.split(s)})(-1);k.on("snap.util.getattr.path",function(){var a=e(this.node,"d");k.stop();return a})(-1);k.on("snap.util.getattr.class",function(){return this.node.className.baseVal})(-1);k.on("snap.util.getattr.fontSize",f)(-1);k.on("snap.util.getattr.font-size",f)(-1)});C.plugin(function(a,v,y,
+M,A){function w(a){return a}function z(a){return function(b){return+b.toFixed(3)+a}}var d={"+":function(a,b){return a+b},"-":function(a,b){return a-b},"/":function(a,b){return a/b},"*":function(a,b){return a*b}},f=String,n=/[a-z]+$/i,u=/^\s*([+\-\/*])\s*=\s*([\d.eE+\-]+)\s*([^\d\s]+)?\s*$/;k.on("snap.util.attr",function(a){if(a=f(a).match(u)){var b=k.nt(),b=b.substring(b.lastIndexOf(".")+1),q=this.attr(b),e={};k.stop();var l=a[3]||"",r=q.match(n),s=d[a[1] ];r&&r==l?a=s(parseFloat(q),+a[2]):(q=this.asPX(b),
+a=s(this.asPX(b),this.asPX(b,a[2]+l)));isNaN(q)||isNaN(a)||(e[b]=a,this.attr(e))}})(-10);k.on("snap.util.equal",function(a,b){var q=f(this.attr(a)||""),e=f(b).match(u);if(e){k.stop();var l=e[3]||"",r=q.match(n),s=d[e[1] ];if(r&&r==l)return{from:parseFloat(q),to:s(parseFloat(q),+e[2]),f:z(r)};q=this.asPX(a);return{from:q,to:s(q,this.asPX(a,e[2]+l)),f:w}}})(-10)});C.plugin(function(a,v,y,M,A){var w=y.prototype,z=a.is;w.rect=function(a,d,k,p,b,q){var e;null==q&&(q=b);z(a,"object")&&"[object Object]"==
+a?e=a:null!=a&&(e={x:a,y:d,width:k,height:p},null!=b&&(e.rx=b,e.ry=q));return this.el("rect",e)};w.circle=function(a,d,k){var p;z(a,"object")&&"[object Object]"==a?p=a:null!=a&&(p={cx:a,cy:d,r:k});return this.el("circle",p)};var d=function(){function a(){this.parentNode.removeChild(this)}return function(d,k){var p=M.doc.createElement("img"),b=M.doc.body;p.style.cssText="position:absolute;left:-9999em;top:-9999em";p.onload=function(){k.call(p);p.onload=p.onerror=null;b.removeChild(p)};p.onerror=a;
+b.appendChild(p);p.src=d}}();w.image=function(f,n,k,p,b){var q=this.el("image");if(z(f,"object")&&"src"in f)q.attr(f);else if(null!=f){var e={"xlink:href":f,preserveAspectRatio:"none"};null!=n&&null!=k&&(e.x=n,e.y=k);null!=p&&null!=b?(e.width=p,e.height=b):d(f,function(){a._.$(q.node,{width:this.offsetWidth,height:this.offsetHeight})});a._.$(q.node,e)}return q};w.ellipse=function(a,d,k,p){var b;z(a,"object")&&"[object Object]"==a?b=a:null!=a&&(b={cx:a,cy:d,rx:k,ry:p});return this.el("ellipse",b)};
+w.path=function(a){var d;z(a,"object")&&!z(a,"array")?d=a:a&&(d={d:a});return this.el("path",d)};w.group=w.g=function(a){var d=this.el("g");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.svg=function(a,d,k,p,b,q,e,l){var r={};z(a,"object")&&null==d?r=a:(null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l]));return this.el("svg",r)};w.mask=function(a){var d=
+this.el("mask");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.ptrn=function(a,d,k,p,b,q,e,l){if(z(a,"object"))var r=a;else arguments.length?(r={},null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l])):r={patternUnits:"userSpaceOnUse"};return this.el("pattern",r)};w.use=function(a){return null!=a?(make("use",this.node),a instanceof v&&(a.attr("id")||
+a.attr({id:ID()}),a=a.attr("id")),this.el("use",{"xlink:href":a})):v.prototype.use.call(this)};w.text=function(a,d,k){var p={};z(a,"object")?p=a:null!=a&&(p={x:a,y:d,text:k||""});return this.el("text",p)};w.line=function(a,d,k,p){var b={};z(a,"object")?b=a:null!=a&&(b={x1:a,x2:k,y1:d,y2:p});return this.el("line",b)};w.polyline=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polyline",d)};
+w.polygon=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polygon",d)};(function(){function d(){return this.selectAll("stop")}function n(b,d){var f=e("stop"),k={offset:+d+"%"};b=a.color(b);k["stop-color"]=b.hex;1>b.opacity&&(k["stop-opacity"]=b.opacity);e(f,k);this.node.appendChild(f);return this}function u(){if("linearGradient"==this.type){var b=e(this.node,"x1")||0,d=e(this.node,"x2")||
+1,f=e(this.node,"y1")||0,k=e(this.node,"y2")||0;return a._.box(b,f,math.abs(d-b),math.abs(k-f))}b=this.node.r||0;return a._.box((this.node.cx||0.5)-b,(this.node.cy||0.5)-b,2*b,2*b)}function p(a,d){function f(a,b){for(var d=(b-u)/(a-w),e=w;e<a;e++)h[e].offset=+(+u+d*(e-w)).toFixed(2);w=a;u=b}var n=k("snap.util.grad.parse",null,d).firstDefined(),p;if(!n)return null;n.params.unshift(a);p="l"==n.type.toLowerCase()?b.apply(0,n.params):q.apply(0,n.params);n.type!=n.type.toLowerCase()&&e(p.node,{gradientUnits:"userSpaceOnUse"});
+var h=n.stops,n=h.length,u=0,w=0;n--;for(var v=0;v<n;v++)"offset"in h[v]&&f(v,h[v].offset);h[n].offset=h[n].offset||100;f(n,h[n].offset);for(v=0;v<=n;v++){var y=h[v];p.addStop(y.color,y.offset)}return p}function b(b,k,p,q,w){b=a._.make("linearGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{x1:k,y1:p,x2:q,y2:w});return b}function q(b,k,p,q,w,h){b=a._.make("radialGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{cx:k,cy:p,r:q});null!=w&&null!=h&&e(b.node,{fx:w,fy:h});
+return b}var e=a._.$;w.gradient=function(a){return p(this.defs,a)};w.gradientLinear=function(a,d,e,f){return b(this.defs,a,d,e,f)};w.gradientRadial=function(a,b,d,e,f){return q(this.defs,a,b,d,e,f)};w.toString=function(){var b=this.node.ownerDocument,d=b.createDocumentFragment(),b=b.createElement("div"),e=this.node.cloneNode(!0);d.appendChild(b);b.appendChild(e);a._.$(e,{xmlns:"http://www.w3.org/2000/svg"});b=b.innerHTML;d.removeChild(d.firstChild);return b};w.clear=function(){for(var a=this.node.firstChild,
+b;a;)b=a.nextSibling,"defs"!=a.tagName?a.parentNode.removeChild(a):w.clear.call({node:a}),a=b}})()});C.plugin(function(a,k,y,M){function A(a){var b=A.ps=A.ps||{};b[a]?b[a].sleep=100:b[a]={sleep:100};setTimeout(function(){for(var d in b)b[L](d)&&d!=a&&(b[d].sleep--,!b[d].sleep&&delete b[d])});return b[a]}function w(a,b,d,e){null==a&&(a=b=d=e=0);null==b&&(b=a.y,d=a.width,e=a.height,a=a.x);return{x:a,y:b,width:d,w:d,height:e,h:e,x2:a+d,y2:b+e,cx:a+d/2,cy:b+e/2,r1:F.min(d,e)/2,r2:F.max(d,e)/2,r0:F.sqrt(d*
+d+e*e)/2,path:s(a,b,d,e),vb:[a,b,d,e].join(" ")}}function z(){return this.join(",").replace(N,"$1")}function d(a){a=C(a);a.toString=z;return a}function f(a,b,d,h,f,k,l,n,p){if(null==p)return e(a,b,d,h,f,k,l,n);if(0>p||e(a,b,d,h,f,k,l,n)<p)p=void 0;else{var q=0.5,O=1-q,s;for(s=e(a,b,d,h,f,k,l,n,O);0.01<Z(s-p);)q/=2,O+=(s<p?1:-1)*q,s=e(a,b,d,h,f,k,l,n,O);p=O}return u(a,b,d,h,f,k,l,n,p)}function n(b,d){function e(a){return+(+a).toFixed(3)}return a._.cacher(function(a,h,l){a instanceof k&&(a=a.attr("d"));
+a=I(a);for(var n,p,D,q,O="",s={},c=0,t=0,r=a.length;t<r;t++){D=a[t];if("M"==D[0])n=+D[1],p=+D[2];else{q=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6]);if(c+q>h){if(d&&!s.start){n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c);O+=["C"+e(n.start.x),e(n.start.y),e(n.m.x),e(n.m.y),e(n.x),e(n.y)];if(l)return O;s.start=O;O=["M"+e(n.x),e(n.y)+"C"+e(n.n.x),e(n.n.y),e(n.end.x),e(n.end.y),e(D[5]),e(D[6])].join();c+=q;n=+D[5];p=+D[6];continue}if(!b&&!d)return n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c)}c+=q;n=+D[5];p=+D[6]}O+=
+D.shift()+D}s.end=O;return n=b?c:d?s:u(n,p,D[0],D[1],D[2],D[3],D[4],D[5],1)},null,a._.clone)}function u(a,b,d,e,h,f,k,l,n){var p=1-n,q=ma(p,3),s=ma(p,2),c=n*n,t=c*n,r=q*a+3*s*n*d+3*p*n*n*h+t*k,q=q*b+3*s*n*e+3*p*n*n*f+t*l,s=a+2*n*(d-a)+c*(h-2*d+a),t=b+2*n*(e-b)+c*(f-2*e+b),x=d+2*n*(h-d)+c*(k-2*h+d),c=e+2*n*(f-e)+c*(l-2*f+e);a=p*a+n*d;b=p*b+n*e;h=p*h+n*k;f=p*f+n*l;l=90-180*F.atan2(s-x,t-c)/S;return{x:r,y:q,m:{x:s,y:t},n:{x:x,y:c},start:{x:a,y:b},end:{x:h,y:f},alpha:l}}function p(b,d,e,h,f,n,k,l){a.is(b,
+"array")||(b=[b,d,e,h,f,n,k,l]);b=U.apply(null,b);return w(b.min.x,b.min.y,b.max.x-b.min.x,b.max.y-b.min.y)}function b(a,b,d){return b>=a.x&&b<=a.x+a.width&&d>=a.y&&d<=a.y+a.height}function q(a,d){a=w(a);d=w(d);return b(d,a.x,a.y)||b(d,a.x2,a.y)||b(d,a.x,a.y2)||b(d,a.x2,a.y2)||b(a,d.x,d.y)||b(a,d.x2,d.y)||b(a,d.x,d.y2)||b(a,d.x2,d.y2)||(a.x<d.x2&&a.x>d.x||d.x<a.x2&&d.x>a.x)&&(a.y<d.y2&&a.y>d.y||d.y<a.y2&&d.y>a.y)}function e(a,b,d,e,h,f,n,k,l){null==l&&(l=1);l=(1<l?1:0>l?0:l)/2;for(var p=[-0.1252,
+0.1252,-0.3678,0.3678,-0.5873,0.5873,-0.7699,0.7699,-0.9041,0.9041,-0.9816,0.9816],q=[0.2491,0.2491,0.2335,0.2335,0.2032,0.2032,0.1601,0.1601,0.1069,0.1069,0.0472,0.0472],s=0,c=0;12>c;c++)var t=l*p[c]+l,r=t*(t*(-3*a+9*d-9*h+3*n)+6*a-12*d+6*h)-3*a+3*d,t=t*(t*(-3*b+9*e-9*f+3*k)+6*b-12*e+6*f)-3*b+3*e,s=s+q[c]*F.sqrt(r*r+t*t);return l*s}function l(a,b,d){a=I(a);b=I(b);for(var h,f,l,n,k,s,r,O,x,c,t=d?0:[],w=0,v=a.length;w<v;w++)if(x=a[w],"M"==x[0])h=k=x[1],f=s=x[2];else{"C"==x[0]?(x=[h,f].concat(x.slice(1)),
+h=x[6],f=x[7]):(x=[h,f,h,f,k,s,k,s],h=k,f=s);for(var G=0,y=b.length;G<y;G++)if(c=b[G],"M"==c[0])l=r=c[1],n=O=c[2];else{"C"==c[0]?(c=[l,n].concat(c.slice(1)),l=c[6],n=c[7]):(c=[l,n,l,n,r,O,r,O],l=r,n=O);var z;var K=x,B=c;z=d;var H=p(K),J=p(B);if(q(H,J)){for(var H=e.apply(0,K),J=e.apply(0,B),H=~~(H/8),J=~~(J/8),U=[],A=[],F={},M=z?0:[],P=0;P<H+1;P++){var C=u.apply(0,K.concat(P/H));U.push({x:C.x,y:C.y,t:P/H})}for(P=0;P<J+1;P++)C=u.apply(0,B.concat(P/J)),A.push({x:C.x,y:C.y,t:P/J});for(P=0;P<H;P++)for(K=
+0;K<J;K++){var Q=U[P],L=U[P+1],B=A[K],C=A[K+1],N=0.001>Z(L.x-Q.x)?"y":"x",S=0.001>Z(C.x-B.x)?"y":"x",R;R=Q.x;var Y=Q.y,V=L.x,ea=L.y,fa=B.x,ga=B.y,ha=C.x,ia=C.y;if(W(R,V)<X(fa,ha)||X(R,V)>W(fa,ha)||W(Y,ea)<X(ga,ia)||X(Y,ea)>W(ga,ia))R=void 0;else{var $=(R*ea-Y*V)*(fa-ha)-(R-V)*(fa*ia-ga*ha),aa=(R*ea-Y*V)*(ga-ia)-(Y-ea)*(fa*ia-ga*ha),ja=(R-V)*(ga-ia)-(Y-ea)*(fa-ha);if(ja){var $=$/ja,aa=aa/ja,ja=+$.toFixed(2),ba=+aa.toFixed(2);R=ja<+X(R,V).toFixed(2)||ja>+W(R,V).toFixed(2)||ja<+X(fa,ha).toFixed(2)||
+ja>+W(fa,ha).toFixed(2)||ba<+X(Y,ea).toFixed(2)||ba>+W(Y,ea).toFixed(2)||ba<+X(ga,ia).toFixed(2)||ba>+W(ga,ia).toFixed(2)?void 0:{x:$,y:aa}}else R=void 0}R&&F[R.x.toFixed(4)]!=R.y.toFixed(4)&&(F[R.x.toFixed(4)]=R.y.toFixed(4),Q=Q.t+Z((R[N]-Q[N])/(L[N]-Q[N]))*(L.t-Q.t),B=B.t+Z((R[S]-B[S])/(C[S]-B[S]))*(C.t-B.t),0<=Q&&1>=Q&&0<=B&&1>=B&&(z?M++:M.push({x:R.x,y:R.y,t1:Q,t2:B})))}z=M}else z=z?0:[];if(d)t+=z;else{H=0;for(J=z.length;H<J;H++)z[H].segment1=w,z[H].segment2=G,z[H].bez1=x,z[H].bez2=c;t=t.concat(z)}}}return t}
+function r(a){var b=A(a);if(b.bbox)return C(b.bbox);if(!a)return w();a=I(a);for(var d=0,e=0,h=[],f=[],l,n=0,k=a.length;n<k;n++)l=a[n],"M"==l[0]?(d=l[1],e=l[2],h.push(d),f.push(e)):(d=U(d,e,l[1],l[2],l[3],l[4],l[5],l[6]),h=h.concat(d.min.x,d.max.x),f=f.concat(d.min.y,d.max.y),d=l[5],e=l[6]);a=X.apply(0,h);l=X.apply(0,f);h=W.apply(0,h);f=W.apply(0,f);f=w(a,l,h-a,f-l);b.bbox=C(f);return f}function s(a,b,d,e,h){if(h)return[["M",+a+ +h,b],["l",d-2*h,0],["a",h,h,0,0,1,h,h],["l",0,e-2*h],["a",h,h,0,0,1,
+-h,h],["l",2*h-d,0],["a",h,h,0,0,1,-h,-h],["l",0,2*h-e],["a",h,h,0,0,1,h,-h],["z"] ];a=[["M",a,b],["l",d,0],["l",0,e],["l",-d,0],["z"] ];a.toString=z;return a}function x(a,b,d,e,h){null==h&&null==e&&(e=d);a=+a;b=+b;d=+d;e=+e;if(null!=h){var f=Math.PI/180,l=a+d*Math.cos(-e*f);a+=d*Math.cos(-h*f);var n=b+d*Math.sin(-e*f);b+=d*Math.sin(-h*f);d=[["M",l,n],["A",d,d,0,+(180<h-e),0,a,b] ]}else d=[["M",a,b],["m",0,-e],["a",d,e,0,1,1,0,2*e],["a",d,e,0,1,1,0,-2*e],["z"] ];d.toString=z;return d}function G(b){var e=
+A(b);if(e.abs)return d(e.abs);Q(b,"array")&&Q(b&&b[0],"array")||(b=a.parsePathString(b));if(!b||!b.length)return[["M",0,0] ];var h=[],f=0,l=0,n=0,k=0,p=0;"M"==b[0][0]&&(f=+b[0][1],l=+b[0][2],n=f,k=l,p++,h[0]=["M",f,l]);for(var q=3==b.length&&"M"==b[0][0]&&"R"==b[1][0].toUpperCase()&&"Z"==b[2][0].toUpperCase(),s,r,w=p,c=b.length;w<c;w++){h.push(s=[]);r=b[w];p=r[0];if(p!=p.toUpperCase())switch(s[0]=p.toUpperCase(),s[0]){case "A":s[1]=r[1];s[2]=r[2];s[3]=r[3];s[4]=r[4];s[5]=r[5];s[6]=+r[6]+f;s[7]=+r[7]+
+l;break;case "V":s[1]=+r[1]+l;break;case "H":s[1]=+r[1]+f;break;case "R":for(var t=[f,l].concat(r.slice(1)),u=2,v=t.length;u<v;u++)t[u]=+t[u]+f,t[++u]=+t[u]+l;h.pop();h=h.concat(P(t,q));break;case "O":h.pop();t=x(f,l,r[1],r[2]);t.push(t[0]);h=h.concat(t);break;case "U":h.pop();h=h.concat(x(f,l,r[1],r[2],r[3]));s=["U"].concat(h[h.length-1].slice(-2));break;case "M":n=+r[1]+f,k=+r[2]+l;default:for(u=1,v=r.length;u<v;u++)s[u]=+r[u]+(u%2?f:l)}else if("R"==p)t=[f,l].concat(r.slice(1)),h.pop(),h=h.concat(P(t,
+q)),s=["R"].concat(r.slice(-2));else if("O"==p)h.pop(),t=x(f,l,r[1],r[2]),t.push(t[0]),h=h.concat(t);else if("U"==p)h.pop(),h=h.concat(x(f,l,r[1],r[2],r[3])),s=["U"].concat(h[h.length-1].slice(-2));else for(t=0,u=r.length;t<u;t++)s[t]=r[t];p=p.toUpperCase();if("O"!=p)switch(s[0]){case "Z":f=+n;l=+k;break;case "H":f=s[1];break;case "V":l=s[1];break;case "M":n=s[s.length-2],k=s[s.length-1];default:f=s[s.length-2],l=s[s.length-1]}}h.toString=z;e.abs=d(h);return h}function h(a,b,d,e){return[a,b,d,e,d,
+e]}function J(a,b,d,e,h,f){var l=1/3,n=2/3;return[l*a+n*d,l*b+n*e,l*h+n*d,l*f+n*e,h,f]}function K(b,d,e,h,f,l,n,k,p,s){var r=120*S/180,q=S/180*(+f||0),c=[],t,x=a._.cacher(function(a,b,c){var d=a*F.cos(c)-b*F.sin(c);a=a*F.sin(c)+b*F.cos(c);return{x:d,y:a}});if(s)v=s[0],t=s[1],l=s[2],u=s[3];else{t=x(b,d,-q);b=t.x;d=t.y;t=x(k,p,-q);k=t.x;p=t.y;F.cos(S/180*f);F.sin(S/180*f);t=(b-k)/2;v=(d-p)/2;u=t*t/(e*e)+v*v/(h*h);1<u&&(u=F.sqrt(u),e*=u,h*=u);var u=e*e,w=h*h,u=(l==n?-1:1)*F.sqrt(Z((u*w-u*v*v-w*t*t)/
+(u*v*v+w*t*t)));l=u*e*v/h+(b+k)/2;var u=u*-h*t/e+(d+p)/2,v=F.asin(((d-u)/h).toFixed(9));t=F.asin(((p-u)/h).toFixed(9));v=b<l?S-v:v;t=k<l?S-t:t;0>v&&(v=2*S+v);0>t&&(t=2*S+t);n&&v>t&&(v-=2*S);!n&&t>v&&(t-=2*S)}if(Z(t-v)>r){var c=t,w=k,G=p;t=v+r*(n&&t>v?1:-1);k=l+e*F.cos(t);p=u+h*F.sin(t);c=K(k,p,e,h,f,0,n,w,G,[t,c,l,u])}l=t-v;f=F.cos(v);r=F.sin(v);n=F.cos(t);t=F.sin(t);l=F.tan(l/4);e=4/3*e*l;l*=4/3*h;h=[b,d];b=[b+e*r,d-l*f];d=[k+e*t,p-l*n];k=[k,p];b[0]=2*h[0]-b[0];b[1]=2*h[1]-b[1];if(s)return[b,d,k].concat(c);
+c=[b,d,k].concat(c).join().split(",");s=[];k=0;for(p=c.length;k<p;k++)s[k]=k%2?x(c[k-1],c[k],q).y:x(c[k],c[k+1],q).x;return s}function U(a,b,d,e,h,f,l,k){for(var n=[],p=[[],[] ],s,r,c,t,q=0;2>q;++q)0==q?(r=6*a-12*d+6*h,s=-3*a+9*d-9*h+3*l,c=3*d-3*a):(r=6*b-12*e+6*f,s=-3*b+9*e-9*f+3*k,c=3*e-3*b),1E-12>Z(s)?1E-12>Z(r)||(s=-c/r,0<s&&1>s&&n.push(s)):(t=r*r-4*c*s,c=F.sqrt(t),0>t||(t=(-r+c)/(2*s),0<t&&1>t&&n.push(t),s=(-r-c)/(2*s),0<s&&1>s&&n.push(s)));for(r=q=n.length;q--;)s=n[q],c=1-s,p[0][q]=c*c*c*a+3*
+c*c*s*d+3*c*s*s*h+s*s*s*l,p[1][q]=c*c*c*b+3*c*c*s*e+3*c*s*s*f+s*s*s*k;p[0][r]=a;p[1][r]=b;p[0][r+1]=l;p[1][r+1]=k;p[0].length=p[1].length=r+2;return{min:{x:X.apply(0,p[0]),y:X.apply(0,p[1])},max:{x:W.apply(0,p[0]),y:W.apply(0,p[1])}}}function I(a,b){var e=!b&&A(a);if(!b&&e.curve)return d(e.curve);var f=G(a),l=b&&G(b),n={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},k={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},p=function(a,b,c){if(!a)return["C",b.x,b.y,b.x,b.y,b.x,b.y];a[0]in{T:1,Q:1}||(b.qx=b.qy=null);
+switch(a[0]){case "M":b.X=a[1];b.Y=a[2];break;case "A":a=["C"].concat(K.apply(0,[b.x,b.y].concat(a.slice(1))));break;case "S":"C"==c||"S"==c?(c=2*b.x-b.bx,b=2*b.y-b.by):(c=b.x,b=b.y);a=["C",c,b].concat(a.slice(1));break;case "T":"Q"==c||"T"==c?(b.qx=2*b.x-b.qx,b.qy=2*b.y-b.qy):(b.qx=b.x,b.qy=b.y);a=["C"].concat(J(b.x,b.y,b.qx,b.qy,a[1],a[2]));break;case "Q":b.qx=a[1];b.qy=a[2];a=["C"].concat(J(b.x,b.y,a[1],a[2],a[3],a[4]));break;case "L":a=["C"].concat(h(b.x,b.y,a[1],a[2]));break;case "H":a=["C"].concat(h(b.x,
+b.y,a[1],b.y));break;case "V":a=["C"].concat(h(b.x,b.y,b.x,a[1]));break;case "Z":a=["C"].concat(h(b.x,b.y,b.X,b.Y))}return a},s=function(a,b){if(7<a[b].length){a[b].shift();for(var c=a[b];c.length;)q[b]="A",l&&(u[b]="A"),a.splice(b++,0,["C"].concat(c.splice(0,6)));a.splice(b,1);v=W(f.length,l&&l.length||0)}},r=function(a,b,c,d,e){a&&b&&"M"==a[e][0]&&"M"!=b[e][0]&&(b.splice(e,0,["M",d.x,d.y]),c.bx=0,c.by=0,c.x=a[e][1],c.y=a[e][2],v=W(f.length,l&&l.length||0))},q=[],u=[],c="",t="",x=0,v=W(f.length,
+l&&l.length||0);for(;x<v;x++){f[x]&&(c=f[x][0]);"C"!=c&&(q[x]=c,x&&(t=q[x-1]));f[x]=p(f[x],n,t);"A"!=q[x]&&"C"==c&&(q[x]="C");s(f,x);l&&(l[x]&&(c=l[x][0]),"C"!=c&&(u[x]=c,x&&(t=u[x-1])),l[x]=p(l[x],k,t),"A"!=u[x]&&"C"==c&&(u[x]="C"),s(l,x));r(f,l,n,k,x);r(l,f,k,n,x);var w=f[x],z=l&&l[x],y=w.length,U=l&&z.length;n.x=w[y-2];n.y=w[y-1];n.bx=$(w[y-4])||n.x;n.by=$(w[y-3])||n.y;k.bx=l&&($(z[U-4])||k.x);k.by=l&&($(z[U-3])||k.y);k.x=l&&z[U-2];k.y=l&&z[U-1]}l||(e.curve=d(f));return l?[f,l]:f}function P(a,
+b){for(var d=[],e=0,h=a.length;h-2*!b>e;e+=2){var f=[{x:+a[e-2],y:+a[e-1]},{x:+a[e],y:+a[e+1]},{x:+a[e+2],y:+a[e+3]},{x:+a[e+4],y:+a[e+5]}];b?e?h-4==e?f[3]={x:+a[0],y:+a[1]}:h-2==e&&(f[2]={x:+a[0],y:+a[1]},f[3]={x:+a[2],y:+a[3]}):f[0]={x:+a[h-2],y:+a[h-1]}:h-4==e?f[3]=f[2]:e||(f[0]={x:+a[e],y:+a[e+1]});d.push(["C",(-f[0].x+6*f[1].x+f[2].x)/6,(-f[0].y+6*f[1].y+f[2].y)/6,(f[1].x+6*f[2].x-f[3].x)/6,(f[1].y+6*f[2].y-f[3].y)/6,f[2].x,f[2].y])}return d}y=k.prototype;var Q=a.is,C=a._.clone,L="hasOwnProperty",
+N=/,?([a-z]),?/gi,$=parseFloat,F=Math,S=F.PI,X=F.min,W=F.max,ma=F.pow,Z=F.abs;M=n(1);var na=n(),ba=n(0,1),V=a._unit2px;a.path=A;a.path.getTotalLength=M;a.path.getPointAtLength=na;a.path.getSubpath=function(a,b,d){if(1E-6>this.getTotalLength(a)-d)return ba(a,b).end;a=ba(a,d,1);return b?ba(a,b).end:a};y.getTotalLength=function(){if(this.node.getTotalLength)return this.node.getTotalLength()};y.getPointAtLength=function(a){return na(this.attr("d"),a)};y.getSubpath=function(b,d){return a.path.getSubpath(this.attr("d"),
+b,d)};a._.box=w;a.path.findDotsAtSegment=u;a.path.bezierBBox=p;a.path.isPointInsideBBox=b;a.path.isBBoxIntersect=q;a.path.intersection=function(a,b){return l(a,b)};a.path.intersectionNumber=function(a,b){return l(a,b,1)};a.path.isPointInside=function(a,d,e){var h=r(a);return b(h,d,e)&&1==l(a,[["M",d,e],["H",h.x2+10] ],1)%2};a.path.getBBox=r;a.path.get={path:function(a){return a.attr("path")},circle:function(a){a=V(a);return x(a.cx,a.cy,a.r)},ellipse:function(a){a=V(a);return x(a.cx||0,a.cy||0,a.rx,
+a.ry)},rect:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height,a.rx,a.ry)},image:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height)},line:function(a){return"M"+[a.attr("x1")||0,a.attr("y1")||0,a.attr("x2"),a.attr("y2")]},polyline:function(a){return"M"+a.attr("points")},polygon:function(a){return"M"+a.attr("points")+"z"},deflt:function(a){a=a.node.getBBox();return s(a.x,a.y,a.width,a.height)}};a.path.toRelative=function(b){var e=A(b),h=String.prototype.toLowerCase;if(e.rel)return d(e.rel);
+a.is(b,"array")&&a.is(b&&b[0],"array")||(b=a.parsePathString(b));var f=[],l=0,n=0,k=0,p=0,s=0;"M"==b[0][0]&&(l=b[0][1],n=b[0][2],k=l,p=n,s++,f.push(["M",l,n]));for(var r=b.length;s<r;s++){var q=f[s]=[],x=b[s];if(x[0]!=h.call(x[0]))switch(q[0]=h.call(x[0]),q[0]){case "a":q[1]=x[1];q[2]=x[2];q[3]=x[3];q[4]=x[4];q[5]=x[5];q[6]=+(x[6]-l).toFixed(3);q[7]=+(x[7]-n).toFixed(3);break;case "v":q[1]=+(x[1]-n).toFixed(3);break;case "m":k=x[1],p=x[2];default:for(var c=1,t=x.length;c<t;c++)q[c]=+(x[c]-(c%2?l:
+n)).toFixed(3)}else for(f[s]=[],"m"==x[0]&&(k=x[1]+l,p=x[2]+n),q=0,c=x.length;q<c;q++)f[s][q]=x[q];x=f[s].length;switch(f[s][0]){case "z":l=k;n=p;break;case "h":l+=+f[s][x-1];break;case "v":n+=+f[s][x-1];break;default:l+=+f[s][x-2],n+=+f[s][x-1]}}f.toString=z;e.rel=d(f);return f};a.path.toAbsolute=G;a.path.toCubic=I;a.path.map=function(a,b){if(!b)return a;var d,e,h,f,l,n,k;a=I(a);h=0;for(l=a.length;h<l;h++)for(k=a[h],f=1,n=k.length;f<n;f+=2)d=b.x(k[f],k[f+1]),e=b.y(k[f],k[f+1]),k[f]=d,k[f+1]=e;return a};
+a.path.toString=z;a.path.clone=d});C.plugin(function(a,v,y,C){var A=Math.max,w=Math.min,z=function(a){this.items=[];this.bindings={};this.length=0;this.type="set";if(a)for(var f=0,n=a.length;f<n;f++)a[f]&&(this[this.items.length]=this.items[this.items.length]=a[f],this.length++)};v=z.prototype;v.push=function(){for(var a,f,n=0,k=arguments.length;n<k;n++)if(a=arguments[n])f=this.items.length,this[f]=this.items[f]=a,this.length++;return this};v.pop=function(){this.length&&delete this[this.length--];
+return this.items.pop()};v.forEach=function(a,f){for(var n=0,k=this.items.length;n<k&&!1!==a.call(f,this.items[n],n);n++);return this};v.animate=function(d,f,n,u){"function"!=typeof n||n.length||(u=n,n=L.linear);d instanceof a._.Animation&&(u=d.callback,n=d.easing,f=n.dur,d=d.attr);var p=arguments;if(a.is(d,"array")&&a.is(p[p.length-1],"array"))var b=!0;var q,e=function(){q?this.b=q:q=this.b},l=0,r=u&&function(){l++==this.length&&u.call(this)};return this.forEach(function(a,l){k.once("snap.animcreated."+
+a.id,e);b?p[l]&&a.animate.apply(a,p[l]):a.animate(d,f,n,r)})};v.remove=function(){for(;this.length;)this.pop().remove();return this};v.bind=function(a,f,k){var u={};if("function"==typeof f)this.bindings[a]=f;else{var p=k||a;this.bindings[a]=function(a){u[p]=a;f.attr(u)}}return this};v.attr=function(a){var f={},k;for(k in a)if(this.bindings[k])this.bindings[k](a[k]);else f[k]=a[k];a=0;for(k=this.items.length;a<k;a++)this.items[a].attr(f);return this};v.clear=function(){for(;this.length;)this.pop()};
+v.splice=function(a,f,k){a=0>a?A(this.length+a,0):a;f=A(0,w(this.length-a,f));var u=[],p=[],b=[],q;for(q=2;q<arguments.length;q++)b.push(arguments[q]);for(q=0;q<f;q++)p.push(this[a+q]);for(;q<this.length-a;q++)u.push(this[a+q]);var e=b.length;for(q=0;q<e+u.length;q++)this.items[a+q]=this[a+q]=q<e?b[q]:u[q-e];for(q=this.items.length=this.length-=f-e;this[q];)delete this[q++];return new z(p)};v.exclude=function(a){for(var f=0,k=this.length;f<k;f++)if(this[f]==a)return this.splice(f,1),!0;return!1};
+v.insertAfter=function(a){for(var f=this.items.length;f--;)this.items[f].insertAfter(a);return this};v.getBBox=function(){for(var a=[],f=[],k=[],u=[],p=this.items.length;p--;)if(!this.items[p].removed){var b=this.items[p].getBBox();a.push(b.x);f.push(b.y);k.push(b.x+b.width);u.push(b.y+b.height)}a=w.apply(0,a);f=w.apply(0,f);k=A.apply(0,k);u=A.apply(0,u);return{x:a,y:f,x2:k,y2:u,width:k-a,height:u-f,cx:a+(k-a)/2,cy:f+(u-f)/2}};v.clone=function(a){a=new z;for(var f=0,k=this.items.length;f<k;f++)a.push(this.items[f].clone());
+return a};v.toString=function(){return"Snap\u2018s set"};v.type="set";a.set=function(){var a=new z;arguments.length&&a.push.apply(a,Array.prototype.slice.call(arguments,0));return a}});C.plugin(function(a,v,y,C){function A(a){var b=a[0];switch(b.toLowerCase()){case "t":return[b,0,0];case "m":return[b,1,0,0,1,0,0];case "r":return 4==a.length?[b,0,a[2],a[3] ]:[b,0];case "s":return 5==a.length?[b,1,1,a[3],a[4] ]:3==a.length?[b,1,1]:[b,1]}}function w(b,d,f){d=q(d).replace(/\.{3}|\u2026/g,b);b=a.parseTransformString(b)||
+[];d=a.parseTransformString(d)||[];for(var k=Math.max(b.length,d.length),p=[],v=[],h=0,w,z,y,I;h<k;h++){y=b[h]||A(d[h]);I=d[h]||A(y);if(y[0]!=I[0]||"r"==y[0].toLowerCase()&&(y[2]!=I[2]||y[3]!=I[3])||"s"==y[0].toLowerCase()&&(y[3]!=I[3]||y[4]!=I[4])){b=a._.transform2matrix(b,f());d=a._.transform2matrix(d,f());p=[["m",b.a,b.b,b.c,b.d,b.e,b.f] ];v=[["m",d.a,d.b,d.c,d.d,d.e,d.f] ];break}p[h]=[];v[h]=[];w=0;for(z=Math.max(y.length,I.length);w<z;w++)w in y&&(p[h][w]=y[w]),w in I&&(v[h][w]=I[w])}return{from:u(p),
+to:u(v),f:n(p)}}function z(a){return a}function d(a){return function(b){return+b.toFixed(3)+a}}function f(b){return a.rgb(b[0],b[1],b[2])}function n(a){var b=0,d,f,k,n,h,p,q=[];d=0;for(f=a.length;d<f;d++){h="[";p=['"'+a[d][0]+'"'];k=1;for(n=a[d].length;k<n;k++)p[k]="val["+b++ +"]";h+=p+"]";q[d]=h}return Function("val","return Snap.path.toString.call(["+q+"])")}function u(a){for(var b=[],d=0,f=a.length;d<f;d++)for(var k=1,n=a[d].length;k<n;k++)b.push(a[d][k]);return b}var p={},b=/[a-z]+$/i,q=String;
+p.stroke=p.fill="colour";v.prototype.equal=function(a,b){return k("snap.util.equal",this,a,b).firstDefined()};k.on("snap.util.equal",function(e,k){var r,s;r=q(this.attr(e)||"");var x=this;if(r==+r&&k==+k)return{from:+r,to:+k,f:z};if("colour"==p[e])return r=a.color(r),s=a.color(k),{from:[r.r,r.g,r.b,r.opacity],to:[s.r,s.g,s.b,s.opacity],f:f};if("transform"==e||"gradientTransform"==e||"patternTransform"==e)return k instanceof a.Matrix&&(k=k.toTransformString()),a._.rgTransform.test(k)||(k=a._.svgTransform2string(k)),
+w(r,k,function(){return x.getBBox(1)});if("d"==e||"path"==e)return r=a.path.toCubic(r,k),{from:u(r[0]),to:u(r[1]),f:n(r[0])};if("points"==e)return r=q(r).split(a._.separator),s=q(k).split(a._.separator),{from:r,to:s,f:function(a){return a}};aUnit=r.match(b);s=q(k).match(b);return aUnit&&aUnit==s?{from:parseFloat(r),to:parseFloat(k),f:d(aUnit)}:{from:this.asPX(e),to:this.asPX(e,k),f:z}})});C.plugin(function(a,v,y,C){var A=v.prototype,w="createTouch"in C.doc;v="click dblclick mousedown mousemove mouseout mouseover mouseup touchstart touchmove touchend touchcancel".split(" ");
+var z={mousedown:"touchstart",mousemove:"touchmove",mouseup:"touchend"},d=function(a,b){var d="y"==a?"scrollTop":"scrollLeft",e=b&&b.node?b.node.ownerDocument:C.doc;return e[d in e.documentElement?"documentElement":"body"][d]},f=function(){this.returnValue=!1},n=function(){return this.originalEvent.preventDefault()},u=function(){this.cancelBubble=!0},p=function(){return this.originalEvent.stopPropagation()},b=function(){if(C.doc.addEventListener)return function(a,b,e,f){var k=w&&z[b]?z[b]:b,l=function(k){var l=
+d("y",f),q=d("x",f);if(w&&z.hasOwnProperty(b))for(var r=0,u=k.targetTouches&&k.targetTouches.length;r<u;r++)if(k.targetTouches[r].target==a||a.contains(k.targetTouches[r].target)){u=k;k=k.targetTouches[r];k.originalEvent=u;k.preventDefault=n;k.stopPropagation=p;break}return e.call(f,k,k.clientX+q,k.clientY+l)};b!==k&&a.addEventListener(b,l,!1);a.addEventListener(k,l,!1);return function(){b!==k&&a.removeEventListener(b,l,!1);a.removeEventListener(k,l,!1);return!0}};if(C.doc.attachEvent)return function(a,
+b,e,h){var k=function(a){a=a||h.node.ownerDocument.window.event;var b=d("y",h),k=d("x",h),k=a.clientX+k,b=a.clientY+b;a.preventDefault=a.preventDefault||f;a.stopPropagation=a.stopPropagation||u;return e.call(h,a,k,b)};a.attachEvent("on"+b,k);return function(){a.detachEvent("on"+b,k);return!0}}}(),q=[],e=function(a){for(var b=a.clientX,e=a.clientY,f=d("y"),l=d("x"),n,p=q.length;p--;){n=q[p];if(w)for(var r=a.touches&&a.touches.length,u;r--;){if(u=a.touches[r],u.identifier==n.el._drag.id||n.el.node.contains(u.target)){b=
+u.clientX;e=u.clientY;(a.originalEvent?a.originalEvent:a).preventDefault();break}}else a.preventDefault();b+=l;e+=f;k("snap.drag.move."+n.el.id,n.move_scope||n.el,b-n.el._drag.x,e-n.el._drag.y,b,e,a)}},l=function(b){a.unmousemove(e).unmouseup(l);for(var d=q.length,f;d--;)f=q[d],f.el._drag={},k("snap.drag.end."+f.el.id,f.end_scope||f.start_scope||f.move_scope||f.el,b);q=[]};for(y=v.length;y--;)(function(d){a[d]=A[d]=function(e,f){a.is(e,"function")&&(this.events=this.events||[],this.events.push({name:d,
+f:e,unbind:b(this.node||document,d,e,f||this)}));return this};a["un"+d]=A["un"+d]=function(a){for(var b=this.events||[],e=b.length;e--;)if(b[e].name==d&&(b[e].f==a||!a)){b[e].unbind();b.splice(e,1);!b.length&&delete this.events;break}return this}})(v[y]);A.hover=function(a,b,d,e){return this.mouseover(a,d).mouseout(b,e||d)};A.unhover=function(a,b){return this.unmouseover(a).unmouseout(b)};var r=[];A.drag=function(b,d,f,h,n,p){function u(r,v,w){(r.originalEvent||r).preventDefault();this._drag.x=v;
+this._drag.y=w;this._drag.id=r.identifier;!q.length&&a.mousemove(e).mouseup(l);q.push({el:this,move_scope:h,start_scope:n,end_scope:p});d&&k.on("snap.drag.start."+this.id,d);b&&k.on("snap.drag.move."+this.id,b);f&&k.on("snap.drag.end."+this.id,f);k("snap.drag.start."+this.id,n||h||this,v,w,r)}if(!arguments.length){var v;return this.drag(function(a,b){this.attr({transform:v+(v?"T":"t")+[a,b]})},function(){v=this.transform().local})}this._drag={};r.push({el:this,start:u});this.mousedown(u);return this};
+A.undrag=function(){for(var b=r.length;b--;)r[b].el==this&&(this.unmousedown(r[b].start),r.splice(b,1),k.unbind("snap.drag.*."+this.id));!r.length&&a.unmousemove(e).unmouseup(l);return this}});C.plugin(function(a,v,y,C){y=y.prototype;var A=/^\s*url\((.+)\)/,w=String,z=a._.$;a.filter={};y.filter=function(d){var f=this;"svg"!=f.type&&(f=f.paper);d=a.parse(w(d));var k=a._.id(),u=z("filter");z(u,{id:k,filterUnits:"userSpaceOnUse"});u.appendChild(d.node);f.defs.appendChild(u);return new v(u)};k.on("snap.util.getattr.filter",
+function(){k.stop();var d=z(this.node,"filter");if(d)return(d=w(d).match(A))&&a.select(d[1])});k.on("snap.util.attr.filter",function(d){if(d instanceof v&&"filter"==d.type){k.stop();var f=d.node.id;f||(z(d.node,{id:d.id}),f=d.id);z(this.node,{filter:a.url(f)})}d&&"none"!=d||(k.stop(),this.node.removeAttribute("filter"))});a.filter.blur=function(d,f){null==d&&(d=2);return a.format('<feGaussianBlur stdDeviation="{def}"/>',{def:null==f?d:[d,f]})};a.filter.blur.toString=function(){return this()};a.filter.shadow=
+function(d,f,k,u,p){"string"==typeof k&&(p=u=k,k=4);"string"!=typeof u&&(p=u,u="#000");null==k&&(k=4);null==p&&(p=1);null==d&&(d=0,f=2);null==f&&(f=d);u=a.color(u||"#000");return a.format('<feGaussianBlur in="SourceAlpha" stdDeviation="{blur}"/><feOffset dx="{dx}" dy="{dy}" result="offsetblur"/><feFlood flood-color="{color}"/><feComposite in2="offsetblur" operator="in"/><feComponentTransfer><feFuncA type="linear" slope="{opacity}"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>',
+{color:u,dx:d,dy:f,blur:k,opacity:p})};a.filter.shadow.toString=function(){return this()};a.filter.grayscale=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {b} {h} 0 0 0 0 0 1 0"/>',{a:0.2126+0.7874*(1-d),b:0.7152-0.7152*(1-d),c:0.0722-0.0722*(1-d),d:0.2126-0.2126*(1-d),e:0.7152+0.2848*(1-d),f:0.0722-0.0722*(1-d),g:0.2126-0.2126*(1-d),h:0.0722+0.9278*(1-d)})};a.filter.grayscale.toString=function(){return this()};a.filter.sepia=
+function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {h} {i} 0 0 0 0 0 1 0"/>',{a:0.393+0.607*(1-d),b:0.769-0.769*(1-d),c:0.189-0.189*(1-d),d:0.349-0.349*(1-d),e:0.686+0.314*(1-d),f:0.168-0.168*(1-d),g:0.272-0.272*(1-d),h:0.534-0.534*(1-d),i:0.131+0.869*(1-d)})};a.filter.sepia.toString=function(){return this()};a.filter.saturate=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="saturate" values="{amount}"/>',{amount:1-
+d})};a.filter.saturate.toString=function(){return this()};a.filter.hueRotate=function(d){return a.format('<feColorMatrix type="hueRotate" values="{angle}"/>',{angle:d||0})};a.filter.hueRotate.toString=function(){return this()};a.filter.invert=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="table" tableValues="{amount} {amount2}"/><feFuncG type="table" tableValues="{amount} {amount2}"/><feFuncB type="table" tableValues="{amount} {amount2}"/></feComponentTransfer>',{amount:d,
+amount2:1-d})};a.filter.invert.toString=function(){return this()};a.filter.brightness=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}"/><feFuncG type="linear" slope="{amount}"/><feFuncB type="linear" slope="{amount}"/></feComponentTransfer>',{amount:d})};a.filter.brightness.toString=function(){return this()};a.filter.contrast=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}" intercept="{amount2}"/><feFuncG type="linear" slope="{amount}" intercept="{amount2}"/><feFuncB type="linear" slope="{amount}" intercept="{amount2}"/></feComponentTransfer>',
+{amount:d,amount2:0.5-d/2})};a.filter.contrast.toString=function(){return this()}});return C});
+
+]]> </script>
+<script> <![CDATA[
+
+(function (glob, factory) {
+    // AMD support
+    if (typeof define === "function" && define.amd) {
+        // Define as an anonymous module
+        define("Gadfly", ["Snap.svg"], function (Snap) {
+            return factory(Snap);
+        });
+    } else {
+        // Browser globals (glob is window)
+        // Snap adds itself to window
+        glob.Gadfly = factory(glob.Snap);
+    }
+}(this, function (Snap) {
+
+var Gadfly = {};
+
+// Get an x/y coordinate value in pixels
+var xPX = function(fig, x) {
+    var client_box = fig.node.getBoundingClientRect();
+    return x * fig.node.viewBox.baseVal.width / client_box.width;
+};
+
+var yPX = function(fig, y) {
+    var client_box = fig.node.getBoundingClientRect();
+    return y * fig.node.viewBox.baseVal.height / client_box.height;
+};
+
+
+Snap.plugin(function (Snap, Element, Paper, global) {
+    // Traverse upwards from a snap element to find and return the first
+    // note with the "plotroot" class.
+    Element.prototype.plotroot = function () {
+        var element = this;
+        while (!element.hasClass("plotroot") && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.svgroot = function () {
+        var element = this;
+        while (element.node.nodeName != "svg" && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.plotbounds = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x0: bbox.x,
+            x1: bbox.x + bbox.width,
+            y0: bbox.y,
+            y1: bbox.y + bbox.height
+        };
+    };
+
+    Element.prototype.plotcenter = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x: bbox.x + bbox.width / 2,
+            y: bbox.y + bbox.height / 2
+        };
+    };
+
+    // Emulate IE style mouseenter/mouseleave events, since Microsoft always
+    // does everything right.
+    // See: http://www.dynamic-tools.net/toolbox/isMouseLeaveOrEnter/
+    var events = ["mouseenter", "mouseleave"];
+
+    for (i in events) {
+        (function (event_name) {
+            var event_name = events[i];
+            Element.prototype[event_name] = function (fn, scope) {
+                if (Snap.is(fn, "function")) {
+                    var fn2 = function (event) {
+                        if (event.type != "mouseover" && event.type != "mouseout") {
+                            return;
+                        }
+
+                        var reltg = event.relatedTarget ? event.relatedTarget :
+                            event.type == "mouseout" ? event.toElement : event.fromElement;
+                        while (reltg && reltg != this.node) reltg = reltg.parentNode;
+
+                        if (reltg != this.node) {
+                            return fn.apply(this, event);
+                        }
+                    };
+
+                    if (event_name == "mouseenter") {
+                        this.mouseover(fn2, scope);
+                    } else {
+                        this.mouseout(fn2, scope);
+                    }
+                }
+                return this;
+            };
+        })(events[i]);
+    }
+
+
+    Element.prototype.mousewheel = function (fn, scope) {
+        if (Snap.is(fn, "function")) {
+            var el = this;
+            var fn2 = function (event) {
+                fn.apply(el, [event]);
+            };
+        }
+
+        this.node.addEventListener(
+            /Firefox/i.test(navigator.userAgent) ? "DOMMouseScroll" : "mousewheel",
+            fn2);
+
+        return this;
+    };
+
+
+    // Snap's attr function can be too slow for things like panning/zooming.
+    // This is a function to directly update element attributes without going
+    // through eve.
+    Element.prototype.attribute = function(key, val) {
+        if (val === undefined) {
+            return this.node.getAttribute(key);
+        } else {
+            this.node.setAttribute(key, val);
+            return this;
+        }
+    };
+
+    Element.prototype.init_gadfly = function() {
+        this.mouseenter(Gadfly.plot_mouseover)
+            .mouseleave(Gadfly.plot_mouseout)
+            .dblclick(Gadfly.plot_dblclick)
+            .mousewheel(Gadfly.guide_background_scroll)
+            .drag(Gadfly.guide_background_drag_onmove,
+                  Gadfly.guide_background_drag_onstart,
+                  Gadfly.guide_background_drag_onend);
+        this.mouseenter(function (event) {
+            init_pan_zoom(this.plotroot());
+        });
+        return this;
+    };
+});
+
+
+// When the plot is moused over, emphasize the grid lines.
+Gadfly.plot_mouseover = function(event) {
+    var root = this.plotroot();
+
+    var keyboard_zoom = function(event) {
+        if (event.which == 187) { // plus
+            increase_zoom_by_position(root, 0.1, true);
+        } else if (event.which == 189) { // minus
+            increase_zoom_by_position(root, -0.1, true);
+        }
+    };
+    root.data("keyboard_zoom", keyboard_zoom);
+    window.addEventListener("keyup", keyboard_zoom);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    xgridlines.data("unfocused_strokedash",
+                    xgridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+    ygridlines.data("unfocused_strokedash",
+                    ygridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+
+    // emphasize grid lines
+    var destcolor = root.data("focused_xgrid_color");
+    xgridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("focused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // reveal zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 1.0}, 250);
+};
+
+// Reset pan and zoom on double click
+Gadfly.plot_dblclick = function(event) {
+  set_plot_pan_zoom(this.plotroot(), 0.0, 0.0, 1.0);
+};
+
+// Unemphasize grid lines on mouse out.
+Gadfly.plot_mouseout = function(event) {
+    var root = this.plotroot();
+
+    window.removeEventListener("keyup", root.data("keyboard_zoom"));
+    root.data("keyboard_zoom", undefined);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    var destcolor = root.data("unfocused_xgrid_color");
+
+    xgridlines.attribute("stroke-dasharray", xgridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("unfocused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", ygridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // hide zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 0.0}, 250);
+};
+
+
+var set_geometry_transform = function(root, tx, ty, scale) {
+    var xscalable = root.hasClass("xscalable"),
+        yscalable = root.hasClass("yscalable");
+
+    var old_scale = root.data("scale");
+
+    var xscale = xscalable ? scale : 1.0,
+        yscale = yscalable ? scale : 1.0;
+
+    tx = xscalable ? tx : 0.0;
+    ty = yscalable ? ty : 0.0;
+
+    var t = new Snap.Matrix().translate(tx, ty).scale(xscale, yscale);
+
+    root.selectAll(".geometry, image")
+        .forEach(function (element, i) {
+            element.transform(t);
+        });
+
+    bounds = root.plotbounds();
+
+    if (yscalable) {
+        var xfixed_t = new Snap.Matrix().translate(0, ty).scale(1.0, yscale);
+        root.selectAll(".xfixed")
+            .forEach(function (element, i) {
+                element.transform(xfixed_t);
+            });
+
+        root.select(".ylabels")
+            .transform(xfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1, 1/scale, cx, cy).add(st);
+                    element.transform(unscale_t);
+
+                    var y = cy * scale + ty;
+                    element.attr("visibility",
+                        bounds.y0 <= y && y <= bounds.y1 ? "visible" : "hidden");
+                }
+            });
+    }
+
+    if (xscalable) {
+        var yfixed_t = new Snap.Matrix().translate(tx, 0).scale(xscale, 1.0);
+        var xtrans = new Snap.Matrix().translate(tx, 0);
+        root.selectAll(".yfixed")
+            .forEach(function (element, i) {
+                element.transform(yfixed_t);
+            });
+
+        root.select(".xlabels")
+            .transform(yfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1/scale, 1, cx, cy).add(st);
+
+                    element.transform(unscale_t);
+
+                    var x = cx * scale + tx;
+                    element.attr("visibility",
+                        bounds.x0 <= x && x <= bounds.x1 ? "visible" : "hidden");
+                    }
+            });
+    }
+
+    // we must unscale anything that is scale invariance: widths, raiduses, etc.
+    var size_attribs = ["font-size"];
+    var unscaled_selection = ".geometry, .geometry *";
+    if (xscalable) {
+        size_attribs.push("rx");
+        unscaled_selection += ", .xgridlines";
+    }
+    if (yscalable) {
+        size_attribs.push("ry");
+        unscaled_selection += ", .ygridlines";
+    }
+
+    root.selectAll(unscaled_selection)
+        .forEach(function (element, i) {
+            // circle need special help
+            if (element.node.nodeName == "circle") {
+                var cx = element.attribute("cx"),
+                    cy = element.attribute("cy");
+                unscale_t = new Snap.Matrix().scale(1/xscale, 1/yscale,
+                                                        cx, cy);
+                element.transform(unscale_t);
+                return;
+            }
+
+            for (i in size_attribs) {
+                var key = size_attribs[i];
+                var val = parseFloat(element.attribute(key));
+                if (val !== undefined && val != 0 && !isNaN(val)) {
+                    element.attribute(key, val * old_scale / scale);
+                }
+            }
+        });
+};
+
+
+// Find the most appropriate tick scale and update label visibility.
+var update_tickscale = function(root, scale, axis) {
+    if (!root.hasClass(axis + "scalable")) return;
+
+    var tickscales = root.data(axis + "tickscales");
+    var best_tickscale = 1.0;
+    var best_tickscale_dist = Infinity;
+    for (tickscale in tickscales) {
+        var dist = Math.abs(Math.log(tickscale) - Math.log(scale));
+        if (dist < best_tickscale_dist) {
+            best_tickscale_dist = dist;
+            best_tickscale = tickscale;
+        }
+    }
+
+    if (best_tickscale != root.data(axis + "tickscale")) {
+        root.data(axis + "tickscale", best_tickscale);
+        var mark_inscale_gridlines = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        var mark_inscale_labels = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        root.select("." + axis + "gridlines").selectAll("path").forEach(mark_inscale_gridlines);
+        root.select("." + axis + "labels").selectAll("text").forEach(mark_inscale_labels);
+    }
+};
+
+
+var set_plot_pan_zoom = function(root, tx, ty, scale) {
+    var old_scale = root.data("scale");
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    // compute the viewport derived from tx, ty, and scale
+    var x_min = -width * scale - (scale * width - width),
+        x_max = width * scale,
+        y_min = -height * scale - (scale * height - height),
+        y_max = height * scale;
+
+    var x0 = bounds.x0 - scale * bounds.x0,
+        y0 = bounds.y0 - scale * bounds.y0;
+
+    var tx = Math.max(Math.min(tx - x0, x_max), x_min),
+        ty = Math.max(Math.min(ty - y0, y_max), y_min);
+
+    tx += x0;
+    ty += y0;
+
+    // when the scale change, we may need to alter which set of
+    // ticks is being displayed
+    if (scale != old_scale) {
+        update_tickscale(root, scale, "x");
+        update_tickscale(root, scale, "y");
+    }
+
+    set_geometry_transform(root, tx, ty, scale);
+
+    root.data("scale", scale);
+    root.data("tx", tx);
+    root.data("ty", ty);
+};
+
+
+var scale_centered_translation = function(root, scale) {
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    var tx0 = root.data("tx"),
+        ty0 = root.data("ty");
+
+    var scale0 = root.data("scale");
+
+    // how off from center the current view is
+    var xoff = tx0 - (bounds.x0 * (1 - scale0) + (width * (1 - scale0)) / 2),
+        yoff = ty0 - (bounds.y0 * (1 - scale0) + (height * (1 - scale0)) / 2);
+
+    // rescale offsets
+    xoff = xoff * scale / scale0;
+    yoff = yoff * scale / scale0;
+
+    // adjust for the panel position being scaled
+    var x_edge_adjust = bounds.x0 * (1 - scale),
+        y_edge_adjust = bounds.y0 * (1 - scale);
+
+    return {
+        x: xoff + x_edge_adjust + (width - width * scale) / 2,
+        y: yoff + y_edge_adjust + (height - height * scale) / 2
+    };
+};
+
+
+// Initialize data for panning zooming if it isn't already.
+var init_pan_zoom = function(root) {
+    if (root.data("zoompan-ready")) {
+        return;
+    }
+
+    // The non-scaling-stroke trick. Rather than try to correct for the
+    // stroke-width when zooming, we force it to a fixed value.
+    var px_per_mm = root.node.getCTM().a;
+
+    // Drag events report deltas in pixels, which we'd like to convert to
+    // millimeters.
+    root.data("px_per_mm", px_per_mm);
+
+    root.selectAll("path")
+        .forEach(function (element, i) {
+        sw = element.asPX("stroke-width") * px_per_mm;
+        if (sw > 0) {
+            element.attribute("stroke-width", sw);
+            element.attribute("vector-effect", "non-scaling-stroke");
+        }
+    });
+
+    // Store ticks labels original tranformation
+    root.selectAll(".xlabels > text, .ylabels > text")
+        .forEach(function (element, i) {
+            var lm = element.transform().localMatrix;
+            element.data("static_transform",
+                new Snap.Matrix(lm.a, lm.b, lm.c, lm.d, lm.e, lm.f));
+        });
+
+    var xgridlines = root.select(".xgridlines");
+    var ygridlines = root.select(".ygridlines");
+    var xlabels = root.select(".xlabels");
+    var ylabels = root.select(".ylabels");
+
+    if (root.data("tx") === undefined) root.data("tx", 0);
+    if (root.data("ty") === undefined) root.data("ty", 0);
+    if (root.data("scale") === undefined) root.data("scale", 1.0);
+    if (root.data("xtickscales") === undefined) {
+
+        // index all the tick scales that are listed
+        var xtickscales = {};
+        var ytickscales = {};
+        var add_x_tick_scales = function (element, i) {
+            xtickscales[element.attribute("gadfly:scale")] = true;
+        };
+        var add_y_tick_scales = function (element, i) {
+            ytickscales[element.attribute("gadfly:scale")] = true;
+        };
+
+        if (xgridlines) xgridlines.selectAll("path").forEach(add_x_tick_scales);
+        if (ygridlines) ygridlines.selectAll("path").forEach(add_y_tick_scales);
+        if (xlabels) xlabels.selectAll("text").forEach(add_x_tick_scales);
+        if (ylabels) ylabels.selectAll("text").forEach(add_y_tick_scales);
+
+        root.data("xtickscales", xtickscales);
+        root.data("ytickscales", ytickscales);
+        root.data("xtickscale", 1.0);
+    }
+
+    var min_scale = 1.0, max_scale = 1.0;
+    for (scale in xtickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    for (scale in ytickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    root.data("min_scale", min_scale);
+    root.data("max_scale", max_scale);
+
+    // store the original positions of labels
+    if (xlabels) {
+        xlabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("x", element.asPX("x"));
+               });
+    }
+
+    if (ylabels) {
+        ylabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("y", element.asPX("y"));
+               });
+    }
+
+    // mark grid lines and ticks as in or out of scale.
+    var mark_inscale = function (element, i) {
+        element.attribute("gadfly:inscale", element.attribute("gadfly:scale") == 1.0);
+    };
+
+    if (xgridlines) xgridlines.selectAll("path").forEach(mark_inscale);
+    if (ygridlines) ygridlines.selectAll("path").forEach(mark_inscale);
+    if (xlabels) xlabels.selectAll("text").forEach(mark_inscale);
+    if (ylabels) ylabels.selectAll("text").forEach(mark_inscale);
+
+    // figure out the upper ond lower bounds on panning using the maximum
+    // and minum grid lines
+    var bounds = root.plotbounds();
+    var pan_bounds = {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 0.0,
+        y1: 0.0
+    };
+
+    if (xgridlines) {
+        xgridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.x1 - bbox.x < pan_bounds.x0) {
+                        pan_bounds.x0 = bounds.x1 - bbox.x;
+                    }
+                    if (bounds.x0 - bbox.x > pan_bounds.x1) {
+                        pan_bounds.x1 = bounds.x0 - bbox.x;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    if (ygridlines) {
+        ygridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.y1 - bbox.y < pan_bounds.y0) {
+                        pan_bounds.y0 = bounds.y1 - bbox.y;
+                    }
+                    if (bounds.y0 - bbox.y > pan_bounds.y1) {
+                        pan_bounds.y1 = bounds.y0 - bbox.y;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    // nudge these values a little
+    pan_bounds.x0 -= 5;
+    pan_bounds.x1 += 5;
+    pan_bounds.y0 -= 5;
+    pan_bounds.y1 += 5;
+    root.data("pan_bounds", pan_bounds);
+
+    root.data("zoompan-ready", true)
+};
+
+
+// drag actions, i.e. zooming and panning
+var pan_action = {
+    start: function(root, x, y, event) {
+        root.data("dx", 0);
+        root.data("dy", 0);
+        root.data("tx0", root.data("tx"));
+        root.data("ty0", root.data("ty"));
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var px_per_mm = root.data("px_per_mm");
+        dx /= px_per_mm;
+        dy /= px_per_mm;
+
+        var tx0 = root.data("tx"),
+            ty0 = root.data("ty");
+
+        var dx0 = root.data("dx"),
+            dy0 = root.data("dy");
+
+        root.data("dx", dx);
+        root.data("dy", dy);
+
+        dx = dx - dx0;
+        dy = dy - dy0;
+
+        var tx = tx0 + dx,
+            ty = ty0 + dy;
+
+        set_plot_pan_zoom(root, tx, ty, root.data("scale"));
+    },
+    end: function(root, event) {
+
+    },
+    cancel: function(root) {
+        set_plot_pan_zoom(root, root.data("tx0"), root.data("ty0"), root.data("scale"));
+    }
+};
+
+var zoom_box;
+var zoom_action = {
+    start: function(root, x, y, event) {
+        var bounds = root.plotbounds();
+        var width = bounds.x1 - bounds.x0,
+            height = bounds.y1 - bounds.y0;
+        var ratio = width / height;
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        x = xscalable ? x / px_per_mm : bounds.x0;
+        y = yscalable ? y / px_per_mm : bounds.y0;
+        var w = xscalable ? 0 : width;
+        var h = yscalable ? 0 : height;
+        zoom_box = root.rect(x, y, w, h).attr({
+            "fill": "#000",
+            "opacity": 0.25
+        });
+        zoom_box.data("ratio", ratio);
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        var bounds = root.plotbounds();
+        if (yscalable) {
+            y /= px_per_mm;
+            y = Math.max(bounds.y0, y);
+            y = Math.min(bounds.y1, y);
+        } else {
+            y = bounds.y1;
+        }
+        if (xscalable) {
+            x /= px_per_mm;
+            x = Math.max(bounds.x0, x);
+            x = Math.min(bounds.x1, x);
+        } else {
+            x = bounds.x1;
+        }
+
+        dx = x - zoom_box.attr("x");
+        dy = y - zoom_box.attr("y");
+        if (xscalable && yscalable) {
+            var ratio = zoom_box.data("ratio");
+            var width = Math.min(Math.abs(dx), ratio * Math.abs(dy));
+            var height = Math.min(Math.abs(dy), Math.abs(dx) / ratio);
+            dx = width * dx / Math.abs(dx);
+            dy = height * dy / Math.abs(dy);
+        }
+        var xoffset = 0,
+            yoffset = 0;
+        if (dx < 0) {
+            xoffset = dx;
+            dx = -1 * dx;
+        }
+        if (dy < 0) {
+            yoffset = dy;
+            dy = -1 * dy;
+        }
+        if (isNaN(dy)) {
+            dy = 0.0;
+        }
+        if (isNaN(dx)) {
+            dx = 0.0;
+        }
+        zoom_box.transform("T" + xoffset + "," + yoffset);
+        zoom_box.attr("width", dx);
+        zoom_box.attr("height", dy);
+    },
+    end: function(root, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var zoom_bounds = zoom_box.getBBox();
+        if (zoom_bounds.width * zoom_bounds.height <= 0) {
+            return;
+        }
+        var plot_bounds = root.plotbounds();
+        var zoom_factor = 1.0;
+        if (yscalable) {
+            zoom_factor = (plot_bounds.y1 - plot_bounds.y0) / zoom_bounds.height;
+        } else {
+            zoom_factor = (plot_bounds.x1 - plot_bounds.x0) / zoom_bounds.width;
+        }
+        var tx = (root.data("tx") - zoom_bounds.x) * zoom_factor + plot_bounds.x0,
+            ty = (root.data("ty") - zoom_bounds.y) * zoom_factor + plot_bounds.y0;
+        set_plot_pan_zoom(root, tx, ty, root.data("scale") * zoom_factor);
+        zoom_box.remove();
+    },
+    cancel: function(root) {
+        zoom_box.remove();
+    }
+};
+
+
+Gadfly.guide_background_drag_onstart = function(x, y, event) {
+    var root = this.plotroot();
+    var scalable = root.hasClass("xscalable") || root.hasClass("yscalable");
+    var zoomable = !event.altKey && !event.ctrlKey && event.shiftKey && scalable;
+    var panable = !event.altKey && !event.ctrlKey && !event.shiftKey && scalable;
+    var drag_action = zoomable ? zoom_action :
+                      panable  ? pan_action :
+                                 undefined;
+    root.data("drag_action", drag_action);
+    if (drag_action) {
+        var cancel_drag_action = function(event) {
+            if (event.which == 27) { // esc key
+                drag_action.cancel(root);
+                root.data("drag_action", undefined);
+            }
+        };
+        window.addEventListener("keyup", cancel_drag_action);
+        root.data("cancel_drag_action", cancel_drag_action);
+        drag_action.start(root, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.update(root, dx, dy, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onend = function(event) {
+    var root = this.plotroot();
+    window.removeEventListener("keyup", root.data("cancel_drag_action"));
+    root.data("cancel_drag_action", undefined);
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.end(root, event);
+    }
+    root.data("drag_action", undefined);
+};
+
+
+Gadfly.guide_background_scroll = function(event) {
+    if (event.shiftKey) {
+        increase_zoom_by_position(this.plotroot(), 0.001 * event.wheelDelta);
+        event.preventDefault();
+    }
+};
+
+
+Gadfly.zoomslider_button_mouseover = function(event) {
+    this.select(".button_logo")
+         .animate({fill: this.data("mouseover_color")}, 100);
+};
+
+
+Gadfly.zoomslider_button_mouseout = function(event) {
+     this.select(".button_logo")
+         .animate({fill: this.data("mouseout_color")}, 100);
+};
+
+
+Gadfly.zoomslider_zoomout_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), -0.1, true);
+};
+
+
+Gadfly.zoomslider_zoomin_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), 0.1, true);
+};
+
+
+Gadfly.zoomslider_track_click = function(event) {
+    // TODO
+};
+
+
+// Map slider position x to scale y using the function y = a*exp(b*x)+c.
+// The constants a, b, and c are solved using the constraint that the function
+// should go through the points (0; min_scale), (0.5; 1), and (1; max_scale).
+var scale_from_slider_position = function(position, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return a * Math.exp(b * position) + c;
+}
+
+// inverse of scale_from_slider_position
+var slider_position_from_scale = function(scale, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return 1 / b * Math.log((scale - c) / a);
+}
+
+var increase_zoom_by_position = function(root, delta_position, animate) {
+    var scale = root.data("scale"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale");
+    var position = slider_position_from_scale(scale, min_scale, max_scale);
+    position += delta_position;
+    scale = scale_from_slider_position(position, min_scale, max_scale);
+    set_zoom(root, scale, animate);
+}
+
+var set_zoom = function(root, scale, animate) {
+    var min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("scale");
+    var new_scale = Math.max(min_scale, Math.min(scale, max_scale));
+    if (animate) {
+        Snap.animate(
+            old_scale,
+            new_scale,
+            function (new_scale) {
+                update_plot_scale(root, new_scale);
+            },
+            200);
+    } else {
+        update_plot_scale(root, new_scale);
+    }
+}
+
+
+var update_plot_scale = function(root, new_scale) {
+    var trans = scale_centered_translation(root, new_scale);
+    set_plot_pan_zoom(root, trans.x, trans.y, new_scale);
+
+    root.selectAll(".zoomslider_thumb")
+        .forEach(function (element, i) {
+            var min_pos = element.data("min_pos"),
+                max_pos = element.data("max_pos"),
+                min_scale = root.data("min_scale"),
+                max_scale = root.data("max_scale");
+            var xmid = (min_pos + max_pos) / 2;
+            var xpos = slider_position_from_scale(new_scale, min_scale, max_scale);
+            element.transform(new Snap.Matrix().translate(
+                Math.max(min_pos, Math.min(
+                         max_pos, min_pos + (max_pos - min_pos) * xpos)) - xmid, 0));
+    });
+};
+
+
+Gadfly.zoomslider_thumb_dragmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var min_pos = this.data("min_pos"),
+        max_pos = this.data("max_pos"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("old_scale");
+
+    var px_per_mm = root.data("px_per_mm");
+    dx /= px_per_mm;
+    dy /= px_per_mm;
+
+    var xmid = (min_pos + max_pos) / 2;
+    var xpos = slider_position_from_scale(old_scale, min_scale, max_scale) +
+                   dx / (max_pos - min_pos);
+
+    // compute the new scale
+    var new_scale = scale_from_slider_position(xpos, min_scale, max_scale);
+    new_scale = Math.min(max_scale, Math.max(min_scale, new_scale));
+
+    update_plot_scale(root, new_scale);
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragstart = function(x, y, event) {
+    this.animate({fill: this.data("mouseover_color")}, 100);
+    var root = this.plotroot();
+
+    // keep track of what the scale was when we started dragging
+    root.data("old_scale", root.data("scale"));
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragend = function(event) {
+    this.animate({fill: this.data("mouseout_color")}, 100);
+    event.stopPropagation();
+};
+
+
+var toggle_color_class = function(root, color_class, ison) {
+    var guides = root.selectAll(".guide." + color_class + ",.guide ." + color_class);
+    var geoms = root.selectAll(".geometry." + color_class + ",.geometry ." + color_class);
+    if (ison) {
+        guides.animate({opacity: 0.5}, 250);
+        geoms.animate({opacity: 0.0}, 250);
+    } else {
+        guides.animate({opacity: 1.0}, 250);
+        geoms.animate({opacity: 1.0}, 250);
+    }
+};
+
+
+Gadfly.colorkey_swatch_click = function(event) {
+    var root = this.plotroot();
+    var color_class = this.data("color_class");
+
+    if (event.shiftKey) {
+        root.selectAll(".colorkey text")
+            .forEach(function (element) {
+                var other_color_class = element.data("color_class");
+                if (other_color_class != color_class) {
+                    toggle_color_class(root, other_color_class,
+                                       element.attr("opacity") == 1.0);
+                }
+            });
+    } else {
+        toggle_color_class(root, color_class, this.attr("opacity") == 1.0);
+    }
+};
+
+
+return Gadfly;
+
+}));
+
+
+//@ sourceURL=gadfly.js
+
+(function (glob, factory) {
+    // AMD support
+      if (typeof require === "function" && typeof define === "function" && define.amd) {
+        require(["Snap.svg", "Gadfly"], function (Snap, Gadfly) {
+            factory(Snap, Gadfly);
+        });
+      } else {
+          factory(glob.Snap, glob.Gadfly);
+      }
+})(window, function (Snap, Gadfly) {
+    var fig = Snap("#fig-120ab1c99b4b4f928527c2e84d608c83");
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-4")
+   .drag(function() {}, function() {}, function() {});
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-8")
+   .init_gadfly();
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-11")
+   .plotroot().data("unfocused_ygrid_color", "#D0D0E0")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-11")
+   .plotroot().data("focused_ygrid_color", "#A0A0A0")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-12")
+   .plotroot().data("unfocused_xgrid_color", "#D0D0E0")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-12")
+   .plotroot().data("focused_xgrid_color", "#A0A0A0")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-20")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-20")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-20")
+   .click(Gadfly.zoomslider_zoomin_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-22")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-22")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-22")
+   .click(Gadfly.zoomslider_track_click);
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-23")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-23")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-23")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-23")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-23")
+   .drag(Gadfly.zoomslider_thumb_dragmove,
+     Gadfly.zoomslider_thumb_dragstart,
+     Gadfly.zoomslider_thumb_dragend)
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-24")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-24")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-120ab1c99b4b4f928527c2e84d608c83-element-24")
+   .click(Gadfly.zoomslider_zoomout_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+    });
+]]> </script>
+</svg>
+
+
+
+We can use a similar approach to plot the filtered growth rate values
+
+
+```julia
+x_data = 1:numObs
+growth_rate_array = Vector{Float64}(numObs+1)
+confidence_array = Vector{Float64}(numObs+1)
+growth_rate_array[1] = initial_guess.μ[1]
+confidence_array[1] = initial_guess.Σ.mat[1,1]
+for i in x_data
+    current_state = filtered_state.state[i]
+    growth_rate_array[i+1] = current_state.μ[1]
+    confidence_array[i+1] = 2*sqrt(current_state.Σ.mat[1,1])
+end
+df_fs = DataFrame(
+    x = [0;x_data],
+    y = growth_rate_array,
+    ymin = growth_rate_array - confidence_array,
+    ymax = growth_rate_array + confidence_array,
+    f = "Filtered values"
+    )
+
+growth_rate_state_plot = plot(
+    layer(x=0:numObs, y=ones(numObs+1)*r, Geom.line, Theme(default_color=getColors[3])),
+    layer(df_fs, x=:x, y=:y, ymin=:ymin, ymax=:ymax, Geom.line, Geom.ribbon),
+    Guide.xlabel("Measurement Number"), Guide.ylabel("Growth Rate"),
+    Guide.manual_color_key("Colour Key",["Filtered Estimate", "Measurements","True Value "],[getColors[1],getColors[2],getColors[3]]),
+    Guide.title("Extended Kalman Filter Example")
+    )
+display(growth_rate_state_plot)
+```
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:gadfly="http://www.gadflyjl.org/ns"
+     version="1.2"
+     width="141.42mm" height="100mm" viewBox="0 0 141.42 100"
+     stroke="none"
+     fill="#000000"
+     stroke-width="0.3"
+     font-size="3.88"
+
+     id="fig-aa04225fcd6c4873b258034b2bf489f2">
+<g class="plotroot xscalable yscalable" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-1">
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-2">
+    <text x="64.7" y="88.39" text-anchor="middle" dy="0.6em">Measurement Number</text>
+  </g>
+  <g class="guide xlabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-3">
+    <text x="-116.52" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-150</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-100</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-50</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">50</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">100</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">150</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">200</text>
+    <text x="245.92" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">250</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-100</text>
+    <text x="-66.68" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-95</text>
+    <text x="-62.15" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-90</text>
+    <text x="-57.62" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-85</text>
+    <text x="-53.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-80</text>
+    <text x="-48.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-75</text>
+    <text x="-44.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-70</text>
+    <text x="-39.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-65</text>
+    <text x="-34.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="-30.44" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-55</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="-21.38" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-45</text>
+    <text x="-16.85" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="-12.32" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-35</text>
+    <text x="-7.78" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="-3.25" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-25</text>
+    <text x="1.28" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="5.81" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-15</text>
+    <text x="10.34" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="14.87" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-5</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="23.93" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">5</text>
+    <text x="28.46" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="32.99" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">15</text>
+    <text x="37.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="42.05" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">25</text>
+    <text x="46.58" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="51.11" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">35</text>
+    <text x="55.64" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="60.17" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">45</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="69.23" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">55</text>
+    <text x="73.76" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="78.29" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">65</text>
+    <text x="82.83" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="87.36" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">75</text>
+    <text x="91.89" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="96.42" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">85</text>
+    <text x="100.95" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="105.48" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">95</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="114.54" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">105</text>
+    <text x="119.07" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="123.6" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">115</text>
+    <text x="128.13" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="132.66" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">125</text>
+    <text x="137.19" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">130</text>
+    <text x="141.72" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">135</text>
+    <text x="146.25" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">140</text>
+    <text x="150.78" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">145</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">150</text>
+    <text x="159.84" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">155</text>
+    <text x="164.37" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">160</text>
+    <text x="168.9" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">165</text>
+    <text x="173.43" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">170</text>
+    <text x="177.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">175</text>
+    <text x="182.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">180</text>
+    <text x="187.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">185</text>
+    <text x="191.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">190</text>
+    <text x="196.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">195</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">200</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-100</text>
+    <text x="-62.15" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-90</text>
+    <text x="-53.09" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-80</text>
+    <text x="-44.03" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-70</text>
+    <text x="-34.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="-16.85" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="-7.78" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="1.28" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="10.34" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="28.46" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="37.52" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="46.58" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="55.64" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="73.76" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="82.83" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="91.89" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="100.95" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="119.07" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="128.13" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">120</text>
+    <text x="137.19" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">130</text>
+    <text x="146.25" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">140</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">150</text>
+    <text x="164.37" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">160</text>
+    <text x="173.43" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">170</text>
+    <text x="182.5" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">180</text>
+    <text x="191.56" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">190</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">200</text>
+  </g>
+  <g class="guide colorkey" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-4">
+    <g fill="#4C404B" font-size="2.82" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-5">
+      <text x="115.82" y="44.85" dy="0.35em">Filtered Estimate</text>
+      <text x="115.82" y="48.48" dy="0.35em">Measurements</text>
+      <text x="115.82" y="52.1" dy="0.35em">True Value </text>
+    </g>
+    <g stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-6">
+      <rect x="113.01" y="43.94" width="1.81" height="1.81" fill="#00BFFF"/>
+      <rect x="113.01" y="47.57" width="1.81" height="1.81" fill="#D4CA3A"/>
+      <rect x="113.01" y="51.2" width="1.81" height="1.81" fill="#FF5EA0"/>
+    </g>
+    <g fill="#362A35" font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-7">
+      <text x="113.01" y="41.03">Colour Key</text>
+    </g>
+  </g>
+  <g clip-path="url(#fig-aa04225fcd6c4873b258034b2bf489f2-element-9)" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-8">
+    <g pointer-events="visible" opacity="1" fill="#000000" fill-opacity="0.000" stroke="#000000" stroke-opacity="0.000" class="guide background" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-10">
+      <rect x="17.4" y="12.61" width="94.61" height="68.1"/>
+    </g>
+    <g class="guide ygridlines xfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-11">
+      <path fill="none" d="M17.4,155.64 L 112.01 155.64" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-62.31 L 112.01 -62.31" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,140.25 L 112.01 140.25" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,137.69 L 112.01 137.69" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,135.13 L 112.01 135.13" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,132.56 L 112.01 132.56" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,127.43 L 112.01 127.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,124.87 L 112.01 124.87" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,122.31 L 112.01 122.31" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,119.74 L 112.01 119.74" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,114.61 L 112.01 114.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,112.05 L 112.01 112.05" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,109.48 L 112.01 109.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,106.92 L 112.01 106.92" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,101.79 L 112.01 101.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,99.23 L 112.01 99.23" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,96.66 L 112.01 96.66" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,94.1 L 112.01 94.1" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,88.97 L 112.01 88.97" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,86.41 L 112.01 86.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,83.84 L 112.01 83.84" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,81.28 L 112.01 81.28" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,76.15 L 112.01 76.15" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,73.59 L 112.01 73.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,71.02 L 112.01 71.02" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,68.46 L 112.01 68.46" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,63.33 L 112.01 63.33" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,60.77 L 112.01 60.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,58.2 L 112.01 58.2" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,55.64 L 112.01 55.64" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,50.51 L 112.01 50.51" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,47.95 L 112.01 47.95" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,45.38 L 112.01 45.38" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,42.82 L 112.01 42.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,37.69 L 112.01 37.69" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,35.12 L 112.01 35.12" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,32.56 L 112.01 32.56" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,30 L 112.01 30" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,24.87 L 112.01 24.87" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,22.3 L 112.01 22.3" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,19.74 L 112.01 19.74" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,17.18 L 112.01 17.18" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,12.05 L 112.01 12.05" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,9.48 L 112.01 9.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,6.92 L 112.01 6.92" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,4.36 L 112.01 4.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-0.77 L 112.01 -0.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-3.34 L 112.01 -3.34" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-5.9 L 112.01 -5.9" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-8.47 L 112.01 -8.47" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-13.59 L 112.01 -13.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-16.16 L 112.01 -16.16" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-18.72 L 112.01 -18.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-21.29 L 112.01 -21.29" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-26.41 L 112.01 -26.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-28.98 L 112.01 -28.98" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-31.54 L 112.01 -31.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-34.11 L 112.01 -34.11" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-39.24 L 112.01 -39.24" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-41.8 L 112.01 -41.8" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-44.36 L 112.01 -44.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-46.93 L 112.01 -46.93" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,181.28 L 112.01 181.28" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,-75.13 L 112.01 -75.13" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,136.41 L 112.01 136.41" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,123.59 L 112.01 123.59" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,110.77 L 112.01 110.77" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,97.95 L 112.01 97.95" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,85.13 L 112.01 85.13" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,72.3 L 112.01 72.3" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,59.48 L 112.01 59.48" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,46.66 L 112.01 46.66" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,33.84 L 112.01 33.84" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,21.02 L 112.01 21.02" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,8.2 L 112.01 8.2" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-4.62 L 112.01 -4.62" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-17.44 L 112.01 -17.44" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-30.26 L 112.01 -30.26" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-43.08 L 112.01 -43.08" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="guide xgridlines yfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-12">
+      <path fill="none" d="M-116.52,12.61 L -116.52 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M245.92,12.61 L 245.92 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-66.68,12.61 L -66.68 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-62.15,12.61 L -62.15 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-57.62,12.61 L -57.62 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-53.09,12.61 L -53.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-48.56,12.61 L -48.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-44.03,12.61 L -44.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-39.5,12.61 L -39.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-34.97,12.61 L -34.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-30.44,12.61 L -30.44 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-21.38,12.61 L -21.38 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-16.85,12.61 L -16.85 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-12.32,12.61 L -12.32 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-7.78,12.61 L -7.78 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-3.25,12.61 L -3.25 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M1.28,12.61 L 1.28 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M5.81,12.61 L 5.81 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M10.34,12.61 L 10.34 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M14.87,12.61 L 14.87 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M23.93,12.61 L 23.93 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M28.46,12.61 L 28.46 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M32.99,12.61 L 32.99 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M37.52,12.61 L 37.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M42.05,12.61 L 42.05 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M46.58,12.61 L 46.58 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M51.11,12.61 L 51.11 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M55.64,12.61 L 55.64 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M60.17,12.61 L 60.17 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M69.23,12.61 L 69.23 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M73.76,12.61 L 73.76 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M78.29,12.61 L 78.29 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M82.83,12.61 L 82.83 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M87.36,12.61 L 87.36 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M91.89,12.61 L 91.89 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M96.42,12.61 L 96.42 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M100.95,12.61 L 100.95 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M105.48,12.61 L 105.48 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M114.54,12.61 L 114.54 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M119.07,12.61 L 119.07 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M123.6,12.61 L 123.6 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M128.13,12.61 L 128.13 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M132.66,12.61 L 132.66 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M137.19,12.61 L 137.19 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M141.72,12.61 L 141.72 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M146.25,12.61 L 146.25 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M150.78,12.61 L 150.78 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M159.84,12.61 L 159.84 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M164.37,12.61 L 164.37 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M168.9,12.61 L 168.9 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M173.43,12.61 L 173.43 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M177.97,12.61 L 177.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M182.5,12.61 L 182.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M187.03,12.61 L 187.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M191.56,12.61 L 191.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M196.09,12.61 L 196.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-62.15,12.61 L -62.15 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-53.09,12.61 L -53.09 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-44.03,12.61 L -44.03 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-34.97,12.61 L -34.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-16.85,12.61 L -16.85 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-7.78,12.61 L -7.78 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M1.28,12.61 L 1.28 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M10.34,12.61 L 10.34 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M28.46,12.61 L 28.46 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M37.52,12.61 L 37.52 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M46.58,12.61 L 46.58 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M55.64,12.61 L 55.64 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M73.76,12.61 L 73.76 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M82.83,12.61 L 82.83 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M91.89,12.61 L 91.89 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M100.95,12.61 L 100.95 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M119.07,12.61 L 119.07 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M128.13,12.61 L 128.13 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M137.19,12.61 L 137.19 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M146.25,12.61 L 146.25 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M164.37,12.61 L 164.37 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M173.43,12.61 L 173.43 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M182.5,12.61 L 182.5 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M191.56,12.61 L 191.56 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="plotpanel" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-13">
+      <g stroke-width="0.3" stroke="#000000" stroke-opacity="0.000" class="geometry" fill="#BDE8FF" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-14">
+        <path d="M110.01,53.38 L 109.1 52.9 108.2 52.77 107.29 52.76 106.38 52.46 105.48 51.89 104.57 52.87 103.67 52.28 102.76 52.03 101.85 51.82 100.95 52.52 100.04 53.24 99.13 53.57 98.23 54.09 97.32 54.58 96.42 55.06 95.51 54.99 94.6 55.03 93.7 55.3 92.79 55.74 91.89 55.35 90.98 54.9 90.07 54.67 89.17 53.9 88.26 54.07 87.36 54.34 86.45 54.13 85.54 54.02 84.64 54.29 83.73 54.48 82.83 54.67 81.92 54.8 81.01 55.21 80.11 55.28 79.2 54.56 78.29 55.01 77.39 55.35 76.48 55.09 75.58 55.39 74.67 55.58 73.76 55.15 72.86 55.24 71.95 55.71 71.05 55.55 70.14 54.65 69.23 53.59 68.33 53.71 67.42 53.05 66.52 52.59 65.61 52.66 64.7 53.85 63.8 54.02 62.89 54.16 61.98 54.53 61.08 55.11 60.17 55.67 59.27 55.26 58.36 55.21 57.45 55.36 56.55 55.08 55.64 55.16 54.74 54.97 53.83 54.79 52.92 54.76 52.02 54.51 51.11 54.71 50.21 54.62 49.3 54.28 48.39 54.56 47.49 53.84 46.58 54.3 45.68 53.71 44.77 53.89 43.86 54.52 42.96 55.39 42.05 54.46 41.14 53.84 40.24 54.41 39.33 54.81 38.43 55.7 37.52 55.25 36.61 55.47 35.71 55.92 34.8 57.32 33.9 57.27 32.99 59.36 32.08 61.28 31.18 57.86 30.27 60.34 29.37 65.35 28.46 69.47 27.55 71.43 26.65 76.79 25.74 78.14 24.83 77.84 23.93 70.27 23.02 70.67 22.12 69.61 21.21 69.29 20.3 72.53 19.4 59.48 19.4 33.84 20.3 21.7 21.21 19.79 22.12 23.05 23.02 28.31 23.93 32.5 24.83 44.41 25.74 47.81 26.65 48.72 27.55 45.13 28.46 44.81 29.37 42.23 30.27 38.78 31.18 37.98 32.08 43.15 32.99 42.77 33.9 42.06 34.8 43.38 35.71 43.1 36.61 43.65 37.52 44.31 38.43 45.52 39.33 45.27 40.24 45.42 41.14 45.32 42.05 46.35 42.96 47.63 43.86 47.03 44.77 46.63 45.68 46.66 46.58 47.41 47.49 47.09 48.39 47.93 49.3 47.75 50.21 48.17 51.11 48.32 52.02 48.17 52.92 48.46 53.83 48.52 54.74 48.73 55.64 48.94 56.55 48.88 57.45 49.17 58.36 49.03 59.27 49.08 60.17 49.51 61.08 48.94 61.98 48.37 62.89 48.01 63.8 47.88 64.7 47.74 65.61 46.57 66.52 46.54 67.42 47.03 68.33 47.73 69.23 47.65 70.14 48.75 71.05 49.68 71.95 49.86 72.86 49.41 73.76 49.32 74.67 49.76 75.58 49.57 76.48 49.27 77.39 49.53 78.29 49.19 79.2 48.75 80.11 49.47 81.01 49.41 81.92 49 82.83 48.88 83.73 48.7 84.64 48.53 85.54 48.27 86.45 48.39 87.36 48.61 88.26 48.37 89.17 48.21 90.07 49 90.98 49.24 91.89 49.7 92.79 50.1 93.7 49.66 94.6 49.39 95.51 49.35 96.42 49.43 97.32 48.95 98.23 48.46 99.13 47.95 100.04 47.63 100.95 46.92 101.85 46.23 102.76 46.46 103.67 46.73 104.57 47.34 105.48 46.37 106.38 46.95 107.29 47.27 108.2 47.29 109.1 47.42 110.01 47.91 z"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#00BFFF" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-15">
+        <path fill="none" d="M19.4,46.66 L 20.3 47.12 21.21 44.54 22.12 46.33 23.02 49.49 23.93 51.39 24.83 61.13 25.74 62.98 26.65 62.76 27.55 58.28 28.46 57.14 29.37 53.79 30.27 49.56 31.18 47.92 32.08 52.22 32.99 51.06 33.9 49.66 34.8 50.35 35.71 49.51 36.61 49.56 37.52 49.78 38.43 50.61 39.33 50.04 40.24 49.91 41.14 49.58 42.05 50.41 42.96 51.51 43.86 50.78 44.77 50.26 45.68 50.19 46.58 50.85 47.49 50.47 48.39 51.25 49.3 51.01 50.21 51.39 51.11 51.51 52.02 51.34 52.92 51.61 53.83 51.65 54.74 51.85 55.64 52.05 56.55 51.98 57.45 52.26 58.36 52.12 59.27 52.17 60.17 52.59 61.08 52.03 61.98 51.45 62.89 51.08 63.8 50.95 64.7 50.8 65.61 49.61 66.52 49.57 67.42 50.04 68.33 50.72 69.23 50.62 70.14 51.7 71.05 52.62 71.95 52.79 72.86 52.33 73.76 52.23 74.67 52.67 75.58 52.48 76.48 52.18 77.39 52.44 78.29 52.1 79.2 51.65 80.11 52.37 81.01 52.31 81.92 51.9 82.83 51.77 83.73 51.59 84.64 51.41 85.54 51.15 86.45 51.26 87.36 51.48 88.26 51.22 89.17 51.05 90.07 51.83 90.98 52.07 91.89 52.53 92.79 52.92 93.7 52.48 94.6 52.21 95.51 52.17 96.42 52.24 97.32 51.76 98.23 51.27 99.13 50.76 100.04 50.44 100.95 49.72 101.85 49.02 102.76 49.25 103.67 49.5 104.57 50.11 105.48 49.13 106.38 49.7 107.29 50.02 108.2 50.03 109.1 50.16 110.01 50.65"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#FF5EA0" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-16">
+        <path fill="none" d="M19.4,50.51 L 20.3 50.51 21.21 50.51 22.12 50.51 23.02 50.51 23.93 50.51 24.83 50.51 25.74 50.51 26.65 50.51 27.55 50.51 28.46 50.51 29.37 50.51 30.27 50.51 31.18 50.51 32.08 50.51 32.99 50.51 33.9 50.51 34.8 50.51 35.71 50.51 36.61 50.51 37.52 50.51 38.43 50.51 39.33 50.51 40.24 50.51 41.14 50.51 42.05 50.51 42.96 50.51 43.86 50.51 44.77 50.51 45.68 50.51 46.58 50.51 47.49 50.51 48.39 50.51 49.3 50.51 50.21 50.51 51.11 50.51 52.02 50.51 52.92 50.51 53.83 50.51 54.74 50.51 55.64 50.51 56.55 50.51 57.45 50.51 58.36 50.51 59.27 50.51 60.17 50.51 61.08 50.51 61.98 50.51 62.89 50.51 63.8 50.51 64.7 50.51 65.61 50.51 66.52 50.51 67.42 50.51 68.33 50.51 69.23 50.51 70.14 50.51 71.05 50.51 71.95 50.51 72.86 50.51 73.76 50.51 74.67 50.51 75.58 50.51 76.48 50.51 77.39 50.51 78.29 50.51 79.2 50.51 80.11 50.51 81.01 50.51 81.92 50.51 82.83 50.51 83.73 50.51 84.64 50.51 85.54 50.51 86.45 50.51 87.36 50.51 88.26 50.51 89.17 50.51 90.07 50.51 90.98 50.51 91.89 50.51 92.79 50.51 93.7 50.51 94.6 50.51 95.51 50.51 96.42 50.51 97.32 50.51 98.23 50.51 99.13 50.51 100.04 50.51 100.95 50.51 101.85 50.51 102.76 50.51 103.67 50.51 104.57 50.51 105.48 50.51 106.38 50.51 107.29 50.51 108.2 50.51 109.1 50.51 110.01 50.51"/>
+      </g>
+    </g>
+    <g opacity="0" class="guide zoomslider" stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-17">
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-18">
+        <rect x="105.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-19">
+          <path d="M105.81,17.21 L 106.61 17.21 106.61 16.41 107.41 16.41 107.41 17.21 108.21 17.21 108.21 18.01 107.41 18.01 107.41 18.81 106.61 18.81 106.61 18.01 105.81 18.01 z"/>
+        </g>
+      </g>
+      <g fill="#EAEAEA" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-20">
+        <rect x="85.51" y="15.61" width="19" height="4"/>
+      </g>
+      <g class="zoomslider_thumb" fill="#6A6A6A" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-21">
+        <rect x="94.01" y="15.61" width="2" height="4"/>
+      </g>
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-22">
+        <rect x="81.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-23">
+          <path d="M81.81,17.21 L 84.21 17.21 84.21 18.01 81.81 18.01 z"/>
+        </g>
+      </g>
+    </g>
+  </g>
+  <g class="guide ylabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-24">
+    <text x="16.4" y="155.64" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-8</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-7</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-6</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-5</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-4</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-3</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">-2</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">-1</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">1</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">2</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">3</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">4</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">5</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">6</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">7</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">8</text>
+    <text x="16.4" y="-62.31" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">9</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-7.0</text>
+    <text x="16.4" y="140.25" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.8</text>
+    <text x="16.4" y="137.69" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.6</text>
+    <text x="16.4" y="135.13" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.4</text>
+    <text x="16.4" y="132.56" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.2</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.0</text>
+    <text x="16.4" y="127.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.8</text>
+    <text x="16.4" y="124.87" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.6</text>
+    <text x="16.4" y="122.31" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.4</text>
+    <text x="16.4" y="119.74" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.2</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.0</text>
+    <text x="16.4" y="114.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.8</text>
+    <text x="16.4" y="112.05" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.6</text>
+    <text x="16.4" y="109.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.4</text>
+    <text x="16.4" y="106.92" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.2</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.0</text>
+    <text x="16.4" y="101.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.8</text>
+    <text x="16.4" y="99.23" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.6</text>
+    <text x="16.4" y="96.66" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.4</text>
+    <text x="16.4" y="94.1" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.2</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.0</text>
+    <text x="16.4" y="88.97" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.8</text>
+    <text x="16.4" y="86.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.6</text>
+    <text x="16.4" y="83.84" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.4</text>
+    <text x="16.4" y="81.28" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.2</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.0</text>
+    <text x="16.4" y="76.15" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.8</text>
+    <text x="16.4" y="73.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.6</text>
+    <text x="16.4" y="71.02" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.4</text>
+    <text x="16.4" y="68.46" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.2</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.0</text>
+    <text x="16.4" y="63.33" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.8</text>
+    <text x="16.4" y="60.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.6</text>
+    <text x="16.4" y="58.2" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.4</text>
+    <text x="16.4" y="55.64" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.2</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.0</text>
+    <text x="16.4" y="50.51" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.2</text>
+    <text x="16.4" y="47.95" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.4</text>
+    <text x="16.4" y="45.38" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.6</text>
+    <text x="16.4" y="42.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.8</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.0</text>
+    <text x="16.4" y="37.69" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.2</text>
+    <text x="16.4" y="35.12" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.4</text>
+    <text x="16.4" y="32.56" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.6</text>
+    <text x="16.4" y="30" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.8</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.0</text>
+    <text x="16.4" y="24.87" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.2</text>
+    <text x="16.4" y="22.3" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.4</text>
+    <text x="16.4" y="19.74" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.6</text>
+    <text x="16.4" y="17.18" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.8</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.0</text>
+    <text x="16.4" y="12.05" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.2</text>
+    <text x="16.4" y="9.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.4</text>
+    <text x="16.4" y="6.92" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.6</text>
+    <text x="16.4" y="4.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.8</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.0</text>
+    <text x="16.4" y="-0.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.2</text>
+    <text x="16.4" y="-3.34" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.4</text>
+    <text x="16.4" y="-5.9" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.6</text>
+    <text x="16.4" y="-8.47" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.8</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.0</text>
+    <text x="16.4" y="-13.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.2</text>
+    <text x="16.4" y="-16.16" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.4</text>
+    <text x="16.4" y="-18.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.6</text>
+    <text x="16.4" y="-21.29" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.8</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.0</text>
+    <text x="16.4" y="-26.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.2</text>
+    <text x="16.4" y="-28.98" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.4</text>
+    <text x="16.4" y="-31.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.6</text>
+    <text x="16.4" y="-34.11" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.8</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.0</text>
+    <text x="16.4" y="-39.24" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.2</text>
+    <text x="16.4" y="-41.8" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.4</text>
+    <text x="16.4" y="-44.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.6</text>
+    <text x="16.4" y="-46.93" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.8</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">8.0</text>
+    <text x="16.4" y="181.28" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-10</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-5</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">5</text>
+    <text x="16.4" y="-75.13" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">10</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-7.0</text>
+    <text x="16.4" y="136.41" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-6.5</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-6.0</text>
+    <text x="16.4" y="123.59" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5.5</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5.0</text>
+    <text x="16.4" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-4.5</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-4.0</text>
+    <text x="16.4" y="97.95" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-3.5</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-3.0</text>
+    <text x="16.4" y="85.13" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-2.5</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-2.0</text>
+    <text x="16.4" y="72.3" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-1.5</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-1.0</text>
+    <text x="16.4" y="59.48" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-0.5</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0.0</text>
+    <text x="16.4" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0.5</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">1.0</text>
+    <text x="16.4" y="33.84" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">1.5</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">2.0</text>
+    <text x="16.4" y="21.02" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">2.5</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">3.0</text>
+    <text x="16.4" y="8.2" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">3.5</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">4.0</text>
+    <text x="16.4" y="-4.62" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">4.5</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5.0</text>
+    <text x="16.4" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5.5</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">6.0</text>
+    <text x="16.4" y="-30.26" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">6.5</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">7.0</text>
+    <text x="16.4" y="-43.08" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">7.5</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">8.0</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-25">
+    <text x="8.81" y="44.66" text-anchor="middle" dy="0.35em" transform="rotate(-90, 8.81, 46.66)">Growth Rate</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-aa04225fcd6c4873b258034b2bf489f2-element-26">
+    <text x="64.7" y="10.61" text-anchor="middle">Extended Kalman Filter Example</text>
+  </g>
+</g>
+<defs>
+<clipPath id="fig-aa04225fcd6c4873b258034b2bf489f2-element-9">
+  <path d="M17.4,12.61 L 112.01 12.61 112.01 80.72 17.4 80.72" />
+</clipPath
+></defs>
+<script> <![CDATA[
+(function(N){var k=/[\.\/]/,L=/\s*,\s*/,C=function(a,d){return a-d},a,v,y={n:{}},M=function(){for(var a=0,d=this.length;a<d;a++)if("undefined"!=typeof this[a])return this[a]},A=function(){for(var a=this.length;--a;)if("undefined"!=typeof this[a])return this[a]},w=function(k,d){k=String(k);var f=v,n=Array.prototype.slice.call(arguments,2),u=w.listeners(k),p=0,b,q=[],e={},l=[],r=a;l.firstDefined=M;l.lastDefined=A;a=k;for(var s=v=0,x=u.length;s<x;s++)"zIndex"in u[s]&&(q.push(u[s].zIndex),0>u[s].zIndex&&
+(e[u[s].zIndex]=u[s]));for(q.sort(C);0>q[p];)if(b=e[q[p++] ],l.push(b.apply(d,n)),v)return v=f,l;for(s=0;s<x;s++)if(b=u[s],"zIndex"in b)if(b.zIndex==q[p]){l.push(b.apply(d,n));if(v)break;do if(p++,(b=e[q[p] ])&&l.push(b.apply(d,n)),v)break;while(b)}else e[b.zIndex]=b;else if(l.push(b.apply(d,n)),v)break;v=f;a=r;return l};w._events=y;w.listeners=function(a){a=a.split(k);var d=y,f,n,u,p,b,q,e,l=[d],r=[];u=0;for(p=a.length;u<p;u++){e=[];b=0;for(q=l.length;b<q;b++)for(d=l[b].n,f=[d[a[u] ],d["*"] ],n=2;n--;)if(d=
+f[n])e.push(d),r=r.concat(d.f||[]);l=e}return r};w.on=function(a,d){a=String(a);if("function"!=typeof d)return function(){};for(var f=a.split(L),n=0,u=f.length;n<u;n++)(function(a){a=a.split(k);for(var b=y,f,e=0,l=a.length;e<l;e++)b=b.n,b=b.hasOwnProperty(a[e])&&b[a[e] ]||(b[a[e] ]={n:{}});b.f=b.f||[];e=0;for(l=b.f.length;e<l;e++)if(b.f[e]==d){f=!0;break}!f&&b.f.push(d)})(f[n]);return function(a){+a==+a&&(d.zIndex=+a)}};w.f=function(a){var d=[].slice.call(arguments,1);return function(){w.apply(null,
+[a,null].concat(d).concat([].slice.call(arguments,0)))}};w.stop=function(){v=1};w.nt=function(k){return k?(new RegExp("(?:\\.|\\/|^)"+k+"(?:\\.|\\/|$)")).test(a):a};w.nts=function(){return a.split(k)};w.off=w.unbind=function(a,d){if(a){var f=a.split(L);if(1<f.length)for(var n=0,u=f.length;n<u;n++)w.off(f[n],d);else{for(var f=a.split(k),p,b,q,e,l=[y],n=0,u=f.length;n<u;n++)for(e=0;e<l.length;e+=q.length-2){q=[e,1];p=l[e].n;if("*"!=f[n])p[f[n] ]&&q.push(p[f[n] ]);else for(b in p)p.hasOwnProperty(b)&&
+q.push(p[b]);l.splice.apply(l,q)}n=0;for(u=l.length;n<u;n++)for(p=l[n];p.n;){if(d){if(p.f){e=0;for(f=p.f.length;e<f;e++)if(p.f[e]==d){p.f.splice(e,1);break}!p.f.length&&delete p.f}for(b in p.n)if(p.n.hasOwnProperty(b)&&p.n[b].f){q=p.n[b].f;e=0;for(f=q.length;e<f;e++)if(q[e]==d){q.splice(e,1);break}!q.length&&delete p.n[b].f}}else for(b in delete p.f,p.n)p.n.hasOwnProperty(b)&&p.n[b].f&&delete p.n[b].f;p=p.n}}}else w._events=y={n:{}}};w.once=function(a,d){var f=function(){w.unbind(a,f);return d.apply(this,
+arguments)};return w.on(a,f)};w.version="0.4.2";w.toString=function(){return"You are running Eve 0.4.2"};"undefined"!=typeof module&&module.exports?module.exports=w:"function"===typeof define&&define.amd?define("eve",[],function(){return w}):N.eve=w})(this);
+(function(N,k){"function"===typeof define&&define.amd?define("Snap.svg",["eve"],function(L){return k(N,L)}):k(N,N.eve)})(this,function(N,k){var L=function(a){var k={},y=N.requestAnimationFrame||N.webkitRequestAnimationFrame||N.mozRequestAnimationFrame||N.oRequestAnimationFrame||N.msRequestAnimationFrame||function(a){setTimeout(a,16)},M=Array.isArray||function(a){return a instanceof Array||"[object Array]"==Object.prototype.toString.call(a)},A=0,w="M"+(+new Date).toString(36),z=function(a){if(null==
+a)return this.s;var b=this.s-a;this.b+=this.dur*b;this.B+=this.dur*b;this.s=a},d=function(a){if(null==a)return this.spd;this.spd=a},f=function(a){if(null==a)return this.dur;this.s=this.s*a/this.dur;this.dur=a},n=function(){delete k[this.id];this.update();a("mina.stop."+this.id,this)},u=function(){this.pdif||(delete k[this.id],this.update(),this.pdif=this.get()-this.b)},p=function(){this.pdif&&(this.b=this.get()-this.pdif,delete this.pdif,k[this.id]=this)},b=function(){var a;if(M(this.start)){a=[];
+for(var b=0,e=this.start.length;b<e;b++)a[b]=+this.start[b]+(this.end[b]-this.start[b])*this.easing(this.s)}else a=+this.start+(this.end-this.start)*this.easing(this.s);this.set(a)},q=function(){var l=0,b;for(b in k)if(k.hasOwnProperty(b)){var e=k[b],f=e.get();l++;e.s=(f-e.b)/(e.dur/e.spd);1<=e.s&&(delete k[b],e.s=1,l--,function(b){setTimeout(function(){a("mina.finish."+b.id,b)})}(e));e.update()}l&&y(q)},e=function(a,r,s,x,G,h,J){a={id:w+(A++).toString(36),start:a,end:r,b:s,s:0,dur:x-s,spd:1,get:G,
+set:h,easing:J||e.linear,status:z,speed:d,duration:f,stop:n,pause:u,resume:p,update:b};k[a.id]=a;r=0;for(var K in k)if(k.hasOwnProperty(K)&&(r++,2==r))break;1==r&&y(q);return a};e.time=Date.now||function(){return+new Date};e.getById=function(a){return k[a]||null};e.linear=function(a){return a};e.easeout=function(a){return Math.pow(a,1.7)};e.easein=function(a){return Math.pow(a,0.48)};e.easeinout=function(a){if(1==a)return 1;if(0==a)return 0;var b=0.48-a/1.04,e=Math.sqrt(0.1734+b*b);a=e-b;a=Math.pow(Math.abs(a),
+1/3)*(0>a?-1:1);b=-e-b;b=Math.pow(Math.abs(b),1/3)*(0>b?-1:1);a=a+b+0.5;return 3*(1-a)*a*a+a*a*a};e.backin=function(a){return 1==a?1:a*a*(2.70158*a-1.70158)};e.backout=function(a){if(0==a)return 0;a-=1;return a*a*(2.70158*a+1.70158)+1};e.elastic=function(a){return a==!!a?a:Math.pow(2,-10*a)*Math.sin(2*(a-0.075)*Math.PI/0.3)+1};e.bounce=function(a){a<1/2.75?a*=7.5625*a:a<2/2.75?(a-=1.5/2.75,a=7.5625*a*a+0.75):a<2.5/2.75?(a-=2.25/2.75,a=7.5625*a*a+0.9375):(a-=2.625/2.75,a=7.5625*a*a+0.984375);return a};
+return N.mina=e}("undefined"==typeof k?function(){}:k),C=function(){function a(c,t){if(c){if(c.tagName)return x(c);if(y(c,"array")&&a.set)return a.set.apply(a,c);if(c instanceof e)return c;if(null==t)return c=G.doc.querySelector(c),x(c)}return new s(null==c?"100%":c,null==t?"100%":t)}function v(c,a){if(a){"#text"==c&&(c=G.doc.createTextNode(a.text||""));"string"==typeof c&&(c=v(c));if("string"==typeof a)return"xlink:"==a.substring(0,6)?c.getAttributeNS(m,a.substring(6)):"xml:"==a.substring(0,4)?c.getAttributeNS(la,
+a.substring(4)):c.getAttribute(a);for(var da in a)if(a[h](da)){var b=J(a[da]);b?"xlink:"==da.substring(0,6)?c.setAttributeNS(m,da.substring(6),b):"xml:"==da.substring(0,4)?c.setAttributeNS(la,da.substring(4),b):c.setAttribute(da,b):c.removeAttribute(da)}}else c=G.doc.createElementNS(la,c);return c}function y(c,a){a=J.prototype.toLowerCase.call(a);return"finite"==a?isFinite(c):"array"==a&&(c instanceof Array||Array.isArray&&Array.isArray(c))?!0:"null"==a&&null===c||a==typeof c&&null!==c||"object"==
+a&&c===Object(c)||$.call(c).slice(8,-1).toLowerCase()==a}function M(c){if("function"==typeof c||Object(c)!==c)return c;var a=new c.constructor,b;for(b in c)c[h](b)&&(a[b]=M(c[b]));return a}function A(c,a,b){function m(){var e=Array.prototype.slice.call(arguments,0),f=e.join("\u2400"),d=m.cache=m.cache||{},l=m.count=m.count||[];if(d[h](f)){a:for(var e=l,l=f,B=0,H=e.length;B<H;B++)if(e[B]===l){e.push(e.splice(B,1)[0]);break a}return b?b(d[f]):d[f]}1E3<=l.length&&delete d[l.shift()];l.push(f);d[f]=c.apply(a,
+e);return b?b(d[f]):d[f]}return m}function w(c,a,b,m,e,f){return null==e?(c-=b,a-=m,c||a?(180*I.atan2(-a,-c)/C+540)%360:0):w(c,a,e,f)-w(b,m,e,f)}function z(c){return c%360*C/180}function d(c){var a=[];c=c.replace(/(?:^|\s)(\w+)\(([^)]+)\)/g,function(c,b,m){m=m.split(/\s*,\s*|\s+/);"rotate"==b&&1==m.length&&m.push(0,0);"scale"==b&&(2<m.length?m=m.slice(0,2):2==m.length&&m.push(0,0),1==m.length&&m.push(m[0],0,0));"skewX"==b?a.push(["m",1,0,I.tan(z(m[0])),1,0,0]):"skewY"==b?a.push(["m",1,I.tan(z(m[0])),
+0,1,0,0]):a.push([b.charAt(0)].concat(m));return c});return a}function f(c,t){var b=O(c),m=new a.Matrix;if(b)for(var e=0,f=b.length;e<f;e++){var h=b[e],d=h.length,B=J(h[0]).toLowerCase(),H=h[0]!=B,l=H?m.invert():0,E;"t"==B&&2==d?m.translate(h[1],0):"t"==B&&3==d?H?(d=l.x(0,0),B=l.y(0,0),H=l.x(h[1],h[2]),l=l.y(h[1],h[2]),m.translate(H-d,l-B)):m.translate(h[1],h[2]):"r"==B?2==d?(E=E||t,m.rotate(h[1],E.x+E.width/2,E.y+E.height/2)):4==d&&(H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.rotate(h[1],H,l)):m.rotate(h[1],
+h[2],h[3])):"s"==B?2==d||3==d?(E=E||t,m.scale(h[1],h[d-1],E.x+E.width/2,E.y+E.height/2)):4==d?H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.scale(h[1],h[1],H,l)):m.scale(h[1],h[1],h[2],h[3]):5==d&&(H?(H=l.x(h[3],h[4]),l=l.y(h[3],h[4]),m.scale(h[1],h[2],H,l)):m.scale(h[1],h[2],h[3],h[4])):"m"==B&&7==d&&m.add(h[1],h[2],h[3],h[4],h[5],h[6])}return m}function n(c,t){if(null==t){var m=!0;t="linearGradient"==c.type||"radialGradient"==c.type?c.node.getAttribute("gradientTransform"):"pattern"==c.type?c.node.getAttribute("patternTransform"):
+c.node.getAttribute("transform");if(!t)return new a.Matrix;t=d(t)}else t=a._.rgTransform.test(t)?J(t).replace(/\.{3}|\u2026/g,c._.transform||aa):d(t),y(t,"array")&&(t=a.path?a.path.toString.call(t):J(t)),c._.transform=t;var b=f(t,c.getBBox(1));if(m)return b;c.matrix=b}function u(c){c=c.node.ownerSVGElement&&x(c.node.ownerSVGElement)||c.node.parentNode&&x(c.node.parentNode)||a.select("svg")||a(0,0);var t=c.select("defs"),t=null==t?!1:t.node;t||(t=r("defs",c.node).node);return t}function p(c){return c.node.ownerSVGElement&&
+x(c.node.ownerSVGElement)||a.select("svg")}function b(c,a,m){function b(c){if(null==c)return aa;if(c==+c)return c;v(B,{width:c});try{return B.getBBox().width}catch(a){return 0}}function h(c){if(null==c)return aa;if(c==+c)return c;v(B,{height:c});try{return B.getBBox().height}catch(a){return 0}}function e(b,B){null==a?d[b]=B(c.attr(b)||0):b==a&&(d=B(null==m?c.attr(b)||0:m))}var f=p(c).node,d={},B=f.querySelector(".svg---mgr");B||(B=v("rect"),v(B,{x:-9E9,y:-9E9,width:10,height:10,"class":"svg---mgr",
+fill:"none"}),f.appendChild(B));switch(c.type){case "rect":e("rx",b),e("ry",h);case "image":e("width",b),e("height",h);case "text":e("x",b);e("y",h);break;case "circle":e("cx",b);e("cy",h);e("r",b);break;case "ellipse":e("cx",b);e("cy",h);e("rx",b);e("ry",h);break;case "line":e("x1",b);e("x2",b);e("y1",h);e("y2",h);break;case "marker":e("refX",b);e("markerWidth",b);e("refY",h);e("markerHeight",h);break;case "radialGradient":e("fx",b);e("fy",h);break;case "tspan":e("dx",b);e("dy",h);break;default:e(a,
+b)}f.removeChild(B);return d}function q(c){y(c,"array")||(c=Array.prototype.slice.call(arguments,0));for(var a=0,b=0,m=this.node;this[a];)delete this[a++];for(a=0;a<c.length;a++)"set"==c[a].type?c[a].forEach(function(c){m.appendChild(c.node)}):m.appendChild(c[a].node);for(var h=m.childNodes,a=0;a<h.length;a++)this[b++]=x(h[a]);return this}function e(c){if(c.snap in E)return E[c.snap];var a=this.id=V(),b;try{b=c.ownerSVGElement}catch(m){}this.node=c;b&&(this.paper=new s(b));this.type=c.tagName;this.anims=
+{};this._={transform:[]};c.snap=a;E[a]=this;"g"==this.type&&(this.add=q);if(this.type in{g:1,mask:1,pattern:1})for(var e in s.prototype)s.prototype[h](e)&&(this[e]=s.prototype[e])}function l(c){this.node=c}function r(c,a){var b=v(c);a.appendChild(b);return x(b)}function s(c,a){var b,m,f,d=s.prototype;if(c&&"svg"==c.tagName){if(c.snap in E)return E[c.snap];var l=c.ownerDocument;b=new e(c);m=c.getElementsByTagName("desc")[0];f=c.getElementsByTagName("defs")[0];m||(m=v("desc"),m.appendChild(l.createTextNode("Created with Snap")),
+b.node.appendChild(m));f||(f=v("defs"),b.node.appendChild(f));b.defs=f;for(var ca in d)d[h](ca)&&(b[ca]=d[ca]);b.paper=b.root=b}else b=r("svg",G.doc.body),v(b.node,{height:a,version:1.1,width:c,xmlns:la});return b}function x(c){return!c||c instanceof e||c instanceof l?c:c.tagName&&"svg"==c.tagName.toLowerCase()?new s(c):c.tagName&&"object"==c.tagName.toLowerCase()&&"image/svg+xml"==c.type?new s(c.contentDocument.getElementsByTagName("svg")[0]):new e(c)}a.version="0.3.0";a.toString=function(){return"Snap v"+
+this.version};a._={};var G={win:N,doc:N.document};a._.glob=G;var h="hasOwnProperty",J=String,K=parseFloat,U=parseInt,I=Math,P=I.max,Q=I.min,Y=I.abs,C=I.PI,aa="",$=Object.prototype.toString,F=/^\s*((#[a-f\d]{6})|(#[a-f\d]{3})|rgba?\(\s*([\d\.]+%?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+%?(?:\s*,\s*[\d\.]+%?)?)\s*\)|hsba?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\)|hsla?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\))\s*$/i;a._.separator=
+RegExp("[,\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]+");var S=RegExp("[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*"),X={hs:1,rg:1},W=RegExp("([a-z])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)",
+"ig"),ma=RegExp("([rstm])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)","ig"),Z=RegExp("(-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?)[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*",
+"ig"),na=0,ba="S"+(+new Date).toString(36),V=function(){return ba+(na++).toString(36)},m="http://www.w3.org/1999/xlink",la="http://www.w3.org/2000/svg",E={},ca=a.url=function(c){return"url('#"+c+"')"};a._.$=v;a._.id=V;a.format=function(){var c=/\{([^\}]+)\}/g,a=/(?:(?:^|\.)(.+?)(?=\[|\.|$|\()|\[('|")(.+?)\2\])(\(\))?/g,b=function(c,b,m){var h=m;b.replace(a,function(c,a,b,m,t){a=a||m;h&&(a in h&&(h=h[a]),"function"==typeof h&&t&&(h=h()))});return h=(null==h||h==m?c:h)+""};return function(a,m){return J(a).replace(c,
+function(c,a){return b(c,a,m)})}}();a._.clone=M;a._.cacher=A;a.rad=z;a.deg=function(c){return 180*c/C%360};a.angle=w;a.is=y;a.snapTo=function(c,a,b){b=y(b,"finite")?b:10;if(y(c,"array"))for(var m=c.length;m--;){if(Y(c[m]-a)<=b)return c[m]}else{c=+c;m=a%c;if(m<b)return a-m;if(m>c-b)return a-m+c}return a};a.getRGB=A(function(c){if(!c||(c=J(c)).indexOf("-")+1)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};if("none"==c)return{r:-1,g:-1,b:-1,hex:"none",toString:ka};!X[h](c.toLowerCase().substring(0,
+2))&&"#"!=c.charAt()&&(c=T(c));if(!c)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};var b,m,e,f,d;if(c=c.match(F)){c[2]&&(e=U(c[2].substring(5),16),m=U(c[2].substring(3,5),16),b=U(c[2].substring(1,3),16));c[3]&&(e=U((d=c[3].charAt(3))+d,16),m=U((d=c[3].charAt(2))+d,16),b=U((d=c[3].charAt(1))+d,16));c[4]&&(d=c[4].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b*=2.55),m=K(d[1]),"%"==d[1].slice(-1)&&(m*=2.55),e=K(d[2]),"%"==d[2].slice(-1)&&(e*=2.55),"rgba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),
+d[3]&&"%"==d[3].slice(-1)&&(f/=100));if(c[5])return d=c[5].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsb2rgb(b,m,e,f);if(c[6])return d=c[6].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),
+"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsla"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsl2rgb(b,m,e,f);b=Q(I.round(b),255);m=Q(I.round(m),255);e=Q(I.round(e),255);f=Q(P(f,0),1);c={r:b,g:m,b:e,toString:ka};c.hex="#"+(16777216|e|m<<8|b<<16).toString(16).slice(1);c.opacity=y(f,"finite")?f:1;return c}return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka}},a);a.hsb=A(function(c,b,m){return a.hsb2rgb(c,b,m).hex});a.hsl=A(function(c,b,m){return a.hsl2rgb(c,
+b,m).hex});a.rgb=A(function(c,a,b,m){if(y(m,"finite")){var e=I.round;return"rgba("+[e(c),e(a),e(b),+m.toFixed(2)]+")"}return"#"+(16777216|b|a<<8|c<<16).toString(16).slice(1)});var T=function(c){var a=G.doc.getElementsByTagName("head")[0]||G.doc.getElementsByTagName("svg")[0];T=A(function(c){if("red"==c.toLowerCase())return"rgb(255, 0, 0)";a.style.color="rgb(255, 0, 0)";a.style.color=c;c=G.doc.defaultView.getComputedStyle(a,aa).getPropertyValue("color");return"rgb(255, 0, 0)"==c?null:c});return T(c)},
+qa=function(){return"hsb("+[this.h,this.s,this.b]+")"},ra=function(){return"hsl("+[this.h,this.s,this.l]+")"},ka=function(){return 1==this.opacity||null==this.opacity?this.hex:"rgba("+[this.r,this.g,this.b,this.opacity]+")"},D=function(c,b,m){null==b&&y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&(m=c.b,b=c.g,c=c.r);null==b&&y(c,string)&&(m=a.getRGB(c),c=m.r,b=m.g,m=m.b);if(1<c||1<b||1<m)c/=255,b/=255,m/=255;return[c,b,m]},oa=function(c,b,m,e){c=I.round(255*c);b=I.round(255*b);m=I.round(255*m);c={r:c,
+g:b,b:m,opacity:y(e,"finite")?e:1,hex:a.rgb(c,b,m),toString:ka};y(e,"finite")&&(c.opacity=e);return c};a.color=function(c){var b;y(c,"object")&&"h"in c&&"s"in c&&"b"in c?(b=a.hsb2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):y(c,"object")&&"h"in c&&"s"in c&&"l"in c?(b=a.hsl2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):(y(c,"string")&&(c=a.getRGB(c)),y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&!("error"in c)?(b=a.rgb2hsl(c),c.h=b.h,c.s=b.s,c.l=b.l,b=a.rgb2hsb(c),c.v=b.b):(c={hex:"none"},
+c.r=c.g=c.b=c.h=c.s=c.v=c.l=-1,c.error=1));c.toString=ka;return c};a.hsb2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"b"in c&&(b=c.b,a=c.s,c=c.h,m=c.o);var e,h,d;c=360*c%360/60;d=b*a;a=d*(1-Y(c%2-1));b=e=h=b-d;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.hsl2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"l"in c&&(b=c.l,a=c.s,c=c.h);if(1<c||1<a||1<b)c/=360,a/=100,b/=100;var e,h,d;c=360*c%360/60;d=2*a*(0.5>b?b:1-b);a=d*(1-Y(c%2-1));b=e=
+h=b-d/2;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.rgb2hsb=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e;m=P(c,a,b);e=m-Q(c,a,b);c=((0==e?0:m==c?(a-b)/e:m==a?(b-c)/e+2:(c-a)/e+4)+360)%6*60/360;return{h:c,s:0==e?0:e/m,b:m,toString:qa}};a.rgb2hsl=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e,h;m=P(c,a,b);e=Q(c,a,b);h=m-e;c=((0==h?0:m==c?(a-b)/h:m==a?(b-c)/h+2:(c-a)/h+4)+360)%6*60/360;m=(m+e)/2;return{h:c,s:0==h?0:0.5>m?h/(2*m):h/(2-2*
+m),l:m,toString:ra}};a.parsePathString=function(c){if(!c)return null;var b=a.path(c);if(b.arr)return a.path.clone(b.arr);var m={a:7,c:6,o:2,h:1,l:2,m:2,r:4,q:4,s:4,t:2,v:1,u:3,z:0},e=[];y(c,"array")&&y(c[0],"array")&&(e=a.path.clone(c));e.length||J(c).replace(W,function(c,a,b){var h=[];c=a.toLowerCase();b.replace(Z,function(c,a){a&&h.push(+a)});"m"==c&&2<h.length&&(e.push([a].concat(h.splice(0,2))),c="l",a="m"==a?"l":"L");"o"==c&&1==h.length&&e.push([a,h[0] ]);if("r"==c)e.push([a].concat(h));else for(;h.length>=
+m[c]&&(e.push([a].concat(h.splice(0,m[c]))),m[c]););});e.toString=a.path.toString;b.arr=a.path.clone(e);return e};var O=a.parseTransformString=function(c){if(!c)return null;var b=[];y(c,"array")&&y(c[0],"array")&&(b=a.path.clone(c));b.length||J(c).replace(ma,function(c,a,m){var e=[];a.toLowerCase();m.replace(Z,function(c,a){a&&e.push(+a)});b.push([a].concat(e))});b.toString=a.path.toString;return b};a._.svgTransform2string=d;a._.rgTransform=RegExp("^[a-z][\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*-?\\.?\\d",
+"i");a._.transform2matrix=f;a._unit2px=b;a._.getSomeDefs=u;a._.getSomeSVG=p;a.select=function(c){return x(G.doc.querySelector(c))};a.selectAll=function(c){c=G.doc.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};setInterval(function(){for(var c in E)if(E[h](c)){var a=E[c],b=a.node;("svg"!=a.type&&!b.ownerSVGElement||"svg"==a.type&&(!b.parentNode||"ownerSVGElement"in b.parentNode&&!b.ownerSVGElement))&&delete E[c]}},1E4);(function(c){function m(c){function a(c,
+b){var m=v(c.node,b);(m=(m=m&&m.match(d))&&m[2])&&"#"==m.charAt()&&(m=m.substring(1))&&(f[m]=(f[m]||[]).concat(function(a){var m={};m[b]=ca(a);v(c.node,m)}))}function b(c){var a=v(c.node,"xlink:href");a&&"#"==a.charAt()&&(a=a.substring(1))&&(f[a]=(f[a]||[]).concat(function(a){c.attr("xlink:href","#"+a)}))}var e=c.selectAll("*"),h,d=/^\s*url\(("|'|)(.*)\1\)\s*$/;c=[];for(var f={},l=0,E=e.length;l<E;l++){h=e[l];a(h,"fill");a(h,"stroke");a(h,"filter");a(h,"mask");a(h,"clip-path");b(h);var t=v(h.node,
+"id");t&&(v(h.node,{id:h.id}),c.push({old:t,id:h.id}))}l=0;for(E=c.length;l<E;l++)if(e=f[c[l].old])for(h=0,t=e.length;h<t;h++)e[h](c[l].id)}function e(c,a,b){return function(m){m=m.slice(c,a);1==m.length&&(m=m[0]);return b?b(m):m}}function d(c){return function(){var a=c?"<"+this.type:"",b=this.node.attributes,m=this.node.childNodes;if(c)for(var e=0,h=b.length;e<h;e++)a+=" "+b[e].name+'="'+b[e].value.replace(/"/g,'\\"')+'"';if(m.length){c&&(a+=">");e=0;for(h=m.length;e<h;e++)3==m[e].nodeType?a+=m[e].nodeValue:
+1==m[e].nodeType&&(a+=x(m[e]).toString());c&&(a+="</"+this.type+">")}else c&&(a+="/>");return a}}c.attr=function(c,a){if(!c)return this;if(y(c,"string"))if(1<arguments.length){var b={};b[c]=a;c=b}else return k("snap.util.getattr."+c,this).firstDefined();for(var m in c)c[h](m)&&k("snap.util.attr."+m,this,c[m]);return this};c.getBBox=function(c){if(!a.Matrix||!a.path)return this.node.getBBox();var b=this,m=new a.Matrix;if(b.removed)return a._.box();for(;"use"==b.type;)if(c||(m=m.add(b.transform().localMatrix.translate(b.attr("x")||
+0,b.attr("y")||0))),b.original)b=b.original;else var e=b.attr("xlink:href"),b=b.original=b.node.ownerDocument.getElementById(e.substring(e.indexOf("#")+1));var e=b._,h=a.path.get[b.type]||a.path.get.deflt;try{if(c)return e.bboxwt=h?a.path.getBBox(b.realPath=h(b)):a._.box(b.node.getBBox()),a._.box(e.bboxwt);b.realPath=h(b);b.matrix=b.transform().localMatrix;e.bbox=a.path.getBBox(a.path.map(b.realPath,m.add(b.matrix)));return a._.box(e.bbox)}catch(d){return a._.box()}};var f=function(){return this.string};
+c.transform=function(c){var b=this._;if(null==c){var m=this;c=new a.Matrix(this.node.getCTM());for(var e=n(this),h=[e],d=new a.Matrix,l=e.toTransformString(),b=J(e)==J(this.matrix)?J(b.transform):l;"svg"!=m.type&&(m=m.parent());)h.push(n(m));for(m=h.length;m--;)d.add(h[m]);return{string:b,globalMatrix:c,totalMatrix:d,localMatrix:e,diffMatrix:c.clone().add(e.invert()),global:c.toTransformString(),total:d.toTransformString(),local:l,toString:f}}c instanceof a.Matrix?this.matrix=c:n(this,c);this.node&&
+("linearGradient"==this.type||"radialGradient"==this.type?v(this.node,{gradientTransform:this.matrix}):"pattern"==this.type?v(this.node,{patternTransform:this.matrix}):v(this.node,{transform:this.matrix}));return this};c.parent=function(){return x(this.node.parentNode)};c.append=c.add=function(c){if(c){if("set"==c.type){var a=this;c.forEach(function(c){a.add(c)});return this}c=x(c);this.node.appendChild(c.node);c.paper=this.paper}return this};c.appendTo=function(c){c&&(c=x(c),c.append(this));return this};
+c.prepend=function(c){if(c){if("set"==c.type){var a=this,b;c.forEach(function(c){b?b.after(c):a.prepend(c);b=c});return this}c=x(c);var m=c.parent();this.node.insertBefore(c.node,this.node.firstChild);this.add&&this.add();c.paper=this.paper;this.parent()&&this.parent().add();m&&m.add()}return this};c.prependTo=function(c){c=x(c);c.prepend(this);return this};c.before=function(c){if("set"==c.type){var a=this;c.forEach(function(c){var b=c.parent();a.node.parentNode.insertBefore(c.node,a.node);b&&b.add()});
+this.parent().add();return this}c=x(c);var b=c.parent();this.node.parentNode.insertBefore(c.node,this.node);this.parent()&&this.parent().add();b&&b.add();c.paper=this.paper;return this};c.after=function(c){c=x(c);var a=c.parent();this.node.nextSibling?this.node.parentNode.insertBefore(c.node,this.node.nextSibling):this.node.parentNode.appendChild(c.node);this.parent()&&this.parent().add();a&&a.add();c.paper=this.paper;return this};c.insertBefore=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,
+c.node);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.insertAfter=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,c.node.nextSibling);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.remove=function(){var c=this.parent();this.node.parentNode&&this.node.parentNode.removeChild(this.node);delete this.paper;this.removed=!0;c&&c.add();return this};c.select=function(c){return x(this.node.querySelector(c))};c.selectAll=
+function(c){c=this.node.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};c.asPX=function(c,a){null==a&&(a=this.attr(c));return+b(this,c,a)};c.use=function(){var c,a=this.node.id;a||(a=this.id,v(this.node,{id:a}));c="linearGradient"==this.type||"radialGradient"==this.type||"pattern"==this.type?r(this.type,this.node.parentNode):r("use",this.node.parentNode);v(c.node,{"xlink:href":"#"+a});c.original=this;return c};var l=/\S+/g;c.addClass=function(c){var a=(c||
+"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h,d;if(a.length){for(e=0;d=a[e++];)h=m.indexOf(d),~h||m.push(d);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.removeClass=function(c){var a=(c||"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h;if(m.length){for(e=0;h=a[e++];)h=m.indexOf(h),~h&&m.splice(h,1);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.hasClass=function(c){return!!~(this.node.className.baseVal.match(l)||[]).indexOf(c)};
+c.toggleClass=function(c,a){if(null!=a)return a?this.addClass(c):this.removeClass(c);var b=(c||"").match(l)||[],m=this.node,e=m.className.baseVal,h=e.match(l)||[],d,f,E;for(d=0;E=b[d++];)f=h.indexOf(E),~f?h.splice(f,1):h.push(E);b=h.join(" ");e!=b&&(m.className.baseVal=b);return this};c.clone=function(){var c=x(this.node.cloneNode(!0));v(c.node,"id")&&v(c.node,{id:c.id});m(c);c.insertAfter(this);return c};c.toDefs=function(){u(this).appendChild(this.node);return this};c.pattern=c.toPattern=function(c,
+a,b,m){var e=r("pattern",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,c=c.x);v(e.node,{x:c,y:a,width:b,height:m,patternUnits:"userSpaceOnUse",id:e.id,viewBox:[c,a,b,m].join(" ")});e.node.appendChild(this.node);return e};c.marker=function(c,a,b,m,e,h){var d=r("marker",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,e=c.refX||c.cx,h=c.refY||c.cy,c=c.x);v(d.node,{viewBox:[c,a,b,m].join(" "),markerWidth:b,markerHeight:m,
+orient:"auto",refX:e||0,refY:h||0,id:d.id});d.node.appendChild(this.node);return d};var E=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);this.attr=c;this.dur=a;b&&(this.easing=b);m&&(this.callback=m)};a._.Animation=E;a.animation=function(c,a,b,m){return new E(c,a,b,m)};c.inAnim=function(){var c=[],a;for(a in this.anims)this.anims[h](a)&&function(a){c.push({anim:new E(a._attrs,a.dur,a.easing,a._callback),mina:a,curStatus:a.status(),status:function(c){return a.status(c)},stop:function(){a.stop()}})}(this.anims[a]);
+return c};a.animate=function(c,a,b,m,e,h){"function"!=typeof e||e.length||(h=e,e=L.linear);var d=L.time();c=L(c,a,d,d+m,L.time,b,e);h&&k.once("mina.finish."+c.id,h);return c};c.stop=function(){for(var c=this.inAnim(),a=0,b=c.length;a<b;a++)c[a].stop();return this};c.animate=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);c instanceof E&&(m=c.callback,b=c.easing,a=b.dur,c=c.attr);var d=[],f=[],l={},t,ca,n,T=this,q;for(q in c)if(c[h](q)){T.equal?(n=T.equal(q,J(c[q])),t=n.from,ca=
+n.to,n=n.f):(t=+T.attr(q),ca=+c[q]);var la=y(t,"array")?t.length:1;l[q]=e(d.length,d.length+la,n);d=d.concat(t);f=f.concat(ca)}t=L.time();var p=L(d,f,t,t+a,L.time,function(c){var a={},b;for(b in l)l[h](b)&&(a[b]=l[b](c));T.attr(a)},b);T.anims[p.id]=p;p._attrs=c;p._callback=m;k("snap.animcreated."+T.id,p);k.once("mina.finish."+p.id,function(){delete T.anims[p.id];m&&m.call(T)});k.once("mina.stop."+p.id,function(){delete T.anims[p.id]});return T};var T={};c.data=function(c,b){var m=T[this.id]=T[this.id]||
+{};if(0==arguments.length)return k("snap.data.get."+this.id,this,m,null),m;if(1==arguments.length){if(a.is(c,"object")){for(var e in c)c[h](e)&&this.data(e,c[e]);return this}k("snap.data.get."+this.id,this,m[c],c);return m[c]}m[c]=b;k("snap.data.set."+this.id,this,b,c);return this};c.removeData=function(c){null==c?T[this.id]={}:T[this.id]&&delete T[this.id][c];return this};c.outerSVG=c.toString=d(1);c.innerSVG=d()})(e.prototype);a.parse=function(c){var a=G.doc.createDocumentFragment(),b=!0,m=G.doc.createElement("div");
+c=J(c);c.match(/^\s*<\s*svg(?:\s|>)/)||(c="<svg>"+c+"</svg>",b=!1);m.innerHTML=c;if(c=m.getElementsByTagName("svg")[0])if(b)a=c;else for(;c.firstChild;)a.appendChild(c.firstChild);m.innerHTML=aa;return new l(a)};l.prototype.select=e.prototype.select;l.prototype.selectAll=e.prototype.selectAll;a.fragment=function(){for(var c=Array.prototype.slice.call(arguments,0),b=G.doc.createDocumentFragment(),m=0,e=c.length;m<e;m++){var h=c[m];h.node&&h.node.nodeType&&b.appendChild(h.node);h.nodeType&&b.appendChild(h);
+"string"==typeof h&&b.appendChild(a.parse(h).node)}return new l(b)};a._.make=r;a._.wrap=x;s.prototype.el=function(c,a){var b=r(c,this.node);a&&b.attr(a);return b};k.on("snap.util.getattr",function(){var c=k.nt(),c=c.substring(c.lastIndexOf(".")+1),a=c.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});return pa[h](a)?this.node.ownerDocument.defaultView.getComputedStyle(this.node,null).getPropertyValue(a):v(this.node,c)});var pa={"alignment-baseline":0,"baseline-shift":0,clip:0,"clip-path":0,
+"clip-rule":0,color:0,"color-interpolation":0,"color-interpolation-filters":0,"color-profile":0,"color-rendering":0,cursor:0,direction:0,display:0,"dominant-baseline":0,"enable-background":0,fill:0,"fill-opacity":0,"fill-rule":0,filter:0,"flood-color":0,"flood-opacity":0,font:0,"font-family":0,"font-size":0,"font-size-adjust":0,"font-stretch":0,"font-style":0,"font-variant":0,"font-weight":0,"glyph-orientation-horizontal":0,"glyph-orientation-vertical":0,"image-rendering":0,kerning:0,"letter-spacing":0,
+"lighting-color":0,marker:0,"marker-end":0,"marker-mid":0,"marker-start":0,mask:0,opacity:0,overflow:0,"pointer-events":0,"shape-rendering":0,"stop-color":0,"stop-opacity":0,stroke:0,"stroke-dasharray":0,"stroke-dashoffset":0,"stroke-linecap":0,"stroke-linejoin":0,"stroke-miterlimit":0,"stroke-opacity":0,"stroke-width":0,"text-anchor":0,"text-decoration":0,"text-rendering":0,"unicode-bidi":0,visibility:0,"word-spacing":0,"writing-mode":0};k.on("snap.util.attr",function(c){var a=k.nt(),b={},a=a.substring(a.lastIndexOf(".")+
+1);b[a]=c;var m=a.replace(/-(\w)/gi,function(c,a){return a.toUpperCase()}),a=a.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});pa[h](a)?this.node.style[m]=null==c?aa:c:v(this.node,b)});a.ajax=function(c,a,b,m){var e=new XMLHttpRequest,h=V();if(e){if(y(a,"function"))m=b,b=a,a=null;else if(y(a,"object")){var d=[],f;for(f in a)a.hasOwnProperty(f)&&d.push(encodeURIComponent(f)+"="+encodeURIComponent(a[f]));a=d.join("&")}e.open(a?"POST":"GET",c,!0);a&&(e.setRequestHeader("X-Requested-With","XMLHttpRequest"),
+e.setRequestHeader("Content-type","application/x-www-form-urlencoded"));b&&(k.once("snap.ajax."+h+".0",b),k.once("snap.ajax."+h+".200",b),k.once("snap.ajax."+h+".304",b));e.onreadystatechange=function(){4==e.readyState&&k("snap.ajax."+h+"."+e.status,m,e)};if(4==e.readyState)return e;e.send(a);return e}};a.load=function(c,b,m){a.ajax(c,function(c){c=a.parse(c.responseText);m?b.call(m,c):b(c)})};a.getElementByPoint=function(c,a){var b,m,e=G.doc.elementFromPoint(c,a);if(G.win.opera&&"svg"==e.tagName){b=
+e;m=b.getBoundingClientRect();b=b.ownerDocument;var h=b.body,d=b.documentElement;b=m.top+(g.win.pageYOffset||d.scrollTop||h.scrollTop)-(d.clientTop||h.clientTop||0);m=m.left+(g.win.pageXOffset||d.scrollLeft||h.scrollLeft)-(d.clientLeft||h.clientLeft||0);h=e.createSVGRect();h.x=c-m;h.y=a-b;h.width=h.height=1;b=e.getIntersectionList(h,null);b.length&&(e=b[b.length-1])}return e?x(e):null};a.plugin=function(c){c(a,e,s,G,l)};return G.win.Snap=a}();C.plugin(function(a,k,y,M,A){function w(a,d,f,b,q,e){null==
+d&&"[object SVGMatrix]"==z.call(a)?(this.a=a.a,this.b=a.b,this.c=a.c,this.d=a.d,this.e=a.e,this.f=a.f):null!=a?(this.a=+a,this.b=+d,this.c=+f,this.d=+b,this.e=+q,this.f=+e):(this.a=1,this.c=this.b=0,this.d=1,this.f=this.e=0)}var z=Object.prototype.toString,d=String,f=Math;(function(n){function k(a){return a[0]*a[0]+a[1]*a[1]}function p(a){var d=f.sqrt(k(a));a[0]&&(a[0]/=d);a[1]&&(a[1]/=d)}n.add=function(a,d,e,f,n,p){var k=[[],[],[] ],u=[[this.a,this.c,this.e],[this.b,this.d,this.f],[0,0,1] ];d=[[a,
+e,n],[d,f,p],[0,0,1] ];a&&a instanceof w&&(d=[[a.a,a.c,a.e],[a.b,a.d,a.f],[0,0,1] ]);for(a=0;3>a;a++)for(e=0;3>e;e++){for(f=n=0;3>f;f++)n+=u[a][f]*d[f][e];k[a][e]=n}this.a=k[0][0];this.b=k[1][0];this.c=k[0][1];this.d=k[1][1];this.e=k[0][2];this.f=k[1][2];return this};n.invert=function(){var a=this.a*this.d-this.b*this.c;return new w(this.d/a,-this.b/a,-this.c/a,this.a/a,(this.c*this.f-this.d*this.e)/a,(this.b*this.e-this.a*this.f)/a)};n.clone=function(){return new w(this.a,this.b,this.c,this.d,this.e,
+this.f)};n.translate=function(a,d){return this.add(1,0,0,1,a,d)};n.scale=function(a,d,e,f){null==d&&(d=a);(e||f)&&this.add(1,0,0,1,e,f);this.add(a,0,0,d,0,0);(e||f)&&this.add(1,0,0,1,-e,-f);return this};n.rotate=function(b,d,e){b=a.rad(b);d=d||0;e=e||0;var l=+f.cos(b).toFixed(9);b=+f.sin(b).toFixed(9);this.add(l,b,-b,l,d,e);return this.add(1,0,0,1,-d,-e)};n.x=function(a,d){return a*this.a+d*this.c+this.e};n.y=function(a,d){return a*this.b+d*this.d+this.f};n.get=function(a){return+this[d.fromCharCode(97+
+a)].toFixed(4)};n.toString=function(){return"matrix("+[this.get(0),this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)].join()+")"};n.offset=function(){return[this.e.toFixed(4),this.f.toFixed(4)]};n.determinant=function(){return this.a*this.d-this.b*this.c};n.split=function(){var b={};b.dx=this.e;b.dy=this.f;var d=[[this.a,this.c],[this.b,this.d] ];b.scalex=f.sqrt(k(d[0]));p(d[0]);b.shear=d[0][0]*d[1][0]+d[0][1]*d[1][1];d[1]=[d[1][0]-d[0][0]*b.shear,d[1][1]-d[0][1]*b.shear];b.scaley=f.sqrt(k(d[1]));
+p(d[1]);b.shear/=b.scaley;0>this.determinant()&&(b.scalex=-b.scalex);var e=-d[0][1],d=d[1][1];0>d?(b.rotate=a.deg(f.acos(d)),0>e&&(b.rotate=360-b.rotate)):b.rotate=a.deg(f.asin(e));b.isSimple=!+b.shear.toFixed(9)&&(b.scalex.toFixed(9)==b.scaley.toFixed(9)||!b.rotate);b.isSuperSimple=!+b.shear.toFixed(9)&&b.scalex.toFixed(9)==b.scaley.toFixed(9)&&!b.rotate;b.noRotation=!+b.shear.toFixed(9)&&!b.rotate;return b};n.toTransformString=function(a){a=a||this.split();if(+a.shear.toFixed(9))return"m"+[this.get(0),
+this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)];a.scalex=+a.scalex.toFixed(4);a.scaley=+a.scaley.toFixed(4);a.rotate=+a.rotate.toFixed(4);return(a.dx||a.dy?"t"+[+a.dx.toFixed(4),+a.dy.toFixed(4)]:"")+(1!=a.scalex||1!=a.scaley?"s"+[a.scalex,a.scaley,0,0]:"")+(a.rotate?"r"+[+a.rotate.toFixed(4),0,0]:"")}})(w.prototype);a.Matrix=w;a.matrix=function(a,d,f,b,k,e){return new w(a,d,f,b,k,e)}});C.plugin(function(a,v,y,M,A){function w(h){return function(d){k.stop();d instanceof A&&1==d.node.childNodes.length&&
+("radialGradient"==d.node.firstChild.tagName||"linearGradient"==d.node.firstChild.tagName||"pattern"==d.node.firstChild.tagName)&&(d=d.node.firstChild,b(this).appendChild(d),d=u(d));if(d instanceof v)if("radialGradient"==d.type||"linearGradient"==d.type||"pattern"==d.type){d.node.id||e(d.node,{id:d.id});var f=l(d.node.id)}else f=d.attr(h);else f=a.color(d),f.error?(f=a(b(this).ownerSVGElement).gradient(d))?(f.node.id||e(f.node,{id:f.id}),f=l(f.node.id)):f=d:f=r(f);d={};d[h]=f;e(this.node,d);this.node.style[h]=
+x}}function z(a){k.stop();a==+a&&(a+="px");this.node.style.fontSize=a}function d(a){var b=[];a=a.childNodes;for(var e=0,f=a.length;e<f;e++){var l=a[e];3==l.nodeType&&b.push(l.nodeValue);"tspan"==l.tagName&&(1==l.childNodes.length&&3==l.firstChild.nodeType?b.push(l.firstChild.nodeValue):b.push(d(l)))}return b}function f(){k.stop();return this.node.style.fontSize}var n=a._.make,u=a._.wrap,p=a.is,b=a._.getSomeDefs,q=/^url\(#?([^)]+)\)$/,e=a._.$,l=a.url,r=String,s=a._.separator,x="";k.on("snap.util.attr.mask",
+function(a){if(a instanceof v||a instanceof A){k.stop();a instanceof A&&1==a.node.childNodes.length&&(a=a.node.firstChild,b(this).appendChild(a),a=u(a));if("mask"==a.type)var d=a;else d=n("mask",b(this)),d.node.appendChild(a.node);!d.node.id&&e(d.node,{id:d.id});e(this.node,{mask:l(d.id)})}});(function(a){k.on("snap.util.attr.clip",a);k.on("snap.util.attr.clip-path",a);k.on("snap.util.attr.clipPath",a)})(function(a){if(a instanceof v||a instanceof A){k.stop();if("clipPath"==a.type)var d=a;else d=
+n("clipPath",b(this)),d.node.appendChild(a.node),!d.node.id&&e(d.node,{id:d.id});e(this.node,{"clip-path":l(d.id)})}});k.on("snap.util.attr.fill",w("fill"));k.on("snap.util.attr.stroke",w("stroke"));var G=/^([lr])(?:\(([^)]*)\))?(.*)$/i;k.on("snap.util.grad.parse",function(a){a=r(a);var b=a.match(G);if(!b)return null;a=b[1];var e=b[2],b=b[3],e=e.split(/\s*,\s*/).map(function(a){return+a==a?+a:a});1==e.length&&0==e[0]&&(e=[]);b=b.split("-");b=b.map(function(a){a=a.split(":");var b={color:a[0]};a[1]&&
+(b.offset=parseFloat(a[1]));return b});return{type:a,params:e,stops:b}});k.on("snap.util.attr.d",function(b){k.stop();p(b,"array")&&p(b[0],"array")&&(b=a.path.toString.call(b));b=r(b);b.match(/[ruo]/i)&&(b=a.path.toAbsolute(b));e(this.node,{d:b})})(-1);k.on("snap.util.attr.#text",function(a){k.stop();a=r(a);for(a=M.doc.createTextNode(a);this.node.firstChild;)this.node.removeChild(this.node.firstChild);this.node.appendChild(a)})(-1);k.on("snap.util.attr.path",function(a){k.stop();this.attr({d:a})})(-1);
+k.on("snap.util.attr.class",function(a){k.stop();this.node.className.baseVal=a})(-1);k.on("snap.util.attr.viewBox",function(a){a=p(a,"object")&&"x"in a?[a.x,a.y,a.width,a.height].join(" "):p(a,"array")?a.join(" "):a;e(this.node,{viewBox:a});k.stop()})(-1);k.on("snap.util.attr.transform",function(a){this.transform(a);k.stop()})(-1);k.on("snap.util.attr.r",function(a){"rect"==this.type&&(k.stop(),e(this.node,{rx:a,ry:a}))})(-1);k.on("snap.util.attr.textpath",function(a){k.stop();if("text"==this.type){var d,
+f;if(!a&&this.textPath){for(a=this.textPath;a.node.firstChild;)this.node.appendChild(a.node.firstChild);a.remove();delete this.textPath}else if(p(a,"string")?(d=b(this),a=u(d.parentNode).path(a),d.appendChild(a.node),d=a.id,a.attr({id:d})):(a=u(a),a instanceof v&&(d=a.attr("id"),d||(d=a.id,a.attr({id:d})))),d)if(a=this.textPath,f=this.node,a)a.attr({"xlink:href":"#"+d});else{for(a=e("textPath",{"xlink:href":"#"+d});f.firstChild;)a.appendChild(f.firstChild);f.appendChild(a);this.textPath=u(a)}}})(-1);
+k.on("snap.util.attr.text",function(a){if("text"==this.type){for(var b=this.node,d=function(a){var b=e("tspan");if(p(a,"array"))for(var f=0;f<a.length;f++)b.appendChild(d(a[f]));else b.appendChild(M.doc.createTextNode(a));b.normalize&&b.normalize();return b};b.firstChild;)b.removeChild(b.firstChild);for(a=d(a);a.firstChild;)b.appendChild(a.firstChild)}k.stop()})(-1);k.on("snap.util.attr.fontSize",z)(-1);k.on("snap.util.attr.font-size",z)(-1);k.on("snap.util.getattr.transform",function(){k.stop();
+return this.transform()})(-1);k.on("snap.util.getattr.textpath",function(){k.stop();return this.textPath})(-1);(function(){function b(d){return function(){k.stop();var b=M.doc.defaultView.getComputedStyle(this.node,null).getPropertyValue("marker-"+d);return"none"==b?b:a(M.doc.getElementById(b.match(q)[1]))}}function d(a){return function(b){k.stop();var d="marker"+a.charAt(0).toUpperCase()+a.substring(1);if(""==b||!b)this.node.style[d]="none";else if("marker"==b.type){var f=b.node.id;f||e(b.node,{id:b.id});
+this.node.style[d]=l(f)}}}k.on("snap.util.getattr.marker-end",b("end"))(-1);k.on("snap.util.getattr.markerEnd",b("end"))(-1);k.on("snap.util.getattr.marker-start",b("start"))(-1);k.on("snap.util.getattr.markerStart",b("start"))(-1);k.on("snap.util.getattr.marker-mid",b("mid"))(-1);k.on("snap.util.getattr.markerMid",b("mid"))(-1);k.on("snap.util.attr.marker-end",d("end"))(-1);k.on("snap.util.attr.markerEnd",d("end"))(-1);k.on("snap.util.attr.marker-start",d("start"))(-1);k.on("snap.util.attr.markerStart",
+d("start"))(-1);k.on("snap.util.attr.marker-mid",d("mid"))(-1);k.on("snap.util.attr.markerMid",d("mid"))(-1)})();k.on("snap.util.getattr.r",function(){if("rect"==this.type&&e(this.node,"rx")==e(this.node,"ry"))return k.stop(),e(this.node,"rx")})(-1);k.on("snap.util.getattr.text",function(){if("text"==this.type||"tspan"==this.type){k.stop();var a=d(this.node);return 1==a.length?a[0]:a}})(-1);k.on("snap.util.getattr.#text",function(){return this.node.textContent})(-1);k.on("snap.util.getattr.viewBox",
+function(){k.stop();var b=e(this.node,"viewBox");if(b)return b=b.split(s),a._.box(+b[0],+b[1],+b[2],+b[3])})(-1);k.on("snap.util.getattr.points",function(){var a=e(this.node,"points");k.stop();if(a)return a.split(s)})(-1);k.on("snap.util.getattr.path",function(){var a=e(this.node,"d");k.stop();return a})(-1);k.on("snap.util.getattr.class",function(){return this.node.className.baseVal})(-1);k.on("snap.util.getattr.fontSize",f)(-1);k.on("snap.util.getattr.font-size",f)(-1)});C.plugin(function(a,v,y,
+M,A){function w(a){return a}function z(a){return function(b){return+b.toFixed(3)+a}}var d={"+":function(a,b){return a+b},"-":function(a,b){return a-b},"/":function(a,b){return a/b},"*":function(a,b){return a*b}},f=String,n=/[a-z]+$/i,u=/^\s*([+\-\/*])\s*=\s*([\d.eE+\-]+)\s*([^\d\s]+)?\s*$/;k.on("snap.util.attr",function(a){if(a=f(a).match(u)){var b=k.nt(),b=b.substring(b.lastIndexOf(".")+1),q=this.attr(b),e={};k.stop();var l=a[3]||"",r=q.match(n),s=d[a[1] ];r&&r==l?a=s(parseFloat(q),+a[2]):(q=this.asPX(b),
+a=s(this.asPX(b),this.asPX(b,a[2]+l)));isNaN(q)||isNaN(a)||(e[b]=a,this.attr(e))}})(-10);k.on("snap.util.equal",function(a,b){var q=f(this.attr(a)||""),e=f(b).match(u);if(e){k.stop();var l=e[3]||"",r=q.match(n),s=d[e[1] ];if(r&&r==l)return{from:parseFloat(q),to:s(parseFloat(q),+e[2]),f:z(r)};q=this.asPX(a);return{from:q,to:s(q,this.asPX(a,e[2]+l)),f:w}}})(-10)});C.plugin(function(a,v,y,M,A){var w=y.prototype,z=a.is;w.rect=function(a,d,k,p,b,q){var e;null==q&&(q=b);z(a,"object")&&"[object Object]"==
+a?e=a:null!=a&&(e={x:a,y:d,width:k,height:p},null!=b&&(e.rx=b,e.ry=q));return this.el("rect",e)};w.circle=function(a,d,k){var p;z(a,"object")&&"[object Object]"==a?p=a:null!=a&&(p={cx:a,cy:d,r:k});return this.el("circle",p)};var d=function(){function a(){this.parentNode.removeChild(this)}return function(d,k){var p=M.doc.createElement("img"),b=M.doc.body;p.style.cssText="position:absolute;left:-9999em;top:-9999em";p.onload=function(){k.call(p);p.onload=p.onerror=null;b.removeChild(p)};p.onerror=a;
+b.appendChild(p);p.src=d}}();w.image=function(f,n,k,p,b){var q=this.el("image");if(z(f,"object")&&"src"in f)q.attr(f);else if(null!=f){var e={"xlink:href":f,preserveAspectRatio:"none"};null!=n&&null!=k&&(e.x=n,e.y=k);null!=p&&null!=b?(e.width=p,e.height=b):d(f,function(){a._.$(q.node,{width:this.offsetWidth,height:this.offsetHeight})});a._.$(q.node,e)}return q};w.ellipse=function(a,d,k,p){var b;z(a,"object")&&"[object Object]"==a?b=a:null!=a&&(b={cx:a,cy:d,rx:k,ry:p});return this.el("ellipse",b)};
+w.path=function(a){var d;z(a,"object")&&!z(a,"array")?d=a:a&&(d={d:a});return this.el("path",d)};w.group=w.g=function(a){var d=this.el("g");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.svg=function(a,d,k,p,b,q,e,l){var r={};z(a,"object")&&null==d?r=a:(null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l]));return this.el("svg",r)};w.mask=function(a){var d=
+this.el("mask");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.ptrn=function(a,d,k,p,b,q,e,l){if(z(a,"object"))var r=a;else arguments.length?(r={},null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l])):r={patternUnits:"userSpaceOnUse"};return this.el("pattern",r)};w.use=function(a){return null!=a?(make("use",this.node),a instanceof v&&(a.attr("id")||
+a.attr({id:ID()}),a=a.attr("id")),this.el("use",{"xlink:href":a})):v.prototype.use.call(this)};w.text=function(a,d,k){var p={};z(a,"object")?p=a:null!=a&&(p={x:a,y:d,text:k||""});return this.el("text",p)};w.line=function(a,d,k,p){var b={};z(a,"object")?b=a:null!=a&&(b={x1:a,x2:k,y1:d,y2:p});return this.el("line",b)};w.polyline=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polyline",d)};
+w.polygon=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polygon",d)};(function(){function d(){return this.selectAll("stop")}function n(b,d){var f=e("stop"),k={offset:+d+"%"};b=a.color(b);k["stop-color"]=b.hex;1>b.opacity&&(k["stop-opacity"]=b.opacity);e(f,k);this.node.appendChild(f);return this}function u(){if("linearGradient"==this.type){var b=e(this.node,"x1")||0,d=e(this.node,"x2")||
+1,f=e(this.node,"y1")||0,k=e(this.node,"y2")||0;return a._.box(b,f,math.abs(d-b),math.abs(k-f))}b=this.node.r||0;return a._.box((this.node.cx||0.5)-b,(this.node.cy||0.5)-b,2*b,2*b)}function p(a,d){function f(a,b){for(var d=(b-u)/(a-w),e=w;e<a;e++)h[e].offset=+(+u+d*(e-w)).toFixed(2);w=a;u=b}var n=k("snap.util.grad.parse",null,d).firstDefined(),p;if(!n)return null;n.params.unshift(a);p="l"==n.type.toLowerCase()?b.apply(0,n.params):q.apply(0,n.params);n.type!=n.type.toLowerCase()&&e(p.node,{gradientUnits:"userSpaceOnUse"});
+var h=n.stops,n=h.length,u=0,w=0;n--;for(var v=0;v<n;v++)"offset"in h[v]&&f(v,h[v].offset);h[n].offset=h[n].offset||100;f(n,h[n].offset);for(v=0;v<=n;v++){var y=h[v];p.addStop(y.color,y.offset)}return p}function b(b,k,p,q,w){b=a._.make("linearGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{x1:k,y1:p,x2:q,y2:w});return b}function q(b,k,p,q,w,h){b=a._.make("radialGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{cx:k,cy:p,r:q});null!=w&&null!=h&&e(b.node,{fx:w,fy:h});
+return b}var e=a._.$;w.gradient=function(a){return p(this.defs,a)};w.gradientLinear=function(a,d,e,f){return b(this.defs,a,d,e,f)};w.gradientRadial=function(a,b,d,e,f){return q(this.defs,a,b,d,e,f)};w.toString=function(){var b=this.node.ownerDocument,d=b.createDocumentFragment(),b=b.createElement("div"),e=this.node.cloneNode(!0);d.appendChild(b);b.appendChild(e);a._.$(e,{xmlns:"http://www.w3.org/2000/svg"});b=b.innerHTML;d.removeChild(d.firstChild);return b};w.clear=function(){for(var a=this.node.firstChild,
+b;a;)b=a.nextSibling,"defs"!=a.tagName?a.parentNode.removeChild(a):w.clear.call({node:a}),a=b}})()});C.plugin(function(a,k,y,M){function A(a){var b=A.ps=A.ps||{};b[a]?b[a].sleep=100:b[a]={sleep:100};setTimeout(function(){for(var d in b)b[L](d)&&d!=a&&(b[d].sleep--,!b[d].sleep&&delete b[d])});return b[a]}function w(a,b,d,e){null==a&&(a=b=d=e=0);null==b&&(b=a.y,d=a.width,e=a.height,a=a.x);return{x:a,y:b,width:d,w:d,height:e,h:e,x2:a+d,y2:b+e,cx:a+d/2,cy:b+e/2,r1:F.min(d,e)/2,r2:F.max(d,e)/2,r0:F.sqrt(d*
+d+e*e)/2,path:s(a,b,d,e),vb:[a,b,d,e].join(" ")}}function z(){return this.join(",").replace(N,"$1")}function d(a){a=C(a);a.toString=z;return a}function f(a,b,d,h,f,k,l,n,p){if(null==p)return e(a,b,d,h,f,k,l,n);if(0>p||e(a,b,d,h,f,k,l,n)<p)p=void 0;else{var q=0.5,O=1-q,s;for(s=e(a,b,d,h,f,k,l,n,O);0.01<Z(s-p);)q/=2,O+=(s<p?1:-1)*q,s=e(a,b,d,h,f,k,l,n,O);p=O}return u(a,b,d,h,f,k,l,n,p)}function n(b,d){function e(a){return+(+a).toFixed(3)}return a._.cacher(function(a,h,l){a instanceof k&&(a=a.attr("d"));
+a=I(a);for(var n,p,D,q,O="",s={},c=0,t=0,r=a.length;t<r;t++){D=a[t];if("M"==D[0])n=+D[1],p=+D[2];else{q=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6]);if(c+q>h){if(d&&!s.start){n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c);O+=["C"+e(n.start.x),e(n.start.y),e(n.m.x),e(n.m.y),e(n.x),e(n.y)];if(l)return O;s.start=O;O=["M"+e(n.x),e(n.y)+"C"+e(n.n.x),e(n.n.y),e(n.end.x),e(n.end.y),e(D[5]),e(D[6])].join();c+=q;n=+D[5];p=+D[6];continue}if(!b&&!d)return n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c)}c+=q;n=+D[5];p=+D[6]}O+=
+D.shift()+D}s.end=O;return n=b?c:d?s:u(n,p,D[0],D[1],D[2],D[3],D[4],D[5],1)},null,a._.clone)}function u(a,b,d,e,h,f,k,l,n){var p=1-n,q=ma(p,3),s=ma(p,2),c=n*n,t=c*n,r=q*a+3*s*n*d+3*p*n*n*h+t*k,q=q*b+3*s*n*e+3*p*n*n*f+t*l,s=a+2*n*(d-a)+c*(h-2*d+a),t=b+2*n*(e-b)+c*(f-2*e+b),x=d+2*n*(h-d)+c*(k-2*h+d),c=e+2*n*(f-e)+c*(l-2*f+e);a=p*a+n*d;b=p*b+n*e;h=p*h+n*k;f=p*f+n*l;l=90-180*F.atan2(s-x,t-c)/S;return{x:r,y:q,m:{x:s,y:t},n:{x:x,y:c},start:{x:a,y:b},end:{x:h,y:f},alpha:l}}function p(b,d,e,h,f,n,k,l){a.is(b,
+"array")||(b=[b,d,e,h,f,n,k,l]);b=U.apply(null,b);return w(b.min.x,b.min.y,b.max.x-b.min.x,b.max.y-b.min.y)}function b(a,b,d){return b>=a.x&&b<=a.x+a.width&&d>=a.y&&d<=a.y+a.height}function q(a,d){a=w(a);d=w(d);return b(d,a.x,a.y)||b(d,a.x2,a.y)||b(d,a.x,a.y2)||b(d,a.x2,a.y2)||b(a,d.x,d.y)||b(a,d.x2,d.y)||b(a,d.x,d.y2)||b(a,d.x2,d.y2)||(a.x<d.x2&&a.x>d.x||d.x<a.x2&&d.x>a.x)&&(a.y<d.y2&&a.y>d.y||d.y<a.y2&&d.y>a.y)}function e(a,b,d,e,h,f,n,k,l){null==l&&(l=1);l=(1<l?1:0>l?0:l)/2;for(var p=[-0.1252,
+0.1252,-0.3678,0.3678,-0.5873,0.5873,-0.7699,0.7699,-0.9041,0.9041,-0.9816,0.9816],q=[0.2491,0.2491,0.2335,0.2335,0.2032,0.2032,0.1601,0.1601,0.1069,0.1069,0.0472,0.0472],s=0,c=0;12>c;c++)var t=l*p[c]+l,r=t*(t*(-3*a+9*d-9*h+3*n)+6*a-12*d+6*h)-3*a+3*d,t=t*(t*(-3*b+9*e-9*f+3*k)+6*b-12*e+6*f)-3*b+3*e,s=s+q[c]*F.sqrt(r*r+t*t);return l*s}function l(a,b,d){a=I(a);b=I(b);for(var h,f,l,n,k,s,r,O,x,c,t=d?0:[],w=0,v=a.length;w<v;w++)if(x=a[w],"M"==x[0])h=k=x[1],f=s=x[2];else{"C"==x[0]?(x=[h,f].concat(x.slice(1)),
+h=x[6],f=x[7]):(x=[h,f,h,f,k,s,k,s],h=k,f=s);for(var G=0,y=b.length;G<y;G++)if(c=b[G],"M"==c[0])l=r=c[1],n=O=c[2];else{"C"==c[0]?(c=[l,n].concat(c.slice(1)),l=c[6],n=c[7]):(c=[l,n,l,n,r,O,r,O],l=r,n=O);var z;var K=x,B=c;z=d;var H=p(K),J=p(B);if(q(H,J)){for(var H=e.apply(0,K),J=e.apply(0,B),H=~~(H/8),J=~~(J/8),U=[],A=[],F={},M=z?0:[],P=0;P<H+1;P++){var C=u.apply(0,K.concat(P/H));U.push({x:C.x,y:C.y,t:P/H})}for(P=0;P<J+1;P++)C=u.apply(0,B.concat(P/J)),A.push({x:C.x,y:C.y,t:P/J});for(P=0;P<H;P++)for(K=
+0;K<J;K++){var Q=U[P],L=U[P+1],B=A[K],C=A[K+1],N=0.001>Z(L.x-Q.x)?"y":"x",S=0.001>Z(C.x-B.x)?"y":"x",R;R=Q.x;var Y=Q.y,V=L.x,ea=L.y,fa=B.x,ga=B.y,ha=C.x,ia=C.y;if(W(R,V)<X(fa,ha)||X(R,V)>W(fa,ha)||W(Y,ea)<X(ga,ia)||X(Y,ea)>W(ga,ia))R=void 0;else{var $=(R*ea-Y*V)*(fa-ha)-(R-V)*(fa*ia-ga*ha),aa=(R*ea-Y*V)*(ga-ia)-(Y-ea)*(fa*ia-ga*ha),ja=(R-V)*(ga-ia)-(Y-ea)*(fa-ha);if(ja){var $=$/ja,aa=aa/ja,ja=+$.toFixed(2),ba=+aa.toFixed(2);R=ja<+X(R,V).toFixed(2)||ja>+W(R,V).toFixed(2)||ja<+X(fa,ha).toFixed(2)||
+ja>+W(fa,ha).toFixed(2)||ba<+X(Y,ea).toFixed(2)||ba>+W(Y,ea).toFixed(2)||ba<+X(ga,ia).toFixed(2)||ba>+W(ga,ia).toFixed(2)?void 0:{x:$,y:aa}}else R=void 0}R&&F[R.x.toFixed(4)]!=R.y.toFixed(4)&&(F[R.x.toFixed(4)]=R.y.toFixed(4),Q=Q.t+Z((R[N]-Q[N])/(L[N]-Q[N]))*(L.t-Q.t),B=B.t+Z((R[S]-B[S])/(C[S]-B[S]))*(C.t-B.t),0<=Q&&1>=Q&&0<=B&&1>=B&&(z?M++:M.push({x:R.x,y:R.y,t1:Q,t2:B})))}z=M}else z=z?0:[];if(d)t+=z;else{H=0;for(J=z.length;H<J;H++)z[H].segment1=w,z[H].segment2=G,z[H].bez1=x,z[H].bez2=c;t=t.concat(z)}}}return t}
+function r(a){var b=A(a);if(b.bbox)return C(b.bbox);if(!a)return w();a=I(a);for(var d=0,e=0,h=[],f=[],l,n=0,k=a.length;n<k;n++)l=a[n],"M"==l[0]?(d=l[1],e=l[2],h.push(d),f.push(e)):(d=U(d,e,l[1],l[2],l[3],l[4],l[5],l[6]),h=h.concat(d.min.x,d.max.x),f=f.concat(d.min.y,d.max.y),d=l[5],e=l[6]);a=X.apply(0,h);l=X.apply(0,f);h=W.apply(0,h);f=W.apply(0,f);f=w(a,l,h-a,f-l);b.bbox=C(f);return f}function s(a,b,d,e,h){if(h)return[["M",+a+ +h,b],["l",d-2*h,0],["a",h,h,0,0,1,h,h],["l",0,e-2*h],["a",h,h,0,0,1,
+-h,h],["l",2*h-d,0],["a",h,h,0,0,1,-h,-h],["l",0,2*h-e],["a",h,h,0,0,1,h,-h],["z"] ];a=[["M",a,b],["l",d,0],["l",0,e],["l",-d,0],["z"] ];a.toString=z;return a}function x(a,b,d,e,h){null==h&&null==e&&(e=d);a=+a;b=+b;d=+d;e=+e;if(null!=h){var f=Math.PI/180,l=a+d*Math.cos(-e*f);a+=d*Math.cos(-h*f);var n=b+d*Math.sin(-e*f);b+=d*Math.sin(-h*f);d=[["M",l,n],["A",d,d,0,+(180<h-e),0,a,b] ]}else d=[["M",a,b],["m",0,-e],["a",d,e,0,1,1,0,2*e],["a",d,e,0,1,1,0,-2*e],["z"] ];d.toString=z;return d}function G(b){var e=
+A(b);if(e.abs)return d(e.abs);Q(b,"array")&&Q(b&&b[0],"array")||(b=a.parsePathString(b));if(!b||!b.length)return[["M",0,0] ];var h=[],f=0,l=0,n=0,k=0,p=0;"M"==b[0][0]&&(f=+b[0][1],l=+b[0][2],n=f,k=l,p++,h[0]=["M",f,l]);for(var q=3==b.length&&"M"==b[0][0]&&"R"==b[1][0].toUpperCase()&&"Z"==b[2][0].toUpperCase(),s,r,w=p,c=b.length;w<c;w++){h.push(s=[]);r=b[w];p=r[0];if(p!=p.toUpperCase())switch(s[0]=p.toUpperCase(),s[0]){case "A":s[1]=r[1];s[2]=r[2];s[3]=r[3];s[4]=r[4];s[5]=r[5];s[6]=+r[6]+f;s[7]=+r[7]+
+l;break;case "V":s[1]=+r[1]+l;break;case "H":s[1]=+r[1]+f;break;case "R":for(var t=[f,l].concat(r.slice(1)),u=2,v=t.length;u<v;u++)t[u]=+t[u]+f,t[++u]=+t[u]+l;h.pop();h=h.concat(P(t,q));break;case "O":h.pop();t=x(f,l,r[1],r[2]);t.push(t[0]);h=h.concat(t);break;case "U":h.pop();h=h.concat(x(f,l,r[1],r[2],r[3]));s=["U"].concat(h[h.length-1].slice(-2));break;case "M":n=+r[1]+f,k=+r[2]+l;default:for(u=1,v=r.length;u<v;u++)s[u]=+r[u]+(u%2?f:l)}else if("R"==p)t=[f,l].concat(r.slice(1)),h.pop(),h=h.concat(P(t,
+q)),s=["R"].concat(r.slice(-2));else if("O"==p)h.pop(),t=x(f,l,r[1],r[2]),t.push(t[0]),h=h.concat(t);else if("U"==p)h.pop(),h=h.concat(x(f,l,r[1],r[2],r[3])),s=["U"].concat(h[h.length-1].slice(-2));else for(t=0,u=r.length;t<u;t++)s[t]=r[t];p=p.toUpperCase();if("O"!=p)switch(s[0]){case "Z":f=+n;l=+k;break;case "H":f=s[1];break;case "V":l=s[1];break;case "M":n=s[s.length-2],k=s[s.length-1];default:f=s[s.length-2],l=s[s.length-1]}}h.toString=z;e.abs=d(h);return h}function h(a,b,d,e){return[a,b,d,e,d,
+e]}function J(a,b,d,e,h,f){var l=1/3,n=2/3;return[l*a+n*d,l*b+n*e,l*h+n*d,l*f+n*e,h,f]}function K(b,d,e,h,f,l,n,k,p,s){var r=120*S/180,q=S/180*(+f||0),c=[],t,x=a._.cacher(function(a,b,c){var d=a*F.cos(c)-b*F.sin(c);a=a*F.sin(c)+b*F.cos(c);return{x:d,y:a}});if(s)v=s[0],t=s[1],l=s[2],u=s[3];else{t=x(b,d,-q);b=t.x;d=t.y;t=x(k,p,-q);k=t.x;p=t.y;F.cos(S/180*f);F.sin(S/180*f);t=(b-k)/2;v=(d-p)/2;u=t*t/(e*e)+v*v/(h*h);1<u&&(u=F.sqrt(u),e*=u,h*=u);var u=e*e,w=h*h,u=(l==n?-1:1)*F.sqrt(Z((u*w-u*v*v-w*t*t)/
+(u*v*v+w*t*t)));l=u*e*v/h+(b+k)/2;var u=u*-h*t/e+(d+p)/2,v=F.asin(((d-u)/h).toFixed(9));t=F.asin(((p-u)/h).toFixed(9));v=b<l?S-v:v;t=k<l?S-t:t;0>v&&(v=2*S+v);0>t&&(t=2*S+t);n&&v>t&&(v-=2*S);!n&&t>v&&(t-=2*S)}if(Z(t-v)>r){var c=t,w=k,G=p;t=v+r*(n&&t>v?1:-1);k=l+e*F.cos(t);p=u+h*F.sin(t);c=K(k,p,e,h,f,0,n,w,G,[t,c,l,u])}l=t-v;f=F.cos(v);r=F.sin(v);n=F.cos(t);t=F.sin(t);l=F.tan(l/4);e=4/3*e*l;l*=4/3*h;h=[b,d];b=[b+e*r,d-l*f];d=[k+e*t,p-l*n];k=[k,p];b[0]=2*h[0]-b[0];b[1]=2*h[1]-b[1];if(s)return[b,d,k].concat(c);
+c=[b,d,k].concat(c).join().split(",");s=[];k=0;for(p=c.length;k<p;k++)s[k]=k%2?x(c[k-1],c[k],q).y:x(c[k],c[k+1],q).x;return s}function U(a,b,d,e,h,f,l,k){for(var n=[],p=[[],[] ],s,r,c,t,q=0;2>q;++q)0==q?(r=6*a-12*d+6*h,s=-3*a+9*d-9*h+3*l,c=3*d-3*a):(r=6*b-12*e+6*f,s=-3*b+9*e-9*f+3*k,c=3*e-3*b),1E-12>Z(s)?1E-12>Z(r)||(s=-c/r,0<s&&1>s&&n.push(s)):(t=r*r-4*c*s,c=F.sqrt(t),0>t||(t=(-r+c)/(2*s),0<t&&1>t&&n.push(t),s=(-r-c)/(2*s),0<s&&1>s&&n.push(s)));for(r=q=n.length;q--;)s=n[q],c=1-s,p[0][q]=c*c*c*a+3*
+c*c*s*d+3*c*s*s*h+s*s*s*l,p[1][q]=c*c*c*b+3*c*c*s*e+3*c*s*s*f+s*s*s*k;p[0][r]=a;p[1][r]=b;p[0][r+1]=l;p[1][r+1]=k;p[0].length=p[1].length=r+2;return{min:{x:X.apply(0,p[0]),y:X.apply(0,p[1])},max:{x:W.apply(0,p[0]),y:W.apply(0,p[1])}}}function I(a,b){var e=!b&&A(a);if(!b&&e.curve)return d(e.curve);var f=G(a),l=b&&G(b),n={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},k={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},p=function(a,b,c){if(!a)return["C",b.x,b.y,b.x,b.y,b.x,b.y];a[0]in{T:1,Q:1}||(b.qx=b.qy=null);
+switch(a[0]){case "M":b.X=a[1];b.Y=a[2];break;case "A":a=["C"].concat(K.apply(0,[b.x,b.y].concat(a.slice(1))));break;case "S":"C"==c||"S"==c?(c=2*b.x-b.bx,b=2*b.y-b.by):(c=b.x,b=b.y);a=["C",c,b].concat(a.slice(1));break;case "T":"Q"==c||"T"==c?(b.qx=2*b.x-b.qx,b.qy=2*b.y-b.qy):(b.qx=b.x,b.qy=b.y);a=["C"].concat(J(b.x,b.y,b.qx,b.qy,a[1],a[2]));break;case "Q":b.qx=a[1];b.qy=a[2];a=["C"].concat(J(b.x,b.y,a[1],a[2],a[3],a[4]));break;case "L":a=["C"].concat(h(b.x,b.y,a[1],a[2]));break;case "H":a=["C"].concat(h(b.x,
+b.y,a[1],b.y));break;case "V":a=["C"].concat(h(b.x,b.y,b.x,a[1]));break;case "Z":a=["C"].concat(h(b.x,b.y,b.X,b.Y))}return a},s=function(a,b){if(7<a[b].length){a[b].shift();for(var c=a[b];c.length;)q[b]="A",l&&(u[b]="A"),a.splice(b++,0,["C"].concat(c.splice(0,6)));a.splice(b,1);v=W(f.length,l&&l.length||0)}},r=function(a,b,c,d,e){a&&b&&"M"==a[e][0]&&"M"!=b[e][0]&&(b.splice(e,0,["M",d.x,d.y]),c.bx=0,c.by=0,c.x=a[e][1],c.y=a[e][2],v=W(f.length,l&&l.length||0))},q=[],u=[],c="",t="",x=0,v=W(f.length,
+l&&l.length||0);for(;x<v;x++){f[x]&&(c=f[x][0]);"C"!=c&&(q[x]=c,x&&(t=q[x-1]));f[x]=p(f[x],n,t);"A"!=q[x]&&"C"==c&&(q[x]="C");s(f,x);l&&(l[x]&&(c=l[x][0]),"C"!=c&&(u[x]=c,x&&(t=u[x-1])),l[x]=p(l[x],k,t),"A"!=u[x]&&"C"==c&&(u[x]="C"),s(l,x));r(f,l,n,k,x);r(l,f,k,n,x);var w=f[x],z=l&&l[x],y=w.length,U=l&&z.length;n.x=w[y-2];n.y=w[y-1];n.bx=$(w[y-4])||n.x;n.by=$(w[y-3])||n.y;k.bx=l&&($(z[U-4])||k.x);k.by=l&&($(z[U-3])||k.y);k.x=l&&z[U-2];k.y=l&&z[U-1]}l||(e.curve=d(f));return l?[f,l]:f}function P(a,
+b){for(var d=[],e=0,h=a.length;h-2*!b>e;e+=2){var f=[{x:+a[e-2],y:+a[e-1]},{x:+a[e],y:+a[e+1]},{x:+a[e+2],y:+a[e+3]},{x:+a[e+4],y:+a[e+5]}];b?e?h-4==e?f[3]={x:+a[0],y:+a[1]}:h-2==e&&(f[2]={x:+a[0],y:+a[1]},f[3]={x:+a[2],y:+a[3]}):f[0]={x:+a[h-2],y:+a[h-1]}:h-4==e?f[3]=f[2]:e||(f[0]={x:+a[e],y:+a[e+1]});d.push(["C",(-f[0].x+6*f[1].x+f[2].x)/6,(-f[0].y+6*f[1].y+f[2].y)/6,(f[1].x+6*f[2].x-f[3].x)/6,(f[1].y+6*f[2].y-f[3].y)/6,f[2].x,f[2].y])}return d}y=k.prototype;var Q=a.is,C=a._.clone,L="hasOwnProperty",
+N=/,?([a-z]),?/gi,$=parseFloat,F=Math,S=F.PI,X=F.min,W=F.max,ma=F.pow,Z=F.abs;M=n(1);var na=n(),ba=n(0,1),V=a._unit2px;a.path=A;a.path.getTotalLength=M;a.path.getPointAtLength=na;a.path.getSubpath=function(a,b,d){if(1E-6>this.getTotalLength(a)-d)return ba(a,b).end;a=ba(a,d,1);return b?ba(a,b).end:a};y.getTotalLength=function(){if(this.node.getTotalLength)return this.node.getTotalLength()};y.getPointAtLength=function(a){return na(this.attr("d"),a)};y.getSubpath=function(b,d){return a.path.getSubpath(this.attr("d"),
+b,d)};a._.box=w;a.path.findDotsAtSegment=u;a.path.bezierBBox=p;a.path.isPointInsideBBox=b;a.path.isBBoxIntersect=q;a.path.intersection=function(a,b){return l(a,b)};a.path.intersectionNumber=function(a,b){return l(a,b,1)};a.path.isPointInside=function(a,d,e){var h=r(a);return b(h,d,e)&&1==l(a,[["M",d,e],["H",h.x2+10] ],1)%2};a.path.getBBox=r;a.path.get={path:function(a){return a.attr("path")},circle:function(a){a=V(a);return x(a.cx,a.cy,a.r)},ellipse:function(a){a=V(a);return x(a.cx||0,a.cy||0,a.rx,
+a.ry)},rect:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height,a.rx,a.ry)},image:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height)},line:function(a){return"M"+[a.attr("x1")||0,a.attr("y1")||0,a.attr("x2"),a.attr("y2")]},polyline:function(a){return"M"+a.attr("points")},polygon:function(a){return"M"+a.attr("points")+"z"},deflt:function(a){a=a.node.getBBox();return s(a.x,a.y,a.width,a.height)}};a.path.toRelative=function(b){var e=A(b),h=String.prototype.toLowerCase;if(e.rel)return d(e.rel);
+a.is(b,"array")&&a.is(b&&b[0],"array")||(b=a.parsePathString(b));var f=[],l=0,n=0,k=0,p=0,s=0;"M"==b[0][0]&&(l=b[0][1],n=b[0][2],k=l,p=n,s++,f.push(["M",l,n]));for(var r=b.length;s<r;s++){var q=f[s]=[],x=b[s];if(x[0]!=h.call(x[0]))switch(q[0]=h.call(x[0]),q[0]){case "a":q[1]=x[1];q[2]=x[2];q[3]=x[3];q[4]=x[4];q[5]=x[5];q[6]=+(x[6]-l).toFixed(3);q[7]=+(x[7]-n).toFixed(3);break;case "v":q[1]=+(x[1]-n).toFixed(3);break;case "m":k=x[1],p=x[2];default:for(var c=1,t=x.length;c<t;c++)q[c]=+(x[c]-(c%2?l:
+n)).toFixed(3)}else for(f[s]=[],"m"==x[0]&&(k=x[1]+l,p=x[2]+n),q=0,c=x.length;q<c;q++)f[s][q]=x[q];x=f[s].length;switch(f[s][0]){case "z":l=k;n=p;break;case "h":l+=+f[s][x-1];break;case "v":n+=+f[s][x-1];break;default:l+=+f[s][x-2],n+=+f[s][x-1]}}f.toString=z;e.rel=d(f);return f};a.path.toAbsolute=G;a.path.toCubic=I;a.path.map=function(a,b){if(!b)return a;var d,e,h,f,l,n,k;a=I(a);h=0;for(l=a.length;h<l;h++)for(k=a[h],f=1,n=k.length;f<n;f+=2)d=b.x(k[f],k[f+1]),e=b.y(k[f],k[f+1]),k[f]=d,k[f+1]=e;return a};
+a.path.toString=z;a.path.clone=d});C.plugin(function(a,v,y,C){var A=Math.max,w=Math.min,z=function(a){this.items=[];this.bindings={};this.length=0;this.type="set";if(a)for(var f=0,n=a.length;f<n;f++)a[f]&&(this[this.items.length]=this.items[this.items.length]=a[f],this.length++)};v=z.prototype;v.push=function(){for(var a,f,n=0,k=arguments.length;n<k;n++)if(a=arguments[n])f=this.items.length,this[f]=this.items[f]=a,this.length++;return this};v.pop=function(){this.length&&delete this[this.length--];
+return this.items.pop()};v.forEach=function(a,f){for(var n=0,k=this.items.length;n<k&&!1!==a.call(f,this.items[n],n);n++);return this};v.animate=function(d,f,n,u){"function"!=typeof n||n.length||(u=n,n=L.linear);d instanceof a._.Animation&&(u=d.callback,n=d.easing,f=n.dur,d=d.attr);var p=arguments;if(a.is(d,"array")&&a.is(p[p.length-1],"array"))var b=!0;var q,e=function(){q?this.b=q:q=this.b},l=0,r=u&&function(){l++==this.length&&u.call(this)};return this.forEach(function(a,l){k.once("snap.animcreated."+
+a.id,e);b?p[l]&&a.animate.apply(a,p[l]):a.animate(d,f,n,r)})};v.remove=function(){for(;this.length;)this.pop().remove();return this};v.bind=function(a,f,k){var u={};if("function"==typeof f)this.bindings[a]=f;else{var p=k||a;this.bindings[a]=function(a){u[p]=a;f.attr(u)}}return this};v.attr=function(a){var f={},k;for(k in a)if(this.bindings[k])this.bindings[k](a[k]);else f[k]=a[k];a=0;for(k=this.items.length;a<k;a++)this.items[a].attr(f);return this};v.clear=function(){for(;this.length;)this.pop()};
+v.splice=function(a,f,k){a=0>a?A(this.length+a,0):a;f=A(0,w(this.length-a,f));var u=[],p=[],b=[],q;for(q=2;q<arguments.length;q++)b.push(arguments[q]);for(q=0;q<f;q++)p.push(this[a+q]);for(;q<this.length-a;q++)u.push(this[a+q]);var e=b.length;for(q=0;q<e+u.length;q++)this.items[a+q]=this[a+q]=q<e?b[q]:u[q-e];for(q=this.items.length=this.length-=f-e;this[q];)delete this[q++];return new z(p)};v.exclude=function(a){for(var f=0,k=this.length;f<k;f++)if(this[f]==a)return this.splice(f,1),!0;return!1};
+v.insertAfter=function(a){for(var f=this.items.length;f--;)this.items[f].insertAfter(a);return this};v.getBBox=function(){for(var a=[],f=[],k=[],u=[],p=this.items.length;p--;)if(!this.items[p].removed){var b=this.items[p].getBBox();a.push(b.x);f.push(b.y);k.push(b.x+b.width);u.push(b.y+b.height)}a=w.apply(0,a);f=w.apply(0,f);k=A.apply(0,k);u=A.apply(0,u);return{x:a,y:f,x2:k,y2:u,width:k-a,height:u-f,cx:a+(k-a)/2,cy:f+(u-f)/2}};v.clone=function(a){a=new z;for(var f=0,k=this.items.length;f<k;f++)a.push(this.items[f].clone());
+return a};v.toString=function(){return"Snap\u2018s set"};v.type="set";a.set=function(){var a=new z;arguments.length&&a.push.apply(a,Array.prototype.slice.call(arguments,0));return a}});C.plugin(function(a,v,y,C){function A(a){var b=a[0];switch(b.toLowerCase()){case "t":return[b,0,0];case "m":return[b,1,0,0,1,0,0];case "r":return 4==a.length?[b,0,a[2],a[3] ]:[b,0];case "s":return 5==a.length?[b,1,1,a[3],a[4] ]:3==a.length?[b,1,1]:[b,1]}}function w(b,d,f){d=q(d).replace(/\.{3}|\u2026/g,b);b=a.parseTransformString(b)||
+[];d=a.parseTransformString(d)||[];for(var k=Math.max(b.length,d.length),p=[],v=[],h=0,w,z,y,I;h<k;h++){y=b[h]||A(d[h]);I=d[h]||A(y);if(y[0]!=I[0]||"r"==y[0].toLowerCase()&&(y[2]!=I[2]||y[3]!=I[3])||"s"==y[0].toLowerCase()&&(y[3]!=I[3]||y[4]!=I[4])){b=a._.transform2matrix(b,f());d=a._.transform2matrix(d,f());p=[["m",b.a,b.b,b.c,b.d,b.e,b.f] ];v=[["m",d.a,d.b,d.c,d.d,d.e,d.f] ];break}p[h]=[];v[h]=[];w=0;for(z=Math.max(y.length,I.length);w<z;w++)w in y&&(p[h][w]=y[w]),w in I&&(v[h][w]=I[w])}return{from:u(p),
+to:u(v),f:n(p)}}function z(a){return a}function d(a){return function(b){return+b.toFixed(3)+a}}function f(b){return a.rgb(b[0],b[1],b[2])}function n(a){var b=0,d,f,k,n,h,p,q=[];d=0;for(f=a.length;d<f;d++){h="[";p=['"'+a[d][0]+'"'];k=1;for(n=a[d].length;k<n;k++)p[k]="val["+b++ +"]";h+=p+"]";q[d]=h}return Function("val","return Snap.path.toString.call(["+q+"])")}function u(a){for(var b=[],d=0,f=a.length;d<f;d++)for(var k=1,n=a[d].length;k<n;k++)b.push(a[d][k]);return b}var p={},b=/[a-z]+$/i,q=String;
+p.stroke=p.fill="colour";v.prototype.equal=function(a,b){return k("snap.util.equal",this,a,b).firstDefined()};k.on("snap.util.equal",function(e,k){var r,s;r=q(this.attr(e)||"");var x=this;if(r==+r&&k==+k)return{from:+r,to:+k,f:z};if("colour"==p[e])return r=a.color(r),s=a.color(k),{from:[r.r,r.g,r.b,r.opacity],to:[s.r,s.g,s.b,s.opacity],f:f};if("transform"==e||"gradientTransform"==e||"patternTransform"==e)return k instanceof a.Matrix&&(k=k.toTransformString()),a._.rgTransform.test(k)||(k=a._.svgTransform2string(k)),
+w(r,k,function(){return x.getBBox(1)});if("d"==e||"path"==e)return r=a.path.toCubic(r,k),{from:u(r[0]),to:u(r[1]),f:n(r[0])};if("points"==e)return r=q(r).split(a._.separator),s=q(k).split(a._.separator),{from:r,to:s,f:function(a){return a}};aUnit=r.match(b);s=q(k).match(b);return aUnit&&aUnit==s?{from:parseFloat(r),to:parseFloat(k),f:d(aUnit)}:{from:this.asPX(e),to:this.asPX(e,k),f:z}})});C.plugin(function(a,v,y,C){var A=v.prototype,w="createTouch"in C.doc;v="click dblclick mousedown mousemove mouseout mouseover mouseup touchstart touchmove touchend touchcancel".split(" ");
+var z={mousedown:"touchstart",mousemove:"touchmove",mouseup:"touchend"},d=function(a,b){var d="y"==a?"scrollTop":"scrollLeft",e=b&&b.node?b.node.ownerDocument:C.doc;return e[d in e.documentElement?"documentElement":"body"][d]},f=function(){this.returnValue=!1},n=function(){return this.originalEvent.preventDefault()},u=function(){this.cancelBubble=!0},p=function(){return this.originalEvent.stopPropagation()},b=function(){if(C.doc.addEventListener)return function(a,b,e,f){var k=w&&z[b]?z[b]:b,l=function(k){var l=
+d("y",f),q=d("x",f);if(w&&z.hasOwnProperty(b))for(var r=0,u=k.targetTouches&&k.targetTouches.length;r<u;r++)if(k.targetTouches[r].target==a||a.contains(k.targetTouches[r].target)){u=k;k=k.targetTouches[r];k.originalEvent=u;k.preventDefault=n;k.stopPropagation=p;break}return e.call(f,k,k.clientX+q,k.clientY+l)};b!==k&&a.addEventListener(b,l,!1);a.addEventListener(k,l,!1);return function(){b!==k&&a.removeEventListener(b,l,!1);a.removeEventListener(k,l,!1);return!0}};if(C.doc.attachEvent)return function(a,
+b,e,h){var k=function(a){a=a||h.node.ownerDocument.window.event;var b=d("y",h),k=d("x",h),k=a.clientX+k,b=a.clientY+b;a.preventDefault=a.preventDefault||f;a.stopPropagation=a.stopPropagation||u;return e.call(h,a,k,b)};a.attachEvent("on"+b,k);return function(){a.detachEvent("on"+b,k);return!0}}}(),q=[],e=function(a){for(var b=a.clientX,e=a.clientY,f=d("y"),l=d("x"),n,p=q.length;p--;){n=q[p];if(w)for(var r=a.touches&&a.touches.length,u;r--;){if(u=a.touches[r],u.identifier==n.el._drag.id||n.el.node.contains(u.target)){b=
+u.clientX;e=u.clientY;(a.originalEvent?a.originalEvent:a).preventDefault();break}}else a.preventDefault();b+=l;e+=f;k("snap.drag.move."+n.el.id,n.move_scope||n.el,b-n.el._drag.x,e-n.el._drag.y,b,e,a)}},l=function(b){a.unmousemove(e).unmouseup(l);for(var d=q.length,f;d--;)f=q[d],f.el._drag={},k("snap.drag.end."+f.el.id,f.end_scope||f.start_scope||f.move_scope||f.el,b);q=[]};for(y=v.length;y--;)(function(d){a[d]=A[d]=function(e,f){a.is(e,"function")&&(this.events=this.events||[],this.events.push({name:d,
+f:e,unbind:b(this.node||document,d,e,f||this)}));return this};a["un"+d]=A["un"+d]=function(a){for(var b=this.events||[],e=b.length;e--;)if(b[e].name==d&&(b[e].f==a||!a)){b[e].unbind();b.splice(e,1);!b.length&&delete this.events;break}return this}})(v[y]);A.hover=function(a,b,d,e){return this.mouseover(a,d).mouseout(b,e||d)};A.unhover=function(a,b){return this.unmouseover(a).unmouseout(b)};var r=[];A.drag=function(b,d,f,h,n,p){function u(r,v,w){(r.originalEvent||r).preventDefault();this._drag.x=v;
+this._drag.y=w;this._drag.id=r.identifier;!q.length&&a.mousemove(e).mouseup(l);q.push({el:this,move_scope:h,start_scope:n,end_scope:p});d&&k.on("snap.drag.start."+this.id,d);b&&k.on("snap.drag.move."+this.id,b);f&&k.on("snap.drag.end."+this.id,f);k("snap.drag.start."+this.id,n||h||this,v,w,r)}if(!arguments.length){var v;return this.drag(function(a,b){this.attr({transform:v+(v?"T":"t")+[a,b]})},function(){v=this.transform().local})}this._drag={};r.push({el:this,start:u});this.mousedown(u);return this};
+A.undrag=function(){for(var b=r.length;b--;)r[b].el==this&&(this.unmousedown(r[b].start),r.splice(b,1),k.unbind("snap.drag.*."+this.id));!r.length&&a.unmousemove(e).unmouseup(l);return this}});C.plugin(function(a,v,y,C){y=y.prototype;var A=/^\s*url\((.+)\)/,w=String,z=a._.$;a.filter={};y.filter=function(d){var f=this;"svg"!=f.type&&(f=f.paper);d=a.parse(w(d));var k=a._.id(),u=z("filter");z(u,{id:k,filterUnits:"userSpaceOnUse"});u.appendChild(d.node);f.defs.appendChild(u);return new v(u)};k.on("snap.util.getattr.filter",
+function(){k.stop();var d=z(this.node,"filter");if(d)return(d=w(d).match(A))&&a.select(d[1])});k.on("snap.util.attr.filter",function(d){if(d instanceof v&&"filter"==d.type){k.stop();var f=d.node.id;f||(z(d.node,{id:d.id}),f=d.id);z(this.node,{filter:a.url(f)})}d&&"none"!=d||(k.stop(),this.node.removeAttribute("filter"))});a.filter.blur=function(d,f){null==d&&(d=2);return a.format('<feGaussianBlur stdDeviation="{def}"/>',{def:null==f?d:[d,f]})};a.filter.blur.toString=function(){return this()};a.filter.shadow=
+function(d,f,k,u,p){"string"==typeof k&&(p=u=k,k=4);"string"!=typeof u&&(p=u,u="#000");null==k&&(k=4);null==p&&(p=1);null==d&&(d=0,f=2);null==f&&(f=d);u=a.color(u||"#000");return a.format('<feGaussianBlur in="SourceAlpha" stdDeviation="{blur}"/><feOffset dx="{dx}" dy="{dy}" result="offsetblur"/><feFlood flood-color="{color}"/><feComposite in2="offsetblur" operator="in"/><feComponentTransfer><feFuncA type="linear" slope="{opacity}"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>',
+{color:u,dx:d,dy:f,blur:k,opacity:p})};a.filter.shadow.toString=function(){return this()};a.filter.grayscale=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {b} {h} 0 0 0 0 0 1 0"/>',{a:0.2126+0.7874*(1-d),b:0.7152-0.7152*(1-d),c:0.0722-0.0722*(1-d),d:0.2126-0.2126*(1-d),e:0.7152+0.2848*(1-d),f:0.0722-0.0722*(1-d),g:0.2126-0.2126*(1-d),h:0.0722+0.9278*(1-d)})};a.filter.grayscale.toString=function(){return this()};a.filter.sepia=
+function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {h} {i} 0 0 0 0 0 1 0"/>',{a:0.393+0.607*(1-d),b:0.769-0.769*(1-d),c:0.189-0.189*(1-d),d:0.349-0.349*(1-d),e:0.686+0.314*(1-d),f:0.168-0.168*(1-d),g:0.272-0.272*(1-d),h:0.534-0.534*(1-d),i:0.131+0.869*(1-d)})};a.filter.sepia.toString=function(){return this()};a.filter.saturate=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="saturate" values="{amount}"/>',{amount:1-
+d})};a.filter.saturate.toString=function(){return this()};a.filter.hueRotate=function(d){return a.format('<feColorMatrix type="hueRotate" values="{angle}"/>',{angle:d||0})};a.filter.hueRotate.toString=function(){return this()};a.filter.invert=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="table" tableValues="{amount} {amount2}"/><feFuncG type="table" tableValues="{amount} {amount2}"/><feFuncB type="table" tableValues="{amount} {amount2}"/></feComponentTransfer>',{amount:d,
+amount2:1-d})};a.filter.invert.toString=function(){return this()};a.filter.brightness=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}"/><feFuncG type="linear" slope="{amount}"/><feFuncB type="linear" slope="{amount}"/></feComponentTransfer>',{amount:d})};a.filter.brightness.toString=function(){return this()};a.filter.contrast=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}" intercept="{amount2}"/><feFuncG type="linear" slope="{amount}" intercept="{amount2}"/><feFuncB type="linear" slope="{amount}" intercept="{amount2}"/></feComponentTransfer>',
+{amount:d,amount2:0.5-d/2})};a.filter.contrast.toString=function(){return this()}});return C});
+
+]]> </script>
+<script> <![CDATA[
+
+(function (glob, factory) {
+    // AMD support
+    if (typeof define === "function" && define.amd) {
+        // Define as an anonymous module
+        define("Gadfly", ["Snap.svg"], function (Snap) {
+            return factory(Snap);
+        });
+    } else {
+        // Browser globals (glob is window)
+        // Snap adds itself to window
+        glob.Gadfly = factory(glob.Snap);
+    }
+}(this, function (Snap) {
+
+var Gadfly = {};
+
+// Get an x/y coordinate value in pixels
+var xPX = function(fig, x) {
+    var client_box = fig.node.getBoundingClientRect();
+    return x * fig.node.viewBox.baseVal.width / client_box.width;
+};
+
+var yPX = function(fig, y) {
+    var client_box = fig.node.getBoundingClientRect();
+    return y * fig.node.viewBox.baseVal.height / client_box.height;
+};
+
+
+Snap.plugin(function (Snap, Element, Paper, global) {
+    // Traverse upwards from a snap element to find and return the first
+    // note with the "plotroot" class.
+    Element.prototype.plotroot = function () {
+        var element = this;
+        while (!element.hasClass("plotroot") && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.svgroot = function () {
+        var element = this;
+        while (element.node.nodeName != "svg" && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.plotbounds = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x0: bbox.x,
+            x1: bbox.x + bbox.width,
+            y0: bbox.y,
+            y1: bbox.y + bbox.height
+        };
+    };
+
+    Element.prototype.plotcenter = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x: bbox.x + bbox.width / 2,
+            y: bbox.y + bbox.height / 2
+        };
+    };
+
+    // Emulate IE style mouseenter/mouseleave events, since Microsoft always
+    // does everything right.
+    // See: http://www.dynamic-tools.net/toolbox/isMouseLeaveOrEnter/
+    var events = ["mouseenter", "mouseleave"];
+
+    for (i in events) {
+        (function (event_name) {
+            var event_name = events[i];
+            Element.prototype[event_name] = function (fn, scope) {
+                if (Snap.is(fn, "function")) {
+                    var fn2 = function (event) {
+                        if (event.type != "mouseover" && event.type != "mouseout") {
+                            return;
+                        }
+
+                        var reltg = event.relatedTarget ? event.relatedTarget :
+                            event.type == "mouseout" ? event.toElement : event.fromElement;
+                        while (reltg && reltg != this.node) reltg = reltg.parentNode;
+
+                        if (reltg != this.node) {
+                            return fn.apply(this, event);
+                        }
+                    };
+
+                    if (event_name == "mouseenter") {
+                        this.mouseover(fn2, scope);
+                    } else {
+                        this.mouseout(fn2, scope);
+                    }
+                }
+                return this;
+            };
+        })(events[i]);
+    }
+
+
+    Element.prototype.mousewheel = function (fn, scope) {
+        if (Snap.is(fn, "function")) {
+            var el = this;
+            var fn2 = function (event) {
+                fn.apply(el, [event]);
+            };
+        }
+
+        this.node.addEventListener(
+            /Firefox/i.test(navigator.userAgent) ? "DOMMouseScroll" : "mousewheel",
+            fn2);
+
+        return this;
+    };
+
+
+    // Snap's attr function can be too slow for things like panning/zooming.
+    // This is a function to directly update element attributes without going
+    // through eve.
+    Element.prototype.attribute = function(key, val) {
+        if (val === undefined) {
+            return this.node.getAttribute(key);
+        } else {
+            this.node.setAttribute(key, val);
+            return this;
+        }
+    };
+
+    Element.prototype.init_gadfly = function() {
+        this.mouseenter(Gadfly.plot_mouseover)
+            .mouseleave(Gadfly.plot_mouseout)
+            .dblclick(Gadfly.plot_dblclick)
+            .mousewheel(Gadfly.guide_background_scroll)
+            .drag(Gadfly.guide_background_drag_onmove,
+                  Gadfly.guide_background_drag_onstart,
+                  Gadfly.guide_background_drag_onend);
+        this.mouseenter(function (event) {
+            init_pan_zoom(this.plotroot());
+        });
+        return this;
+    };
+});
+
+
+// When the plot is moused over, emphasize the grid lines.
+Gadfly.plot_mouseover = function(event) {
+    var root = this.plotroot();
+
+    var keyboard_zoom = function(event) {
+        if (event.which == 187) { // plus
+            increase_zoom_by_position(root, 0.1, true);
+        } else if (event.which == 189) { // minus
+            increase_zoom_by_position(root, -0.1, true);
+        }
+    };
+    root.data("keyboard_zoom", keyboard_zoom);
+    window.addEventListener("keyup", keyboard_zoom);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    xgridlines.data("unfocused_strokedash",
+                    xgridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+    ygridlines.data("unfocused_strokedash",
+                    ygridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+
+    // emphasize grid lines
+    var destcolor = root.data("focused_xgrid_color");
+    xgridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("focused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // reveal zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 1.0}, 250);
+};
+
+// Reset pan and zoom on double click
+Gadfly.plot_dblclick = function(event) {
+  set_plot_pan_zoom(this.plotroot(), 0.0, 0.0, 1.0);
+};
+
+// Unemphasize grid lines on mouse out.
+Gadfly.plot_mouseout = function(event) {
+    var root = this.plotroot();
+
+    window.removeEventListener("keyup", root.data("keyboard_zoom"));
+    root.data("keyboard_zoom", undefined);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    var destcolor = root.data("unfocused_xgrid_color");
+
+    xgridlines.attribute("stroke-dasharray", xgridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("unfocused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", ygridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // hide zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 0.0}, 250);
+};
+
+
+var set_geometry_transform = function(root, tx, ty, scale) {
+    var xscalable = root.hasClass("xscalable"),
+        yscalable = root.hasClass("yscalable");
+
+    var old_scale = root.data("scale");
+
+    var xscale = xscalable ? scale : 1.0,
+        yscale = yscalable ? scale : 1.0;
+
+    tx = xscalable ? tx : 0.0;
+    ty = yscalable ? ty : 0.0;
+
+    var t = new Snap.Matrix().translate(tx, ty).scale(xscale, yscale);
+
+    root.selectAll(".geometry, image")
+        .forEach(function (element, i) {
+            element.transform(t);
+        });
+
+    bounds = root.plotbounds();
+
+    if (yscalable) {
+        var xfixed_t = new Snap.Matrix().translate(0, ty).scale(1.0, yscale);
+        root.selectAll(".xfixed")
+            .forEach(function (element, i) {
+                element.transform(xfixed_t);
+            });
+
+        root.select(".ylabels")
+            .transform(xfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1, 1/scale, cx, cy).add(st);
+                    element.transform(unscale_t);
+
+                    var y = cy * scale + ty;
+                    element.attr("visibility",
+                        bounds.y0 <= y && y <= bounds.y1 ? "visible" : "hidden");
+                }
+            });
+    }
+
+    if (xscalable) {
+        var yfixed_t = new Snap.Matrix().translate(tx, 0).scale(xscale, 1.0);
+        var xtrans = new Snap.Matrix().translate(tx, 0);
+        root.selectAll(".yfixed")
+            .forEach(function (element, i) {
+                element.transform(yfixed_t);
+            });
+
+        root.select(".xlabels")
+            .transform(yfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1/scale, 1, cx, cy).add(st);
+
+                    element.transform(unscale_t);
+
+                    var x = cx * scale + tx;
+                    element.attr("visibility",
+                        bounds.x0 <= x && x <= bounds.x1 ? "visible" : "hidden");
+                    }
+            });
+    }
+
+    // we must unscale anything that is scale invariance: widths, raiduses, etc.
+    var size_attribs = ["font-size"];
+    var unscaled_selection = ".geometry, .geometry *";
+    if (xscalable) {
+        size_attribs.push("rx");
+        unscaled_selection += ", .xgridlines";
+    }
+    if (yscalable) {
+        size_attribs.push("ry");
+        unscaled_selection += ", .ygridlines";
+    }
+
+    root.selectAll(unscaled_selection)
+        .forEach(function (element, i) {
+            // circle need special help
+            if (element.node.nodeName == "circle") {
+                var cx = element.attribute("cx"),
+                    cy = element.attribute("cy");
+                unscale_t = new Snap.Matrix().scale(1/xscale, 1/yscale,
+                                                        cx, cy);
+                element.transform(unscale_t);
+                return;
+            }
+
+            for (i in size_attribs) {
+                var key = size_attribs[i];
+                var val = parseFloat(element.attribute(key));
+                if (val !== undefined && val != 0 && !isNaN(val)) {
+                    element.attribute(key, val * old_scale / scale);
+                }
+            }
+        });
+};
+
+
+// Find the most appropriate tick scale and update label visibility.
+var update_tickscale = function(root, scale, axis) {
+    if (!root.hasClass(axis + "scalable")) return;
+
+    var tickscales = root.data(axis + "tickscales");
+    var best_tickscale = 1.0;
+    var best_tickscale_dist = Infinity;
+    for (tickscale in tickscales) {
+        var dist = Math.abs(Math.log(tickscale) - Math.log(scale));
+        if (dist < best_tickscale_dist) {
+            best_tickscale_dist = dist;
+            best_tickscale = tickscale;
+        }
+    }
+
+    if (best_tickscale != root.data(axis + "tickscale")) {
+        root.data(axis + "tickscale", best_tickscale);
+        var mark_inscale_gridlines = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        var mark_inscale_labels = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        root.select("." + axis + "gridlines").selectAll("path").forEach(mark_inscale_gridlines);
+        root.select("." + axis + "labels").selectAll("text").forEach(mark_inscale_labels);
+    }
+};
+
+
+var set_plot_pan_zoom = function(root, tx, ty, scale) {
+    var old_scale = root.data("scale");
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    // compute the viewport derived from tx, ty, and scale
+    var x_min = -width * scale - (scale * width - width),
+        x_max = width * scale,
+        y_min = -height * scale - (scale * height - height),
+        y_max = height * scale;
+
+    var x0 = bounds.x0 - scale * bounds.x0,
+        y0 = bounds.y0 - scale * bounds.y0;
+
+    var tx = Math.max(Math.min(tx - x0, x_max), x_min),
+        ty = Math.max(Math.min(ty - y0, y_max), y_min);
+
+    tx += x0;
+    ty += y0;
+
+    // when the scale change, we may need to alter which set of
+    // ticks is being displayed
+    if (scale != old_scale) {
+        update_tickscale(root, scale, "x");
+        update_tickscale(root, scale, "y");
+    }
+
+    set_geometry_transform(root, tx, ty, scale);
+
+    root.data("scale", scale);
+    root.data("tx", tx);
+    root.data("ty", ty);
+};
+
+
+var scale_centered_translation = function(root, scale) {
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    var tx0 = root.data("tx"),
+        ty0 = root.data("ty");
+
+    var scale0 = root.data("scale");
+
+    // how off from center the current view is
+    var xoff = tx0 - (bounds.x0 * (1 - scale0) + (width * (1 - scale0)) / 2),
+        yoff = ty0 - (bounds.y0 * (1 - scale0) + (height * (1 - scale0)) / 2);
+
+    // rescale offsets
+    xoff = xoff * scale / scale0;
+    yoff = yoff * scale / scale0;
+
+    // adjust for the panel position being scaled
+    var x_edge_adjust = bounds.x0 * (1 - scale),
+        y_edge_adjust = bounds.y0 * (1 - scale);
+
+    return {
+        x: xoff + x_edge_adjust + (width - width * scale) / 2,
+        y: yoff + y_edge_adjust + (height - height * scale) / 2
+    };
+};
+
+
+// Initialize data for panning zooming if it isn't already.
+var init_pan_zoom = function(root) {
+    if (root.data("zoompan-ready")) {
+        return;
+    }
+
+    // The non-scaling-stroke trick. Rather than try to correct for the
+    // stroke-width when zooming, we force it to a fixed value.
+    var px_per_mm = root.node.getCTM().a;
+
+    // Drag events report deltas in pixels, which we'd like to convert to
+    // millimeters.
+    root.data("px_per_mm", px_per_mm);
+
+    root.selectAll("path")
+        .forEach(function (element, i) {
+        sw = element.asPX("stroke-width") * px_per_mm;
+        if (sw > 0) {
+            element.attribute("stroke-width", sw);
+            element.attribute("vector-effect", "non-scaling-stroke");
+        }
+    });
+
+    // Store ticks labels original tranformation
+    root.selectAll(".xlabels > text, .ylabels > text")
+        .forEach(function (element, i) {
+            var lm = element.transform().localMatrix;
+            element.data("static_transform",
+                new Snap.Matrix(lm.a, lm.b, lm.c, lm.d, lm.e, lm.f));
+        });
+
+    var xgridlines = root.select(".xgridlines");
+    var ygridlines = root.select(".ygridlines");
+    var xlabels = root.select(".xlabels");
+    var ylabels = root.select(".ylabels");
+
+    if (root.data("tx") === undefined) root.data("tx", 0);
+    if (root.data("ty") === undefined) root.data("ty", 0);
+    if (root.data("scale") === undefined) root.data("scale", 1.0);
+    if (root.data("xtickscales") === undefined) {
+
+        // index all the tick scales that are listed
+        var xtickscales = {};
+        var ytickscales = {};
+        var add_x_tick_scales = function (element, i) {
+            xtickscales[element.attribute("gadfly:scale")] = true;
+        };
+        var add_y_tick_scales = function (element, i) {
+            ytickscales[element.attribute("gadfly:scale")] = true;
+        };
+
+        if (xgridlines) xgridlines.selectAll("path").forEach(add_x_tick_scales);
+        if (ygridlines) ygridlines.selectAll("path").forEach(add_y_tick_scales);
+        if (xlabels) xlabels.selectAll("text").forEach(add_x_tick_scales);
+        if (ylabels) ylabels.selectAll("text").forEach(add_y_tick_scales);
+
+        root.data("xtickscales", xtickscales);
+        root.data("ytickscales", ytickscales);
+        root.data("xtickscale", 1.0);
+    }
+
+    var min_scale = 1.0, max_scale = 1.0;
+    for (scale in xtickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    for (scale in ytickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    root.data("min_scale", min_scale);
+    root.data("max_scale", max_scale);
+
+    // store the original positions of labels
+    if (xlabels) {
+        xlabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("x", element.asPX("x"));
+               });
+    }
+
+    if (ylabels) {
+        ylabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("y", element.asPX("y"));
+               });
+    }
+
+    // mark grid lines and ticks as in or out of scale.
+    var mark_inscale = function (element, i) {
+        element.attribute("gadfly:inscale", element.attribute("gadfly:scale") == 1.0);
+    };
+
+    if (xgridlines) xgridlines.selectAll("path").forEach(mark_inscale);
+    if (ygridlines) ygridlines.selectAll("path").forEach(mark_inscale);
+    if (xlabels) xlabels.selectAll("text").forEach(mark_inscale);
+    if (ylabels) ylabels.selectAll("text").forEach(mark_inscale);
+
+    // figure out the upper ond lower bounds on panning using the maximum
+    // and minum grid lines
+    var bounds = root.plotbounds();
+    var pan_bounds = {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 0.0,
+        y1: 0.0
+    };
+
+    if (xgridlines) {
+        xgridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.x1 - bbox.x < pan_bounds.x0) {
+                        pan_bounds.x0 = bounds.x1 - bbox.x;
+                    }
+                    if (bounds.x0 - bbox.x > pan_bounds.x1) {
+                        pan_bounds.x1 = bounds.x0 - bbox.x;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    if (ygridlines) {
+        ygridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.y1 - bbox.y < pan_bounds.y0) {
+                        pan_bounds.y0 = bounds.y1 - bbox.y;
+                    }
+                    if (bounds.y0 - bbox.y > pan_bounds.y1) {
+                        pan_bounds.y1 = bounds.y0 - bbox.y;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    // nudge these values a little
+    pan_bounds.x0 -= 5;
+    pan_bounds.x1 += 5;
+    pan_bounds.y0 -= 5;
+    pan_bounds.y1 += 5;
+    root.data("pan_bounds", pan_bounds);
+
+    root.data("zoompan-ready", true)
+};
+
+
+// drag actions, i.e. zooming and panning
+var pan_action = {
+    start: function(root, x, y, event) {
+        root.data("dx", 0);
+        root.data("dy", 0);
+        root.data("tx0", root.data("tx"));
+        root.data("ty0", root.data("ty"));
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var px_per_mm = root.data("px_per_mm");
+        dx /= px_per_mm;
+        dy /= px_per_mm;
+
+        var tx0 = root.data("tx"),
+            ty0 = root.data("ty");
+
+        var dx0 = root.data("dx"),
+            dy0 = root.data("dy");
+
+        root.data("dx", dx);
+        root.data("dy", dy);
+
+        dx = dx - dx0;
+        dy = dy - dy0;
+
+        var tx = tx0 + dx,
+            ty = ty0 + dy;
+
+        set_plot_pan_zoom(root, tx, ty, root.data("scale"));
+    },
+    end: function(root, event) {
+
+    },
+    cancel: function(root) {
+        set_plot_pan_zoom(root, root.data("tx0"), root.data("ty0"), root.data("scale"));
+    }
+};
+
+var zoom_box;
+var zoom_action = {
+    start: function(root, x, y, event) {
+        var bounds = root.plotbounds();
+        var width = bounds.x1 - bounds.x0,
+            height = bounds.y1 - bounds.y0;
+        var ratio = width / height;
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        x = xscalable ? x / px_per_mm : bounds.x0;
+        y = yscalable ? y / px_per_mm : bounds.y0;
+        var w = xscalable ? 0 : width;
+        var h = yscalable ? 0 : height;
+        zoom_box = root.rect(x, y, w, h).attr({
+            "fill": "#000",
+            "opacity": 0.25
+        });
+        zoom_box.data("ratio", ratio);
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        var bounds = root.plotbounds();
+        if (yscalable) {
+            y /= px_per_mm;
+            y = Math.max(bounds.y0, y);
+            y = Math.min(bounds.y1, y);
+        } else {
+            y = bounds.y1;
+        }
+        if (xscalable) {
+            x /= px_per_mm;
+            x = Math.max(bounds.x0, x);
+            x = Math.min(bounds.x1, x);
+        } else {
+            x = bounds.x1;
+        }
+
+        dx = x - zoom_box.attr("x");
+        dy = y - zoom_box.attr("y");
+        if (xscalable && yscalable) {
+            var ratio = zoom_box.data("ratio");
+            var width = Math.min(Math.abs(dx), ratio * Math.abs(dy));
+            var height = Math.min(Math.abs(dy), Math.abs(dx) / ratio);
+            dx = width * dx / Math.abs(dx);
+            dy = height * dy / Math.abs(dy);
+        }
+        var xoffset = 0,
+            yoffset = 0;
+        if (dx < 0) {
+            xoffset = dx;
+            dx = -1 * dx;
+        }
+        if (dy < 0) {
+            yoffset = dy;
+            dy = -1 * dy;
+        }
+        if (isNaN(dy)) {
+            dy = 0.0;
+        }
+        if (isNaN(dx)) {
+            dx = 0.0;
+        }
+        zoom_box.transform("T" + xoffset + "," + yoffset);
+        zoom_box.attr("width", dx);
+        zoom_box.attr("height", dy);
+    },
+    end: function(root, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var zoom_bounds = zoom_box.getBBox();
+        if (zoom_bounds.width * zoom_bounds.height <= 0) {
+            return;
+        }
+        var plot_bounds = root.plotbounds();
+        var zoom_factor = 1.0;
+        if (yscalable) {
+            zoom_factor = (plot_bounds.y1 - plot_bounds.y0) / zoom_bounds.height;
+        } else {
+            zoom_factor = (plot_bounds.x1 - plot_bounds.x0) / zoom_bounds.width;
+        }
+        var tx = (root.data("tx") - zoom_bounds.x) * zoom_factor + plot_bounds.x0,
+            ty = (root.data("ty") - zoom_bounds.y) * zoom_factor + plot_bounds.y0;
+        set_plot_pan_zoom(root, tx, ty, root.data("scale") * zoom_factor);
+        zoom_box.remove();
+    },
+    cancel: function(root) {
+        zoom_box.remove();
+    }
+};
+
+
+Gadfly.guide_background_drag_onstart = function(x, y, event) {
+    var root = this.plotroot();
+    var scalable = root.hasClass("xscalable") || root.hasClass("yscalable");
+    var zoomable = !event.altKey && !event.ctrlKey && event.shiftKey && scalable;
+    var panable = !event.altKey && !event.ctrlKey && !event.shiftKey && scalable;
+    var drag_action = zoomable ? zoom_action :
+                      panable  ? pan_action :
+                                 undefined;
+    root.data("drag_action", drag_action);
+    if (drag_action) {
+        var cancel_drag_action = function(event) {
+            if (event.which == 27) { // esc key
+                drag_action.cancel(root);
+                root.data("drag_action", undefined);
+            }
+        };
+        window.addEventListener("keyup", cancel_drag_action);
+        root.data("cancel_drag_action", cancel_drag_action);
+        drag_action.start(root, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.update(root, dx, dy, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onend = function(event) {
+    var root = this.plotroot();
+    window.removeEventListener("keyup", root.data("cancel_drag_action"));
+    root.data("cancel_drag_action", undefined);
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.end(root, event);
+    }
+    root.data("drag_action", undefined);
+};
+
+
+Gadfly.guide_background_scroll = function(event) {
+    if (event.shiftKey) {
+        increase_zoom_by_position(this.plotroot(), 0.001 * event.wheelDelta);
+        event.preventDefault();
+    }
+};
+
+
+Gadfly.zoomslider_button_mouseover = function(event) {
+    this.select(".button_logo")
+         .animate({fill: this.data("mouseover_color")}, 100);
+};
+
+
+Gadfly.zoomslider_button_mouseout = function(event) {
+     this.select(".button_logo")
+         .animate({fill: this.data("mouseout_color")}, 100);
+};
+
+
+Gadfly.zoomslider_zoomout_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), -0.1, true);
+};
+
+
+Gadfly.zoomslider_zoomin_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), 0.1, true);
+};
+
+
+Gadfly.zoomslider_track_click = function(event) {
+    // TODO
+};
+
+
+// Map slider position x to scale y using the function y = a*exp(b*x)+c.
+// The constants a, b, and c are solved using the constraint that the function
+// should go through the points (0; min_scale), (0.5; 1), and (1; max_scale).
+var scale_from_slider_position = function(position, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return a * Math.exp(b * position) + c;
+}
+
+// inverse of scale_from_slider_position
+var slider_position_from_scale = function(scale, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return 1 / b * Math.log((scale - c) / a);
+}
+
+var increase_zoom_by_position = function(root, delta_position, animate) {
+    var scale = root.data("scale"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale");
+    var position = slider_position_from_scale(scale, min_scale, max_scale);
+    position += delta_position;
+    scale = scale_from_slider_position(position, min_scale, max_scale);
+    set_zoom(root, scale, animate);
+}
+
+var set_zoom = function(root, scale, animate) {
+    var min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("scale");
+    var new_scale = Math.max(min_scale, Math.min(scale, max_scale));
+    if (animate) {
+        Snap.animate(
+            old_scale,
+            new_scale,
+            function (new_scale) {
+                update_plot_scale(root, new_scale);
+            },
+            200);
+    } else {
+        update_plot_scale(root, new_scale);
+    }
+}
+
+
+var update_plot_scale = function(root, new_scale) {
+    var trans = scale_centered_translation(root, new_scale);
+    set_plot_pan_zoom(root, trans.x, trans.y, new_scale);
+
+    root.selectAll(".zoomslider_thumb")
+        .forEach(function (element, i) {
+            var min_pos = element.data("min_pos"),
+                max_pos = element.data("max_pos"),
+                min_scale = root.data("min_scale"),
+                max_scale = root.data("max_scale");
+            var xmid = (min_pos + max_pos) / 2;
+            var xpos = slider_position_from_scale(new_scale, min_scale, max_scale);
+            element.transform(new Snap.Matrix().translate(
+                Math.max(min_pos, Math.min(
+                         max_pos, min_pos + (max_pos - min_pos) * xpos)) - xmid, 0));
+    });
+};
+
+
+Gadfly.zoomslider_thumb_dragmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var min_pos = this.data("min_pos"),
+        max_pos = this.data("max_pos"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("old_scale");
+
+    var px_per_mm = root.data("px_per_mm");
+    dx /= px_per_mm;
+    dy /= px_per_mm;
+
+    var xmid = (min_pos + max_pos) / 2;
+    var xpos = slider_position_from_scale(old_scale, min_scale, max_scale) +
+                   dx / (max_pos - min_pos);
+
+    // compute the new scale
+    var new_scale = scale_from_slider_position(xpos, min_scale, max_scale);
+    new_scale = Math.min(max_scale, Math.max(min_scale, new_scale));
+
+    update_plot_scale(root, new_scale);
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragstart = function(x, y, event) {
+    this.animate({fill: this.data("mouseover_color")}, 100);
+    var root = this.plotroot();
+
+    // keep track of what the scale was when we started dragging
+    root.data("old_scale", root.data("scale"));
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragend = function(event) {
+    this.animate({fill: this.data("mouseout_color")}, 100);
+    event.stopPropagation();
+};
+
+
+var toggle_color_class = function(root, color_class, ison) {
+    var guides = root.selectAll(".guide." + color_class + ",.guide ." + color_class);
+    var geoms = root.selectAll(".geometry." + color_class + ",.geometry ." + color_class);
+    if (ison) {
+        guides.animate({opacity: 0.5}, 250);
+        geoms.animate({opacity: 0.0}, 250);
+    } else {
+        guides.animate({opacity: 1.0}, 250);
+        geoms.animate({opacity: 1.0}, 250);
+    }
+};
+
+
+Gadfly.colorkey_swatch_click = function(event) {
+    var root = this.plotroot();
+    var color_class = this.data("color_class");
+
+    if (event.shiftKey) {
+        root.selectAll(".colorkey text")
+            .forEach(function (element) {
+                var other_color_class = element.data("color_class");
+                if (other_color_class != color_class) {
+                    toggle_color_class(root, other_color_class,
+                                       element.attr("opacity") == 1.0);
+                }
+            });
+    } else {
+        toggle_color_class(root, color_class, this.attr("opacity") == 1.0);
+    }
+};
+
+
+return Gadfly;
+
+}));
+
+
+//@ sourceURL=gadfly.js
+
+(function (glob, factory) {
+    // AMD support
+      if (typeof require === "function" && typeof define === "function" && define.amd) {
+        require(["Snap.svg", "Gadfly"], function (Snap, Gadfly) {
+            factory(Snap, Gadfly);
+        });
+      } else {
+          factory(glob.Snap, glob.Gadfly);
+      }
+})(window, function (Snap, Gadfly) {
+    var fig = Snap("#fig-aa04225fcd6c4873b258034b2bf489f2");
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-4")
+   .drag(function() {}, function() {}, function() {});
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-8")
+   .init_gadfly();
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-11")
+   .plotroot().data("unfocused_ygrid_color", "#D0D0E0")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-11")
+   .plotroot().data("focused_ygrid_color", "#A0A0A0")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-12")
+   .plotroot().data("unfocused_xgrid_color", "#D0D0E0")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-12")
+   .plotroot().data("focused_xgrid_color", "#A0A0A0")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-18")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-18")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-18")
+   .click(Gadfly.zoomslider_zoomin_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-20")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-20")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-20")
+   .click(Gadfly.zoomslider_track_click);
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-21")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-21")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-21")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-21")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-21")
+   .drag(Gadfly.zoomslider_thumb_dragmove,
+     Gadfly.zoomslider_thumb_dragstart,
+     Gadfly.zoomslider_thumb_dragend)
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-22")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-22")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-aa04225fcd6c4873b258034b2bf489f2-element-22")
+   .click(Gadfly.zoomslider_zoomout_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+    });
+]]> </script>
+</svg>
+
+
+
+For those that just want the code, without the explanation, you have come to the right place. Here it is:
+
+
+```julia
+using StateSpace
+using Distributions
+using Gadfly
+using DataFrames
+using Colors
+
+r = 0.2 #r is the growth rate
+k = 100.0 #k is the carrying capacity
+p0 = 0.1 * k # p0 is the initial population
+Δt = 0.1 # Δt is the change in time.
+
+#Define the logistic growth function to set the observations
+function logisticGrowth(r, p, k, t)
+    k * p * exp(r*t) / (k + p * (exp(r*t) - 1))
+end
+logisticGrowth(state) = logisticGrowth(state[1], state[2], k, Δt)
+
+#Generate noisy measurements
+measurement_noise_variance = 25.0
+numObs = 100
+true_values = Vector{Float64}(numObs)
+population_measurements = Vector{Float64}(numObs)
+for i in 1:numObs
+    true_values[i] = logisticGrowth(r, p0, k, i*Δt)
+    population_measurements[i] = true_values[i] + randn() * sqrt(measurement_noise_variance)
+end
+growth_rate_measurements = zeros(numObs)
+measurements = [growth_rate_measurements population_measurements]'
+
+#Section: Describe Extended Kalman Filter parameters
+function process_fcn(state)
+    predict_growth_rate = state[1]
+    predict_population = logisticGrowth(state)
+    new_state = [predict_growth_rate, predict_population]
+    return new_state
+end
+process_noise_mat = diagm([0.001, 0.001])
+
+function observation_fcn(state)
+    growth_rate_observation = 0.0
+    population_observation = 1.0 * state[2]
+    observation = [growth_rate_observation, population_observation]
+    return observation
+end
+observation_noise_mat = diagm([1.0, measurement_noise_variance])
+
+#Create instance of our EKF model
+nonLinSSM = NonlinearGaussianSSM(process_fcn, process_noise_mat, observation_fcn, observation_noise_mat)
+
+initial_guess = MvNormal([0.5, 10], diagm([1.0,20.0])) #Set initial guess of the state
+
+filtered_state = filter(nonLinSSM, measurements, initial_guess) #Execute  the Extended Kalman Filter
+
+#Plot Filtered results for population
+x_data = 1:numObs
+population_array = Vector{Float64}(numObs+1)
+confidence_array = Vector{Float64}(numObs+1)
+population_array[1] = initial_guess.μ[2]
+confidence_array[1] = 2*sqrt(initial_guess.Σ.mat[2,2])
+for i in x_data
+    current_state = filtered_state.state[i]
+    population_array[i+1] = current_state.μ[2]
+    confidence_array[i+1] = 2*sqrt(current_state.Σ.mat[2,2])
+end
+df_fs = DataFrame(
+    x = [0;x_data],
+    y = population_array,
+    ymin = population_array - confidence_array,
+    ymax = population_array + confidence_array,
+    f = "Filtered values"
+    )
+
+n = 3
+getColors = distinguishable_colors(n, Color[LCHab(70, 60, 240)],
+                                   transform=c -> deuteranopic(c, 0.5),
+                                   lchoices=Float64[65, 70, 75, 80],
+                                   cchoices=Float64[0, 50, 60, 70],
+                                   hchoices=linspace(0, 330, 24))
+population_state_plot = plot(
+    layer(x=0:numObs, y=[p0;measurements[2,:]'], Geom.point, Theme(default_color=getColors[2])),
+    layer(x=0:numObs, y=[p0;true_values], Geom.line, Theme(default_color=getColors[3])),
+    layer(df_fs, x=:x, y=:y, ymin=:ymin, ymax=:ymax, Geom.line, Geom.ribbon),
+    Guide.xlabel("Measurement Number"), Guide.ylabel("Population"),
+    Guide.manual_color_key("Colour Key",["Filtered Estimate", "Measurements","True Value "],[getColors[1],getColors[2],getColors[3]]),
+    Guide.title("Extended Kalman Filter Example")
+    )
+display(population_state_plot)
+
+#Plot Filtered results for growth rate
+x_data = 1:numObs
+growth_rate_array = Vector{Float64}(numObs+1)
+confidence_array = Vector{Float64}(numObs+1)
+growth_rate_array[1] = initial_guess.μ[1]
+confidence_array[1] = initial_guess.Σ.mat[1,1]
+for i in x_data
+    current_state = filtered_state.state[i]
+    growth_rate_array[i+1] = current_state.μ[1]
+    confidence_array[i+1] = 2*sqrt(current_state.Σ.mat[1,1])
+end
+df_fs = DataFrame(
+    x = [0;x_data],
+    y = growth_rate_array,
+    ymin = growth_rate_array - confidence_array,
+    ymax = growth_rate_array + confidence_array,
+    f = "Filtered values"
+    )
+
+growth_rate_state_plot = plot(
+    layer(x=0:numObs, y=ones(numObs+1)*r, Geom.line, Theme(default_color=getColors[3])),
+    layer(df_fs, x=:x, y=:y, ymin=:ymin, ymax=:ymax, Geom.line, Geom.ribbon),
+    Guide.xlabel("Measurement Number"), Guide.ylabel("Growth Rate"),
+    Guide.manual_color_key("Colour Key",["Filtered Estimate", "Measurements","True Value "],[getColors[1],getColors[2],getColors[3]]),
+    Guide.title("Extended Kalman Filter Example")
+    )
+display(growth_rate_state_plot)
+```
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:gadfly="http://www.gadflyjl.org/ns"
+     version="1.2"
+     width="141.42mm" height="100mm" viewBox="0 0 141.42 100"
+     stroke="none"
+     fill="#000000"
+     stroke-width="0.3"
+     font-size="3.88"
+
+     id="fig-2818e351c0b64d329dd1446ada8e8069">
+<g class="plotroot xscalable yscalable" id="fig-2818e351c0b64d329dd1446ada8e8069-element-1">
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-2">
+    <text x="65.54" y="88.39" text-anchor="middle" dy="0.6em">Measurement Number</text>
+  </g>
+  <g class="guide xlabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-2818e351c0b64d329dd1446ada8e8069-element-3">
+    <text x="-112.33" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-150</text>
+    <text x="-67.86" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-100</text>
+    <text x="-23.4" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-50</text>
+    <text x="21.07" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="65.54" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">50</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">100</text>
+    <text x="154.48" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">150</text>
+    <text x="198.94" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">200</text>
+    <text x="243.41" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">250</text>
+    <text x="-67.86" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-100</text>
+    <text x="-63.42" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-95</text>
+    <text x="-58.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-90</text>
+    <text x="-54.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-85</text>
+    <text x="-50.08" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-80</text>
+    <text x="-45.63" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-75</text>
+    <text x="-41.18" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-70</text>
+    <text x="-36.74" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-65</text>
+    <text x="-32.29" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="-27.84" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-55</text>
+    <text x="-23.4" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="-18.95" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-45</text>
+    <text x="-14.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="-10.06" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-35</text>
+    <text x="-5.61" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="-1.16" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-25</text>
+    <text x="3.28" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="7.73" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-15</text>
+    <text x="12.18" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="16.62" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-5</text>
+    <text x="21.07" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="25.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">5</text>
+    <text x="29.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="34.41" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">15</text>
+    <text x="38.86" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="43.31" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">25</text>
+    <text x="47.75" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="52.2" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">35</text>
+    <text x="56.65" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="61.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">45</text>
+    <text x="65.54" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="69.99" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">55</text>
+    <text x="74.43" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="78.88" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">65</text>
+    <text x="83.33" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="87.77" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">75</text>
+    <text x="92.22" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="96.67" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">85</text>
+    <text x="101.11" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="105.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">95</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="114.45" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">105</text>
+    <text x="118.9" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="123.35" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">115</text>
+    <text x="127.8" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="132.24" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">125</text>
+    <text x="136.69" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">130</text>
+    <text x="141.14" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">135</text>
+    <text x="145.58" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">140</text>
+    <text x="150.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">145</text>
+    <text x="154.48" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">150</text>
+    <text x="158.92" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">155</text>
+    <text x="163.37" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">160</text>
+    <text x="167.82" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">165</text>
+    <text x="172.26" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">170</text>
+    <text x="176.71" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">175</text>
+    <text x="181.16" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">180</text>
+    <text x="185.6" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">185</text>
+    <text x="190.05" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">190</text>
+    <text x="194.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">195</text>
+    <text x="198.94" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">200</text>
+    <text x="-67.86" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="21.07" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="198.94" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="-67.86" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-100</text>
+    <text x="-58.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-90</text>
+    <text x="-50.08" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-80</text>
+    <text x="-41.18" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-70</text>
+    <text x="-32.29" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="-23.4" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="-14.5" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="-5.61" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="3.28" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="12.18" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="21.07" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="29.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="38.86" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="47.75" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="56.65" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="65.54" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="74.43" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="83.33" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="92.22" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="101.11" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="118.9" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="127.8" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">120</text>
+    <text x="136.69" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">130</text>
+    <text x="145.58" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">140</text>
+    <text x="154.48" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">150</text>
+    <text x="163.37" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">160</text>
+    <text x="172.26" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">170</text>
+    <text x="181.16" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">180</text>
+    <text x="190.05" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">190</text>
+    <text x="198.94" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">200</text>
+  </g>
+  <g class="guide colorkey" id="fig-2818e351c0b64d329dd1446ada8e8069-element-4">
+    <g fill="#4C404B" font-size="2.82" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" id="fig-2818e351c0b64d329dd1446ada8e8069-element-5">
+      <text x="115.82" y="44.85" dy="0.35em">Filtered Estimate</text>
+      <text x="115.82" y="48.48" dy="0.35em">Measurements</text>
+      <text x="115.82" y="52.1" dy="0.35em">True Value </text>
+    </g>
+    <g stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-6">
+      <rect x="113.01" y="43.94" width="1.81" height="1.81" fill="#00BFFF"/>
+      <rect x="113.01" y="47.57" width="1.81" height="1.81" fill="#D4CA3A"/>
+      <rect x="113.01" y="51.2" width="1.81" height="1.81" fill="#FF5EA0"/>
+    </g>
+    <g fill="#362A35" font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-7">
+      <text x="113.01" y="41.03">Colour Key</text>
+    </g>
+  </g>
+  <g clip-path="url(#fig-2818e351c0b64d329dd1446ada8e8069-element-9)" id="fig-2818e351c0b64d329dd1446ada8e8069-element-8">
+    <g pointer-events="visible" opacity="1" fill="#000000" fill-opacity="0.000" stroke="#000000" stroke-opacity="0.000" class="guide background" id="fig-2818e351c0b64d329dd1446ada8e8069-element-10">
+      <rect x="19.07" y="12.61" width="92.94" height="68.1"/>
+    </g>
+    <g class="guide ygridlines xfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-2818e351c0b64d329dd1446ada8e8069-element-11">
+      <path fill="none" d="M19.07,158.84 L 112.01 158.84" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,142.82 L 112.01 142.82" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,126.79 L 112.01 126.79" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,110.77 L 112.01 110.77" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,94.74 L 112.01 94.74" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,78.72 L 112.01 78.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M19.07,62.69 L 112.01 62.69" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M19.07,46.66 L 112.01 46.66" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M19.07,30.64 L 112.01 30.64" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M19.07,14.61 L 112.01 14.61" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M19.07,-1.41 L 112.01 -1.41" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-17.44 L 112.01 -17.44" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-33.47 L 112.01 -33.47" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-49.49 L 112.01 -49.49" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-65.52 L 112.01 -65.52" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,142.82 L 112.01 142.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,138.81 L 112.01 138.81" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,134.81 L 112.01 134.81" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,130.8 L 112.01 130.8" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,126.79 L 112.01 126.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,122.79 L 112.01 122.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,118.78 L 112.01 118.78" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,114.77 L 112.01 114.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,110.77 L 112.01 110.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,106.76 L 112.01 106.76" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,102.75 L 112.01 102.75" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,98.75 L 112.01 98.75" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,94.74 L 112.01 94.74" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,90.73 L 112.01 90.73" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,86.73 L 112.01 86.73" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,82.72 L 112.01 82.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,78.72 L 112.01 78.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,74.71 L 112.01 74.71" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,70.7 L 112.01 70.7" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,66.7 L 112.01 66.7" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,62.69 L 112.01 62.69" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,58.68 L 112.01 58.68" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,54.68 L 112.01 54.68" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,50.67 L 112.01 50.67" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,46.66 L 112.01 46.66" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,42.66 L 112.01 42.66" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,38.65 L 112.01 38.65" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,34.64 L 112.01 34.64" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,30.64 L 112.01 30.64" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,26.63 L 112.01 26.63" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,22.62 L 112.01 22.62" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,18.62 L 112.01 18.62" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,14.61 L 112.01 14.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,10.61 L 112.01 10.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,6.6 L 112.01 6.6" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,2.59 L 112.01 2.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-1.41 L 112.01 -1.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-5.42 L 112.01 -5.42" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-9.43 L 112.01 -9.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-13.43 L 112.01 -13.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-17.44 L 112.01 -17.44" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-21.45 L 112.01 -21.45" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-25.45 L 112.01 -25.45" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-29.46 L 112.01 -29.46" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-33.47 L 112.01 -33.47" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-37.47 L 112.01 -37.47" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-41.48 L 112.01 -41.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-45.49 L 112.01 -45.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-49.49 L 112.01 -49.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,142.82 L 112.01 142.82" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.07,62.69 L 112.01 62.69" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.07,-17.44 L 112.01 -17.44" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.07,-97.57 L 112.01 -97.57" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.07,142.82 L 112.01 142.82" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,138.81 L 112.01 138.81" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,134.81 L 112.01 134.81" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,130.8 L 112.01 130.8" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,126.79 L 112.01 126.79" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,122.79 L 112.01 122.79" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,118.78 L 112.01 118.78" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,114.77 L 112.01 114.77" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,110.77 L 112.01 110.77" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,106.76 L 112.01 106.76" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,102.75 L 112.01 102.75" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,98.75 L 112.01 98.75" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,94.74 L 112.01 94.74" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,90.73 L 112.01 90.73" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,86.73 L 112.01 86.73" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,82.72 L 112.01 82.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,78.72 L 112.01 78.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,74.71 L 112.01 74.71" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,70.7 L 112.01 70.7" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,66.7 L 112.01 66.7" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,62.69 L 112.01 62.69" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,58.68 L 112.01 58.68" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,54.68 L 112.01 54.68" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,50.67 L 112.01 50.67" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,46.66 L 112.01 46.66" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,42.66 L 112.01 42.66" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,38.65 L 112.01 38.65" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,34.64 L 112.01 34.64" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,30.64 L 112.01 30.64" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,26.63 L 112.01 26.63" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,22.62 L 112.01 22.62" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,18.62 L 112.01 18.62" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,14.61 L 112.01 14.61" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,10.61 L 112.01 10.61" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,6.6 L 112.01 6.6" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,2.59 L 112.01 2.59" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-1.41 L 112.01 -1.41" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-5.42 L 112.01 -5.42" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-9.43 L 112.01 -9.43" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-13.43 L 112.01 -13.43" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-17.44 L 112.01 -17.44" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-21.45 L 112.01 -21.45" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-25.45 L 112.01 -25.45" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-29.46 L 112.01 -29.46" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-33.47 L 112.01 -33.47" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-37.47 L 112.01 -37.47" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-41.48 L 112.01 -41.48" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-45.49 L 112.01 -45.49" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.07,-49.49 L 112.01 -49.49" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="guide xgridlines yfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-2818e351c0b64d329dd1446ada8e8069-element-12">
+      <path fill="none" d="M-112.33,12.61 L -112.33 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-67.86,12.61 L -67.86 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-23.4,12.61 L -23.4 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M21.07,12.61 L 21.07 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M65.54,12.61 L 65.54 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M154.48,12.61 L 154.48 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M198.94,12.61 L 198.94 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M243.41,12.61 L 243.41 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-67.86,12.61 L -67.86 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-63.42,12.61 L -63.42 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-58.97,12.61 L -58.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-54.52,12.61 L -54.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-50.08,12.61 L -50.08 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-45.63,12.61 L -45.63 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-41.18,12.61 L -41.18 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-36.74,12.61 L -36.74 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-32.29,12.61 L -32.29 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-27.84,12.61 L -27.84 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-23.4,12.61 L -23.4 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-18.95,12.61 L -18.95 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-14.5,12.61 L -14.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-10.06,12.61 L -10.06 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-5.61,12.61 L -5.61 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-1.16,12.61 L -1.16 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M3.28,12.61 L 3.28 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M7.73,12.61 L 7.73 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M12.18,12.61 L 12.18 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M16.62,12.61 L 16.62 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M21.07,12.61 L 21.07 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M25.52,12.61 L 25.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M29.97,12.61 L 29.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M34.41,12.61 L 34.41 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M38.86,12.61 L 38.86 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M43.31,12.61 L 43.31 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M47.75,12.61 L 47.75 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M52.2,12.61 L 52.2 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M56.65,12.61 L 56.65 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M61.09,12.61 L 61.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M65.54,12.61 L 65.54 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M69.99,12.61 L 69.99 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M74.43,12.61 L 74.43 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M78.88,12.61 L 78.88 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M83.33,12.61 L 83.33 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M87.77,12.61 L 87.77 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M92.22,12.61 L 92.22 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M96.67,12.61 L 96.67 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M101.11,12.61 L 101.11 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M105.56,12.61 L 105.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M114.45,12.61 L 114.45 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M118.9,12.61 L 118.9 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M123.35,12.61 L 123.35 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M127.8,12.61 L 127.8 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M132.24,12.61 L 132.24 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M136.69,12.61 L 136.69 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M141.14,12.61 L 141.14 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M145.58,12.61 L 145.58 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M150.03,12.61 L 150.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M154.48,12.61 L 154.48 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M158.92,12.61 L 158.92 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M163.37,12.61 L 163.37 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M167.82,12.61 L 167.82 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M172.26,12.61 L 172.26 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M176.71,12.61 L 176.71 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M181.16,12.61 L 181.16 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M185.6,12.61 L 185.6 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M190.05,12.61 L 190.05 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M194.5,12.61 L 194.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M198.94,12.61 L 198.94 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-67.86,12.61 L -67.86 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M21.07,12.61 L 21.07 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M198.94,12.61 L 198.94 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M-67.86,12.61 L -67.86 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-58.97,12.61 L -58.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-50.08,12.61 L -50.08 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-41.18,12.61 L -41.18 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-32.29,12.61 L -32.29 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-23.4,12.61 L -23.4 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-14.5,12.61 L -14.5 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-5.61,12.61 L -5.61 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M3.28,12.61 L 3.28 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M12.18,12.61 L 12.18 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M21.07,12.61 L 21.07 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M29.97,12.61 L 29.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M38.86,12.61 L 38.86 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M47.75,12.61 L 47.75 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M56.65,12.61 L 56.65 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M65.54,12.61 L 65.54 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M74.43,12.61 L 74.43 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M83.33,12.61 L 83.33 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M92.22,12.61 L 92.22 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M101.11,12.61 L 101.11 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M118.9,12.61 L 118.9 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M127.8,12.61 L 127.8 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M136.69,12.61 L 136.69 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M145.58,12.61 L 145.58 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M154.48,12.61 L 154.48 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M163.37,12.61 L 163.37 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M172.26,12.61 L 172.26 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M181.16,12.61 L 181.16 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M190.05,12.61 L 190.05 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M198.94,12.61 L 198.94 80.72" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="plotpanel" id="fig-2818e351c0b64d329dd1446ada8e8069-element-13">
+      <g stroke-width="0.3" stroke="#000000" stroke-opacity="0.000" class="geometry" fill="#BDE8FF" id="fig-2818e351c0b64d329dd1446ada8e8069-element-14">
+        <path d="M110.01,28.7 L 109.12 28.35 108.23 28.65 107.34 29.17 106.45 29.22 105.56 28.9 104.67 31.16 103.78 30.78 102.89 31.04 102 31.41 101.11 33.24 100.23 34.98 99.34 35.98 98.45 37.21 97.56 38.3 96.67 39.27 95.78 39.34 94.89 39.59 94 40.16 93.11 40.95 92.22 40.41 91.33 39.86 90.44 39.72 89.55 38.83 88.66 39.49 87.77 40.24 86.88 40.25 86 40.45 85.11 41.21 84.22 41.79 83.33 42.34 82.44 42.78 81.55 43.59 80.66 43.83 79.77 42.96 78.88 43.86 77.99 44.53 77.1 44.29 76.21 44.89 75.32 45.29 74.43 44.77 73.54 45.08 72.65 45.89 71.77 45.74 70.88 44.56 69.99 43.34 69.1 43.97 68.21 43.51 67.32 43.46 66.43 44.19 65.54 46.36 64.65 46.97 63.76 47.51 62.87 48.32 61.98 49.34 61.09 50.26 60.2 49.81 59.31 49.91 58.42 50.27 57.54 50.06 56.65 50.36 55.76 50.28 54.87 50.26 53.98 50.47 53.09 50.38 52.2 50.92 51.31 51.07 50.42 50.9 49.53 51.56 48.64 50.95 47.75 51.86 46.86 51.48 45.97 52.06 45.08 53.1 44.2 54.28 43.31 53.46 42.42 53.11 41.53 53.97 40.64 54.58 39.75 55.5 38.86 55.27 37.97 55.59 37.08 56.03 36.19 56.97 35.3 56.94 34.41 57.99 33.52 58.73 32.63 57.08 31.74 58.01 30.85 59.55 29.97 60.51 29.08 60.61 28.19 61.9 27.3 61.68 26.41 60.71 25.52 57.23 24.63 57.02 23.74 56.73 22.85 57.23 21.96 60.18 21.07 61.84 21.07 47.51 21.96 49.14 22.85 47.5 23.74 47.2 24.63 47.41 25.52 47.66 26.41 51.29 27.3 53.14 28.19 54.17 29.08 53.51 29.97 53.59 30.85 52.73 31.74 51.08 32.63 49.82 33.52 51.14 34.41 50.48 35.3 49.46 36.19 49.45 37.08 48.56 37.97 48.14 38.86 47.86 39.75 48.16 40.64 47.36 41.53 46.84 42.42 46.05 43.31 46.45 44.2 47.37 45.08 46.34 45.97 45.39 46.86 44.86 47.75 45.28 48.64 44.44 49.53 45.1 50.42 44.5 51.31 44.72 52.2 44.64 53.09 44.15 53.98 44.27 54.87 44.1 55.76 44.16 56.65 44.26 57.54 44.01 58.42 44.24 59.31 43.91 60.2 43.82 61.09 44.28 61.98 43.4 62.87 42.37 63.76 41.53 64.65 40.93 65.54 40.28 66.43 38.06 67.32 37.24 68.21 37.21 69.1 37.63 69.99 36.98 70.88 38.18 71.77 39.38 72.65 39.59 73.54 38.82 74.43 38.54 75.32 39.07 76.21 38.7 77.1 38.11 77.99 38.35 78.88 37.68 79.77 36.78 80.66 37.62 81.55 37.38 82.44 36.56 83.33 36.11 84.22 35.54 85.11 34.94 86 34.16 86.88 33.92 87.77 33.88 88.66 33.13 89.55 32.45 90.44 33.32 91.33 33.46 92.22 34.02 93.11 34.58 94 33.82 94.89 33.25 95.78 33 96.67 32.93 97.56 31.96 98.45 30.86 99.34 29.6 100.23 28.57 101.11 26.81 102 24.94 102.89 24.54 103.78 24.26 104.67 24.64 105.56 22.36 106.45 22.68 107.34 22.64 108.23 22.12 109.12 21.82 110.01 22.18 z"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#00BFFF" id="fig-2818e351c0b64d329dd1446ada8e8069-element-15">
+        <path fill="none" d="M21.07,54.68 L 21.96 54.66 22.85 52.37 23.74 51.97 24.63 52.22 25.52 52.44 26.41 56 27.3 57.41 28.19 58.03 29.08 57.06 29.97 57.05 30.85 56.14 31.74 54.55 32.63 53.45 33.52 54.94 34.41 54.23 35.3 53.2 36.19 53.21 37.08 52.3 37.97 51.87 38.86 51.56 39.75 51.83 40.64 50.97 41.53 50.4 42.42 49.58 43.31 49.95 44.2 50.83 45.08 49.72 45.97 48.73 46.86 48.17 47.75 48.57 48.64 47.69 49.53 48.33 50.42 47.7 51.31 47.9 52.2 47.78 53.09 47.27 53.98 47.37 54.87 47.18 55.76 47.22 56.65 47.31 57.54 47.03 58.42 47.25 59.31 46.91 60.2 46.81 61.09 47.27 61.98 46.37 62.87 45.35 63.76 44.52 64.65 43.95 65.54 43.32 66.43 41.12 67.32 40.35 68.21 40.36 69.1 40.8 69.99 40.16 70.88 41.37 71.77 42.56 72.65 42.74 73.54 41.95 74.43 41.65 75.32 42.18 76.21 41.79 77.1 41.2 77.99 41.44 78.88 40.77 79.77 39.87 80.66 40.72 81.55 40.48 82.44 39.67 83.33 39.23 84.22 38.67 85.11 38.07 86 37.31 86.88 37.09 87.77 37.06 88.66 36.31 89.55 35.64 90.44 36.52 91.33 36.66 92.22 37.21 93.11 37.76 94 36.99 94.89 36.42 95.78 36.17 96.67 36.1 97.56 35.13 98.45 34.03 99.34 32.79 100.23 31.78 101.11 30.03 102 28.18 102.89 27.79 103.78 27.52 104.67 27.9 105.56 25.63 106.45 25.95 107.34 25.9 108.23 25.38 109.12 25.08 110.01 25.44"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#FF5EA0" id="fig-2818e351c0b64d329dd1446ada8e8069-element-16">
+        <path fill="none" d="M21.07,54.68 L 21.96 54.53 22.85 54.38 23.74 54.23 24.63 54.08 25.52 53.93 26.41 53.77 27.3 53.61 28.19 53.45 29.08 53.28 29.97 53.11 30.85 52.94 31.74 52.77 32.63 52.6 33.52 52.42 34.41 52.24 35.3 52.06 36.19 51.87 37.08 51.68 37.97 51.49 38.86 51.3 39.75 51.1 40.64 50.9 41.53 50.7 42.42 50.49 43.31 50.28 44.2 50.07 45.08 49.86 45.97 49.64 46.86 49.42 47.75 49.2 48.64 48.97 49.53 48.74 50.42 48.51 51.31 48.28 52.2 48.04 53.09 47.8 53.98 47.55 54.87 47.31 55.76 47.06 56.65 46.8 57.54 46.55 58.42 46.29 59.31 46.02 60.2 45.76 61.09 45.49 61.98 45.22 62.87 44.94 63.76 44.67 64.65 44.39 65.54 44.1 66.43 43.81 67.32 43.52 68.21 43.23 69.1 42.94 69.99 42.64 70.88 42.33 71.77 42.03 72.65 41.72 73.54 41.41 74.43 41.1 75.32 40.78 76.21 40.46 77.1 40.14 77.99 39.81 78.88 39.48 79.77 39.15 80.66 38.82 81.55 38.48 82.44 38.14 83.33 37.8 84.22 37.46 85.11 37.11 86 36.76 86.88 36.41 87.77 36.05 88.66 35.7 89.55 35.34 90.44 34.97 91.33 34.61 92.22 34.25 93.11 33.88 94 33.51 94.89 33.13 95.78 32.76 96.67 32.38 97.56 32.01 98.45 31.63 99.34 31.25 100.23 30.86 101.11 30.48 102 30.09 102.89 29.71 103.78 29.32 104.67 28.93 105.56 28.54 106.45 28.14 107.34 27.75 108.23 27.35 109.12 26.96 110.01 26.56"/>
+      </g>
+      <g class="geometry" id="fig-2818e351c0b64d329dd1446ada8e8069-element-17">
+        <g class="color_RGBA{Float32}(0.83092886f0,0.79346967f0,0.22566344f0,1.0f0)" stroke="#FFFFFF" stroke-width="0.3" fill="#D4CA3A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-18">
+          <circle cx="21.07" cy="54.68" r="0.9"/>
+          <circle cx="21.96" cy="55.42" r="0.9"/>
+          <circle cx="22.85" cy="49.55" r="0.9"/>
+          <circle cx="23.74" cy="53.34" r="0.9"/>
+          <circle cx="24.63" cy="54.3" r="0.9"/>
+          <circle cx="25.52" cy="53.71" r="0.9"/>
+          <circle cx="26.41" cy="63.15" r="0.9"/>
+          <circle cx="27.3" cy="59.19" r="0.9"/>
+          <circle cx="28.19" cy="57.76" r="0.9"/>
+          <circle cx="29.08" cy="50.59" r="0.9"/>
+          <circle cx="29.97" cy="55.27" r="0.9"/>
+          <circle cx="30.85" cy="50.58" r="0.9"/>
+          <circle cx="31.74" cy="47.37" r="0.9"/>
+          <circle cx="32.63" cy="50.69" r="0.9"/>
+          <circle cx="33.52" cy="62.23" r="0.9"/>
+          <circle cx="34.41" cy="52.05" r="0.9"/>
+          <circle cx="35.3" cy="50.3" r="0.9"/>
+          <circle cx="36.19" cy="54.75" r="0.9"/>
+          <circle cx="37.08" cy="50.21" r="0.9"/>
+          <circle cx="37.97" cy="52.01" r="0.9"/>
+          <circle cx="38.86" cy="52.21" r="0.9"/>
+          <circle cx="39.75" cy="54.57" r="0.9"/>
+          <circle cx="40.64" cy="48.89" r="0.9"/>
+          <circle cx="41.53" cy="49.88" r="0.9"/>
+          <circle cx="42.42" cy="48.14" r="0.9"/>
+          <circle cx="43.31" cy="53.84" r="0.9"/>
+          <circle cx="44.2" cy="56.44" r="0.9"/>
+          <circle cx="45.08" cy="45.64" r="0.9"/>
+          <circle cx="45.97" cy="45.69" r="0.9"/>
+          <circle cx="46.86" cy="47.68" r="0.9"/>
+          <circle cx="47.75" cy="52.93" r="0.9"/>
+          <circle cx="48.64" cy="45.07" r="0.9"/>
+          <circle cx="49.53" cy="53.87" r="0.9"/>
+          <circle cx="50.42" cy="45.96" r="0.9"/>
+          <circle cx="51.31" cy="50.83" r="0.9"/>
+          <circle cx="52.2" cy="48.71" r="0.9"/>
+          <circle cx="53.09" cy="45.85" r="0.9"/>
+          <circle cx="53.98" cy="49.64" r="0.9"/>
+          <circle cx="54.87" cy="47.54" r="0.9"/>
+          <circle cx="55.76" cy="48.9" r="0.9"/>
+          <circle cx="56.65" cy="49.09" r="0.9"/>
+          <circle cx="57.54" cy="46.42" r="0.9"/>
+          <circle cx="58.42" cy="49.73" r="0.9"/>
+          <circle cx="59.31" cy="45.66" r="0.9"/>
+          <circle cx="60.2" cy="47.23" r="0.9"/>
+          <circle cx="61.09" cy="51.09" r="0.9"/>
+          <circle cx="61.98" cy="41.23" r="0.9"/>
+          <circle cx="62.87" cy="40.12" r="0.9"/>
+          <circle cx="63.76" cy="41.25" r="0.9"/>
+          <circle cx="64.65" cy="42.77" r="0.9"/>
+          <circle cx="65.54" cy="41.96" r="0.9"/>
+          <circle cx="66.43" cy="30.9" r="0.9"/>
+          <circle cx="67.32" cy="39.96" r="0.9"/>
+          <circle cx="68.21" cy="44.31" r="0.9"/>
+          <circle cx="69.1" cy="46.49" r="0.9"/>
+          <circle cx="69.99" cy="39.3" r="0.9"/>
+          <circle cx="70.88" cy="50.42" r="0.9"/>
+          <circle cx="71.77" cy="50.41" r="0.9"/>
+          <circle cx="72.65" cy="44.24" r="0.9"/>
+          <circle cx="73.54" cy="37.84" r="0.9"/>
+          <circle cx="74.43" cy="40.84" r="0.9"/>
+          <circle cx="75.32" cy="46.09" r="0.9"/>
+          <circle cx="76.21" cy="40.05" r="0.9"/>
+          <circle cx="77.1" cy="38.51" r="0.9"/>
+          <circle cx="77.99" cy="43.81" r="0.9"/>
+          <circle cx="78.88" cy="37.65" r="0.9"/>
+          <circle cx="79.77" cy="35.86" r="0.9"/>
+          <circle cx="80.66" cy="47.19" r="0.9"/>
+          <circle cx="81.55" cy="39.91" r="0.9"/>
+          <circle cx="82.44" cy="35.96" r="0.9"/>
+          <circle cx="83.33" cy="38.1" r="0.9"/>
+          <circle cx="84.22" cy="37.02" r="0.9"/>
+          <circle cx="85.11" cy="36.49" r="0.9"/>
+          <circle cx="86" cy="35" r="0.9"/>
+          <circle cx="86.88" cy="38.08" r="0.9"/>
+          <circle cx="87.77" cy="38.94" r="0.9"/>
+          <circle cx="88.66" cy="34.08" r="0.9"/>
+          <circle cx="89.55" cy="34.16" r="0.9"/>
+          <circle cx="90.44" cy="43.38" r="0.9"/>
+          <circle cx="91.33" cy="38.76" r="0.9"/>
+          <circle cx="92.22" cy="41.24" r="0.9"/>
+          <circle cx="93.11" cy="41.29" r="0.9"/>
+          <circle cx="94" cy="32.98" r="0.9"/>
+          <circle cx="94.89" cy="34.02" r="0.9"/>
+          <circle cx="95.78" cy="35.79" r="0.9"/>
+          <circle cx="96.67" cy="36.76" r="0.9"/>
+          <circle cx="97.56" cy="30.82" r="0.9"/>
+          <circle cx="98.45" cy="29.62" r="0.9"/>
+          <circle cx="99.34" cy="28.17" r="0.9"/>
+          <circle cx="100.23" cy="28.94" r="0.9"/>
+          <circle cx="101.11" cy="23.7" r="0.9"/>
+          <circle cx="102" cy="22.07" r="0.9"/>
+          <circle cx="102.89" cy="29.72" r="0.9"/>
+          <circle cx="103.78" cy="29.77" r="0.9"/>
+          <circle cx="104.67" cy="33.16" r="0.9"/>
+          <circle cx="105.56" cy="17.04" r="0.9"/>
+          <circle cx="106.45" cy="31.02" r="0.9"/>
+          <circle cx="107.34" cy="28.67" r="0.9"/>
+          <circle cx="108.23" cy="25.49" r="0.9"/>
+          <circle cx="109.12" cy="26.25" r="0.9"/>
+          <circle cx="110.01" cy="29.78" r="0.9"/>
+        </g>
+      </g>
+    </g>
+    <g opacity="0" class="guide zoomslider" stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-19">
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-20">
+        <rect x="105.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-21">
+          <path d="M105.81,17.21 L 106.61 17.21 106.61 16.41 107.41 16.41 107.41 17.21 108.21 17.21 108.21 18.01 107.41 18.01 107.41 18.81 106.61 18.81 106.61 18.01 105.81 18.01 z"/>
+        </g>
+      </g>
+      <g fill="#EAEAEA" id="fig-2818e351c0b64d329dd1446ada8e8069-element-22">
+        <rect x="85.51" y="15.61" width="19" height="4"/>
+      </g>
+      <g class="zoomslider_thumb" fill="#6A6A6A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-23">
+        <rect x="94.01" y="15.61" width="2" height="4"/>
+      </g>
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-24">
+        <rect x="81.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-2818e351c0b64d329dd1446ada8e8069-element-25">
+          <path d="M81.81,17.21 L 84.21 17.21 84.21 18.01 81.81 18.01 z"/>
+        </g>
+      </g>
+    </g>
+  </g>
+  <g class="guide ylabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-2818e351c0b64d329dd1446ada8e8069-element-26">
+    <text x="18.07" y="158.84" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-120</text>
+    <text x="18.07" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-100</text>
+    <text x="18.07" y="126.79" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-80</text>
+    <text x="18.07" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-60</text>
+    <text x="18.07" y="94.74" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-40</text>
+    <text x="18.07" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">-20</text>
+    <text x="18.07" y="62.69" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="18.07" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">20</text>
+    <text x="18.07" y="30.64" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">40</text>
+    <text x="18.07" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">60</text>
+    <text x="18.07" y="-1.41" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">80</text>
+    <text x="18.07" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">100</text>
+    <text x="18.07" y="-33.47" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">120</text>
+    <text x="18.07" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">140</text>
+    <text x="18.07" y="-65.52" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">160</text>
+    <text x="18.07" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-100</text>
+    <text x="18.07" y="138.81" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-95</text>
+    <text x="18.07" y="134.81" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-90</text>
+    <text x="18.07" y="130.8" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-85</text>
+    <text x="18.07" y="126.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-80</text>
+    <text x="18.07" y="122.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-75</text>
+    <text x="18.07" y="118.78" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-70</text>
+    <text x="18.07" y="114.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-65</text>
+    <text x="18.07" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="18.07" y="106.76" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-55</text>
+    <text x="18.07" y="102.75" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="18.07" y="98.75" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-45</text>
+    <text x="18.07" y="94.74" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="18.07" y="90.73" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-35</text>
+    <text x="18.07" y="86.73" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="18.07" y="82.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-25</text>
+    <text x="18.07" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="18.07" y="74.71" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-15</text>
+    <text x="18.07" y="70.7" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="18.07" y="66.7" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5</text>
+    <text x="18.07" y="62.69" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="18.07" y="58.68" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5</text>
+    <text x="18.07" y="54.68" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="18.07" y="50.67" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">15</text>
+    <text x="18.07" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="18.07" y="42.66" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">25</text>
+    <text x="18.07" y="38.65" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="18.07" y="34.64" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">35</text>
+    <text x="18.07" y="30.64" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="18.07" y="26.63" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">45</text>
+    <text x="18.07" y="22.62" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="18.07" y="18.62" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">55</text>
+    <text x="18.07" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="18.07" y="10.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">65</text>
+    <text x="18.07" y="6.6" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="18.07" y="2.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">75</text>
+    <text x="18.07" y="-1.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="18.07" y="-5.42" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">85</text>
+    <text x="18.07" y="-9.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="18.07" y="-13.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">95</text>
+    <text x="18.07" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="18.07" y="-21.45" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">105</text>
+    <text x="18.07" y="-25.45" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="18.07" y="-29.46" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">115</text>
+    <text x="18.07" y="-33.47" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="18.07" y="-37.47" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">125</text>
+    <text x="18.07" y="-41.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">130</text>
+    <text x="18.07" y="-45.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">135</text>
+    <text x="18.07" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">140</text>
+    <text x="18.07" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="18.07" y="62.69" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="18.07" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="18.07" y="-97.57" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="18.07" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-100</text>
+    <text x="18.07" y="138.81" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-95</text>
+    <text x="18.07" y="134.81" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-90</text>
+    <text x="18.07" y="130.8" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-85</text>
+    <text x="18.07" y="126.79" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-80</text>
+    <text x="18.07" y="122.79" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-75</text>
+    <text x="18.07" y="118.78" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-70</text>
+    <text x="18.07" y="114.77" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-65</text>
+    <text x="18.07" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="18.07" y="106.76" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-55</text>
+    <text x="18.07" y="102.75" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="18.07" y="98.75" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-45</text>
+    <text x="18.07" y="94.74" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="18.07" y="90.73" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-35</text>
+    <text x="18.07" y="86.73" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="18.07" y="82.72" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-25</text>
+    <text x="18.07" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="18.07" y="74.71" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-15</text>
+    <text x="18.07" y="70.7" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="18.07" y="66.7" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5</text>
+    <text x="18.07" y="62.69" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="18.07" y="58.68" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5</text>
+    <text x="18.07" y="54.68" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="18.07" y="50.67" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">15</text>
+    <text x="18.07" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="18.07" y="42.66" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">25</text>
+    <text x="18.07" y="38.65" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="18.07" y="34.64" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">35</text>
+    <text x="18.07" y="30.64" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="18.07" y="26.63" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">45</text>
+    <text x="18.07" y="22.62" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="18.07" y="18.62" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">55</text>
+    <text x="18.07" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="18.07" y="10.61" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">65</text>
+    <text x="18.07" y="6.6" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="18.07" y="2.59" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">75</text>
+    <text x="18.07" y="-1.41" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="18.07" y="-5.42" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">85</text>
+    <text x="18.07" y="-9.43" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="18.07" y="-13.43" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">95</text>
+    <text x="18.07" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="18.07" y="-21.45" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">105</text>
+    <text x="18.07" y="-25.45" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="18.07" y="-29.46" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">115</text>
+    <text x="18.07" y="-33.47" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">120</text>
+    <text x="18.07" y="-37.47" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">125</text>
+    <text x="18.07" y="-41.48" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">130</text>
+    <text x="18.07" y="-45.49" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">135</text>
+    <text x="18.07" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">140</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-27">
+    <text x="8.81" y="44.66" text-anchor="middle" dy="0.35em" transform="rotate(-90, 8.81, 46.66)">Population</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-2818e351c0b64d329dd1446ada8e8069-element-28">
+    <text x="65.54" y="10.61" text-anchor="middle">Extended Kalman Filter Example</text>
+  </g>
+</g>
+<defs>
+<clipPath id="fig-2818e351c0b64d329dd1446ada8e8069-element-9">
+  <path d="M19.07,12.61 L 112.01 12.61 112.01 80.72 19.07 80.72" />
+</clipPath
+></defs>
+<script> <![CDATA[
+(function(N){var k=/[\.\/]/,L=/\s*,\s*/,C=function(a,d){return a-d},a,v,y={n:{}},M=function(){for(var a=0,d=this.length;a<d;a++)if("undefined"!=typeof this[a])return this[a]},A=function(){for(var a=this.length;--a;)if("undefined"!=typeof this[a])return this[a]},w=function(k,d){k=String(k);var f=v,n=Array.prototype.slice.call(arguments,2),u=w.listeners(k),p=0,b,q=[],e={},l=[],r=a;l.firstDefined=M;l.lastDefined=A;a=k;for(var s=v=0,x=u.length;s<x;s++)"zIndex"in u[s]&&(q.push(u[s].zIndex),0>u[s].zIndex&&
+(e[u[s].zIndex]=u[s]));for(q.sort(C);0>q[p];)if(b=e[q[p++] ],l.push(b.apply(d,n)),v)return v=f,l;for(s=0;s<x;s++)if(b=u[s],"zIndex"in b)if(b.zIndex==q[p]){l.push(b.apply(d,n));if(v)break;do if(p++,(b=e[q[p] ])&&l.push(b.apply(d,n)),v)break;while(b)}else e[b.zIndex]=b;else if(l.push(b.apply(d,n)),v)break;v=f;a=r;return l};w._events=y;w.listeners=function(a){a=a.split(k);var d=y,f,n,u,p,b,q,e,l=[d],r=[];u=0;for(p=a.length;u<p;u++){e=[];b=0;for(q=l.length;b<q;b++)for(d=l[b].n,f=[d[a[u] ],d["*"] ],n=2;n--;)if(d=
+f[n])e.push(d),r=r.concat(d.f||[]);l=e}return r};w.on=function(a,d){a=String(a);if("function"!=typeof d)return function(){};for(var f=a.split(L),n=0,u=f.length;n<u;n++)(function(a){a=a.split(k);for(var b=y,f,e=0,l=a.length;e<l;e++)b=b.n,b=b.hasOwnProperty(a[e])&&b[a[e] ]||(b[a[e] ]={n:{}});b.f=b.f||[];e=0;for(l=b.f.length;e<l;e++)if(b.f[e]==d){f=!0;break}!f&&b.f.push(d)})(f[n]);return function(a){+a==+a&&(d.zIndex=+a)}};w.f=function(a){var d=[].slice.call(arguments,1);return function(){w.apply(null,
+[a,null].concat(d).concat([].slice.call(arguments,0)))}};w.stop=function(){v=1};w.nt=function(k){return k?(new RegExp("(?:\\.|\\/|^)"+k+"(?:\\.|\\/|$)")).test(a):a};w.nts=function(){return a.split(k)};w.off=w.unbind=function(a,d){if(a){var f=a.split(L);if(1<f.length)for(var n=0,u=f.length;n<u;n++)w.off(f[n],d);else{for(var f=a.split(k),p,b,q,e,l=[y],n=0,u=f.length;n<u;n++)for(e=0;e<l.length;e+=q.length-2){q=[e,1];p=l[e].n;if("*"!=f[n])p[f[n] ]&&q.push(p[f[n] ]);else for(b in p)p.hasOwnProperty(b)&&
+q.push(p[b]);l.splice.apply(l,q)}n=0;for(u=l.length;n<u;n++)for(p=l[n];p.n;){if(d){if(p.f){e=0;for(f=p.f.length;e<f;e++)if(p.f[e]==d){p.f.splice(e,1);break}!p.f.length&&delete p.f}for(b in p.n)if(p.n.hasOwnProperty(b)&&p.n[b].f){q=p.n[b].f;e=0;for(f=q.length;e<f;e++)if(q[e]==d){q.splice(e,1);break}!q.length&&delete p.n[b].f}}else for(b in delete p.f,p.n)p.n.hasOwnProperty(b)&&p.n[b].f&&delete p.n[b].f;p=p.n}}}else w._events=y={n:{}}};w.once=function(a,d){var f=function(){w.unbind(a,f);return d.apply(this,
+arguments)};return w.on(a,f)};w.version="0.4.2";w.toString=function(){return"You are running Eve 0.4.2"};"undefined"!=typeof module&&module.exports?module.exports=w:"function"===typeof define&&define.amd?define("eve",[],function(){return w}):N.eve=w})(this);
+(function(N,k){"function"===typeof define&&define.amd?define("Snap.svg",["eve"],function(L){return k(N,L)}):k(N,N.eve)})(this,function(N,k){var L=function(a){var k={},y=N.requestAnimationFrame||N.webkitRequestAnimationFrame||N.mozRequestAnimationFrame||N.oRequestAnimationFrame||N.msRequestAnimationFrame||function(a){setTimeout(a,16)},M=Array.isArray||function(a){return a instanceof Array||"[object Array]"==Object.prototype.toString.call(a)},A=0,w="M"+(+new Date).toString(36),z=function(a){if(null==
+a)return this.s;var b=this.s-a;this.b+=this.dur*b;this.B+=this.dur*b;this.s=a},d=function(a){if(null==a)return this.spd;this.spd=a},f=function(a){if(null==a)return this.dur;this.s=this.s*a/this.dur;this.dur=a},n=function(){delete k[this.id];this.update();a("mina.stop."+this.id,this)},u=function(){this.pdif||(delete k[this.id],this.update(),this.pdif=this.get()-this.b)},p=function(){this.pdif&&(this.b=this.get()-this.pdif,delete this.pdif,k[this.id]=this)},b=function(){var a;if(M(this.start)){a=[];
+for(var b=0,e=this.start.length;b<e;b++)a[b]=+this.start[b]+(this.end[b]-this.start[b])*this.easing(this.s)}else a=+this.start+(this.end-this.start)*this.easing(this.s);this.set(a)},q=function(){var l=0,b;for(b in k)if(k.hasOwnProperty(b)){var e=k[b],f=e.get();l++;e.s=(f-e.b)/(e.dur/e.spd);1<=e.s&&(delete k[b],e.s=1,l--,function(b){setTimeout(function(){a("mina.finish."+b.id,b)})}(e));e.update()}l&&y(q)},e=function(a,r,s,x,G,h,J){a={id:w+(A++).toString(36),start:a,end:r,b:s,s:0,dur:x-s,spd:1,get:G,
+set:h,easing:J||e.linear,status:z,speed:d,duration:f,stop:n,pause:u,resume:p,update:b};k[a.id]=a;r=0;for(var K in k)if(k.hasOwnProperty(K)&&(r++,2==r))break;1==r&&y(q);return a};e.time=Date.now||function(){return+new Date};e.getById=function(a){return k[a]||null};e.linear=function(a){return a};e.easeout=function(a){return Math.pow(a,1.7)};e.easein=function(a){return Math.pow(a,0.48)};e.easeinout=function(a){if(1==a)return 1;if(0==a)return 0;var b=0.48-a/1.04,e=Math.sqrt(0.1734+b*b);a=e-b;a=Math.pow(Math.abs(a),
+1/3)*(0>a?-1:1);b=-e-b;b=Math.pow(Math.abs(b),1/3)*(0>b?-1:1);a=a+b+0.5;return 3*(1-a)*a*a+a*a*a};e.backin=function(a){return 1==a?1:a*a*(2.70158*a-1.70158)};e.backout=function(a){if(0==a)return 0;a-=1;return a*a*(2.70158*a+1.70158)+1};e.elastic=function(a){return a==!!a?a:Math.pow(2,-10*a)*Math.sin(2*(a-0.075)*Math.PI/0.3)+1};e.bounce=function(a){a<1/2.75?a*=7.5625*a:a<2/2.75?(a-=1.5/2.75,a=7.5625*a*a+0.75):a<2.5/2.75?(a-=2.25/2.75,a=7.5625*a*a+0.9375):(a-=2.625/2.75,a=7.5625*a*a+0.984375);return a};
+return N.mina=e}("undefined"==typeof k?function(){}:k),C=function(){function a(c,t){if(c){if(c.tagName)return x(c);if(y(c,"array")&&a.set)return a.set.apply(a,c);if(c instanceof e)return c;if(null==t)return c=G.doc.querySelector(c),x(c)}return new s(null==c?"100%":c,null==t?"100%":t)}function v(c,a){if(a){"#text"==c&&(c=G.doc.createTextNode(a.text||""));"string"==typeof c&&(c=v(c));if("string"==typeof a)return"xlink:"==a.substring(0,6)?c.getAttributeNS(m,a.substring(6)):"xml:"==a.substring(0,4)?c.getAttributeNS(la,
+a.substring(4)):c.getAttribute(a);for(var da in a)if(a[h](da)){var b=J(a[da]);b?"xlink:"==da.substring(0,6)?c.setAttributeNS(m,da.substring(6),b):"xml:"==da.substring(0,4)?c.setAttributeNS(la,da.substring(4),b):c.setAttribute(da,b):c.removeAttribute(da)}}else c=G.doc.createElementNS(la,c);return c}function y(c,a){a=J.prototype.toLowerCase.call(a);return"finite"==a?isFinite(c):"array"==a&&(c instanceof Array||Array.isArray&&Array.isArray(c))?!0:"null"==a&&null===c||a==typeof c&&null!==c||"object"==
+a&&c===Object(c)||$.call(c).slice(8,-1).toLowerCase()==a}function M(c){if("function"==typeof c||Object(c)!==c)return c;var a=new c.constructor,b;for(b in c)c[h](b)&&(a[b]=M(c[b]));return a}function A(c,a,b){function m(){var e=Array.prototype.slice.call(arguments,0),f=e.join("\u2400"),d=m.cache=m.cache||{},l=m.count=m.count||[];if(d[h](f)){a:for(var e=l,l=f,B=0,H=e.length;B<H;B++)if(e[B]===l){e.push(e.splice(B,1)[0]);break a}return b?b(d[f]):d[f]}1E3<=l.length&&delete d[l.shift()];l.push(f);d[f]=c.apply(a,
+e);return b?b(d[f]):d[f]}return m}function w(c,a,b,m,e,f){return null==e?(c-=b,a-=m,c||a?(180*I.atan2(-a,-c)/C+540)%360:0):w(c,a,e,f)-w(b,m,e,f)}function z(c){return c%360*C/180}function d(c){var a=[];c=c.replace(/(?:^|\s)(\w+)\(([^)]+)\)/g,function(c,b,m){m=m.split(/\s*,\s*|\s+/);"rotate"==b&&1==m.length&&m.push(0,0);"scale"==b&&(2<m.length?m=m.slice(0,2):2==m.length&&m.push(0,0),1==m.length&&m.push(m[0],0,0));"skewX"==b?a.push(["m",1,0,I.tan(z(m[0])),1,0,0]):"skewY"==b?a.push(["m",1,I.tan(z(m[0])),
+0,1,0,0]):a.push([b.charAt(0)].concat(m));return c});return a}function f(c,t){var b=O(c),m=new a.Matrix;if(b)for(var e=0,f=b.length;e<f;e++){var h=b[e],d=h.length,B=J(h[0]).toLowerCase(),H=h[0]!=B,l=H?m.invert():0,E;"t"==B&&2==d?m.translate(h[1],0):"t"==B&&3==d?H?(d=l.x(0,0),B=l.y(0,0),H=l.x(h[1],h[2]),l=l.y(h[1],h[2]),m.translate(H-d,l-B)):m.translate(h[1],h[2]):"r"==B?2==d?(E=E||t,m.rotate(h[1],E.x+E.width/2,E.y+E.height/2)):4==d&&(H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.rotate(h[1],H,l)):m.rotate(h[1],
+h[2],h[3])):"s"==B?2==d||3==d?(E=E||t,m.scale(h[1],h[d-1],E.x+E.width/2,E.y+E.height/2)):4==d?H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.scale(h[1],h[1],H,l)):m.scale(h[1],h[1],h[2],h[3]):5==d&&(H?(H=l.x(h[3],h[4]),l=l.y(h[3],h[4]),m.scale(h[1],h[2],H,l)):m.scale(h[1],h[2],h[3],h[4])):"m"==B&&7==d&&m.add(h[1],h[2],h[3],h[4],h[5],h[6])}return m}function n(c,t){if(null==t){var m=!0;t="linearGradient"==c.type||"radialGradient"==c.type?c.node.getAttribute("gradientTransform"):"pattern"==c.type?c.node.getAttribute("patternTransform"):
+c.node.getAttribute("transform");if(!t)return new a.Matrix;t=d(t)}else t=a._.rgTransform.test(t)?J(t).replace(/\.{3}|\u2026/g,c._.transform||aa):d(t),y(t,"array")&&(t=a.path?a.path.toString.call(t):J(t)),c._.transform=t;var b=f(t,c.getBBox(1));if(m)return b;c.matrix=b}function u(c){c=c.node.ownerSVGElement&&x(c.node.ownerSVGElement)||c.node.parentNode&&x(c.node.parentNode)||a.select("svg")||a(0,0);var t=c.select("defs"),t=null==t?!1:t.node;t||(t=r("defs",c.node).node);return t}function p(c){return c.node.ownerSVGElement&&
+x(c.node.ownerSVGElement)||a.select("svg")}function b(c,a,m){function b(c){if(null==c)return aa;if(c==+c)return c;v(B,{width:c});try{return B.getBBox().width}catch(a){return 0}}function h(c){if(null==c)return aa;if(c==+c)return c;v(B,{height:c});try{return B.getBBox().height}catch(a){return 0}}function e(b,B){null==a?d[b]=B(c.attr(b)||0):b==a&&(d=B(null==m?c.attr(b)||0:m))}var f=p(c).node,d={},B=f.querySelector(".svg---mgr");B||(B=v("rect"),v(B,{x:-9E9,y:-9E9,width:10,height:10,"class":"svg---mgr",
+fill:"none"}),f.appendChild(B));switch(c.type){case "rect":e("rx",b),e("ry",h);case "image":e("width",b),e("height",h);case "text":e("x",b);e("y",h);break;case "circle":e("cx",b);e("cy",h);e("r",b);break;case "ellipse":e("cx",b);e("cy",h);e("rx",b);e("ry",h);break;case "line":e("x1",b);e("x2",b);e("y1",h);e("y2",h);break;case "marker":e("refX",b);e("markerWidth",b);e("refY",h);e("markerHeight",h);break;case "radialGradient":e("fx",b);e("fy",h);break;case "tspan":e("dx",b);e("dy",h);break;default:e(a,
+b)}f.removeChild(B);return d}function q(c){y(c,"array")||(c=Array.prototype.slice.call(arguments,0));for(var a=0,b=0,m=this.node;this[a];)delete this[a++];for(a=0;a<c.length;a++)"set"==c[a].type?c[a].forEach(function(c){m.appendChild(c.node)}):m.appendChild(c[a].node);for(var h=m.childNodes,a=0;a<h.length;a++)this[b++]=x(h[a]);return this}function e(c){if(c.snap in E)return E[c.snap];var a=this.id=V(),b;try{b=c.ownerSVGElement}catch(m){}this.node=c;b&&(this.paper=new s(b));this.type=c.tagName;this.anims=
+{};this._={transform:[]};c.snap=a;E[a]=this;"g"==this.type&&(this.add=q);if(this.type in{g:1,mask:1,pattern:1})for(var e in s.prototype)s.prototype[h](e)&&(this[e]=s.prototype[e])}function l(c){this.node=c}function r(c,a){var b=v(c);a.appendChild(b);return x(b)}function s(c,a){var b,m,f,d=s.prototype;if(c&&"svg"==c.tagName){if(c.snap in E)return E[c.snap];var l=c.ownerDocument;b=new e(c);m=c.getElementsByTagName("desc")[0];f=c.getElementsByTagName("defs")[0];m||(m=v("desc"),m.appendChild(l.createTextNode("Created with Snap")),
+b.node.appendChild(m));f||(f=v("defs"),b.node.appendChild(f));b.defs=f;for(var ca in d)d[h](ca)&&(b[ca]=d[ca]);b.paper=b.root=b}else b=r("svg",G.doc.body),v(b.node,{height:a,version:1.1,width:c,xmlns:la});return b}function x(c){return!c||c instanceof e||c instanceof l?c:c.tagName&&"svg"==c.tagName.toLowerCase()?new s(c):c.tagName&&"object"==c.tagName.toLowerCase()&&"image/svg+xml"==c.type?new s(c.contentDocument.getElementsByTagName("svg")[0]):new e(c)}a.version="0.3.0";a.toString=function(){return"Snap v"+
+this.version};a._={};var G={win:N,doc:N.document};a._.glob=G;var h="hasOwnProperty",J=String,K=parseFloat,U=parseInt,I=Math,P=I.max,Q=I.min,Y=I.abs,C=I.PI,aa="",$=Object.prototype.toString,F=/^\s*((#[a-f\d]{6})|(#[a-f\d]{3})|rgba?\(\s*([\d\.]+%?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+%?(?:\s*,\s*[\d\.]+%?)?)\s*\)|hsba?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\)|hsla?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\))\s*$/i;a._.separator=
+RegExp("[,\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]+");var S=RegExp("[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*"),X={hs:1,rg:1},W=RegExp("([a-z])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)",
+"ig"),ma=RegExp("([rstm])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)","ig"),Z=RegExp("(-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?)[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*",
+"ig"),na=0,ba="S"+(+new Date).toString(36),V=function(){return ba+(na++).toString(36)},m="http://www.w3.org/1999/xlink",la="http://www.w3.org/2000/svg",E={},ca=a.url=function(c){return"url('#"+c+"')"};a._.$=v;a._.id=V;a.format=function(){var c=/\{([^\}]+)\}/g,a=/(?:(?:^|\.)(.+?)(?=\[|\.|$|\()|\[('|")(.+?)\2\])(\(\))?/g,b=function(c,b,m){var h=m;b.replace(a,function(c,a,b,m,t){a=a||m;h&&(a in h&&(h=h[a]),"function"==typeof h&&t&&(h=h()))});return h=(null==h||h==m?c:h)+""};return function(a,m){return J(a).replace(c,
+function(c,a){return b(c,a,m)})}}();a._.clone=M;a._.cacher=A;a.rad=z;a.deg=function(c){return 180*c/C%360};a.angle=w;a.is=y;a.snapTo=function(c,a,b){b=y(b,"finite")?b:10;if(y(c,"array"))for(var m=c.length;m--;){if(Y(c[m]-a)<=b)return c[m]}else{c=+c;m=a%c;if(m<b)return a-m;if(m>c-b)return a-m+c}return a};a.getRGB=A(function(c){if(!c||(c=J(c)).indexOf("-")+1)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};if("none"==c)return{r:-1,g:-1,b:-1,hex:"none",toString:ka};!X[h](c.toLowerCase().substring(0,
+2))&&"#"!=c.charAt()&&(c=T(c));if(!c)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};var b,m,e,f,d;if(c=c.match(F)){c[2]&&(e=U(c[2].substring(5),16),m=U(c[2].substring(3,5),16),b=U(c[2].substring(1,3),16));c[3]&&(e=U((d=c[3].charAt(3))+d,16),m=U((d=c[3].charAt(2))+d,16),b=U((d=c[3].charAt(1))+d,16));c[4]&&(d=c[4].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b*=2.55),m=K(d[1]),"%"==d[1].slice(-1)&&(m*=2.55),e=K(d[2]),"%"==d[2].slice(-1)&&(e*=2.55),"rgba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),
+d[3]&&"%"==d[3].slice(-1)&&(f/=100));if(c[5])return d=c[5].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsb2rgb(b,m,e,f);if(c[6])return d=c[6].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),
+"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsla"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsl2rgb(b,m,e,f);b=Q(I.round(b),255);m=Q(I.round(m),255);e=Q(I.round(e),255);f=Q(P(f,0),1);c={r:b,g:m,b:e,toString:ka};c.hex="#"+(16777216|e|m<<8|b<<16).toString(16).slice(1);c.opacity=y(f,"finite")?f:1;return c}return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka}},a);a.hsb=A(function(c,b,m){return a.hsb2rgb(c,b,m).hex});a.hsl=A(function(c,b,m){return a.hsl2rgb(c,
+b,m).hex});a.rgb=A(function(c,a,b,m){if(y(m,"finite")){var e=I.round;return"rgba("+[e(c),e(a),e(b),+m.toFixed(2)]+")"}return"#"+(16777216|b|a<<8|c<<16).toString(16).slice(1)});var T=function(c){var a=G.doc.getElementsByTagName("head")[0]||G.doc.getElementsByTagName("svg")[0];T=A(function(c){if("red"==c.toLowerCase())return"rgb(255, 0, 0)";a.style.color="rgb(255, 0, 0)";a.style.color=c;c=G.doc.defaultView.getComputedStyle(a,aa).getPropertyValue("color");return"rgb(255, 0, 0)"==c?null:c});return T(c)},
+qa=function(){return"hsb("+[this.h,this.s,this.b]+")"},ra=function(){return"hsl("+[this.h,this.s,this.l]+")"},ka=function(){return 1==this.opacity||null==this.opacity?this.hex:"rgba("+[this.r,this.g,this.b,this.opacity]+")"},D=function(c,b,m){null==b&&y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&(m=c.b,b=c.g,c=c.r);null==b&&y(c,string)&&(m=a.getRGB(c),c=m.r,b=m.g,m=m.b);if(1<c||1<b||1<m)c/=255,b/=255,m/=255;return[c,b,m]},oa=function(c,b,m,e){c=I.round(255*c);b=I.round(255*b);m=I.round(255*m);c={r:c,
+g:b,b:m,opacity:y(e,"finite")?e:1,hex:a.rgb(c,b,m),toString:ka};y(e,"finite")&&(c.opacity=e);return c};a.color=function(c){var b;y(c,"object")&&"h"in c&&"s"in c&&"b"in c?(b=a.hsb2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):y(c,"object")&&"h"in c&&"s"in c&&"l"in c?(b=a.hsl2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):(y(c,"string")&&(c=a.getRGB(c)),y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&!("error"in c)?(b=a.rgb2hsl(c),c.h=b.h,c.s=b.s,c.l=b.l,b=a.rgb2hsb(c),c.v=b.b):(c={hex:"none"},
+c.r=c.g=c.b=c.h=c.s=c.v=c.l=-1,c.error=1));c.toString=ka;return c};a.hsb2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"b"in c&&(b=c.b,a=c.s,c=c.h,m=c.o);var e,h,d;c=360*c%360/60;d=b*a;a=d*(1-Y(c%2-1));b=e=h=b-d;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.hsl2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"l"in c&&(b=c.l,a=c.s,c=c.h);if(1<c||1<a||1<b)c/=360,a/=100,b/=100;var e,h,d;c=360*c%360/60;d=2*a*(0.5>b?b:1-b);a=d*(1-Y(c%2-1));b=e=
+h=b-d/2;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.rgb2hsb=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e;m=P(c,a,b);e=m-Q(c,a,b);c=((0==e?0:m==c?(a-b)/e:m==a?(b-c)/e+2:(c-a)/e+4)+360)%6*60/360;return{h:c,s:0==e?0:e/m,b:m,toString:qa}};a.rgb2hsl=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e,h;m=P(c,a,b);e=Q(c,a,b);h=m-e;c=((0==h?0:m==c?(a-b)/h:m==a?(b-c)/h+2:(c-a)/h+4)+360)%6*60/360;m=(m+e)/2;return{h:c,s:0==h?0:0.5>m?h/(2*m):h/(2-2*
+m),l:m,toString:ra}};a.parsePathString=function(c){if(!c)return null;var b=a.path(c);if(b.arr)return a.path.clone(b.arr);var m={a:7,c:6,o:2,h:1,l:2,m:2,r:4,q:4,s:4,t:2,v:1,u:3,z:0},e=[];y(c,"array")&&y(c[0],"array")&&(e=a.path.clone(c));e.length||J(c).replace(W,function(c,a,b){var h=[];c=a.toLowerCase();b.replace(Z,function(c,a){a&&h.push(+a)});"m"==c&&2<h.length&&(e.push([a].concat(h.splice(0,2))),c="l",a="m"==a?"l":"L");"o"==c&&1==h.length&&e.push([a,h[0] ]);if("r"==c)e.push([a].concat(h));else for(;h.length>=
+m[c]&&(e.push([a].concat(h.splice(0,m[c]))),m[c]););});e.toString=a.path.toString;b.arr=a.path.clone(e);return e};var O=a.parseTransformString=function(c){if(!c)return null;var b=[];y(c,"array")&&y(c[0],"array")&&(b=a.path.clone(c));b.length||J(c).replace(ma,function(c,a,m){var e=[];a.toLowerCase();m.replace(Z,function(c,a){a&&e.push(+a)});b.push([a].concat(e))});b.toString=a.path.toString;return b};a._.svgTransform2string=d;a._.rgTransform=RegExp("^[a-z][\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*-?\\.?\\d",
+"i");a._.transform2matrix=f;a._unit2px=b;a._.getSomeDefs=u;a._.getSomeSVG=p;a.select=function(c){return x(G.doc.querySelector(c))};a.selectAll=function(c){c=G.doc.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};setInterval(function(){for(var c in E)if(E[h](c)){var a=E[c],b=a.node;("svg"!=a.type&&!b.ownerSVGElement||"svg"==a.type&&(!b.parentNode||"ownerSVGElement"in b.parentNode&&!b.ownerSVGElement))&&delete E[c]}},1E4);(function(c){function m(c){function a(c,
+b){var m=v(c.node,b);(m=(m=m&&m.match(d))&&m[2])&&"#"==m.charAt()&&(m=m.substring(1))&&(f[m]=(f[m]||[]).concat(function(a){var m={};m[b]=ca(a);v(c.node,m)}))}function b(c){var a=v(c.node,"xlink:href");a&&"#"==a.charAt()&&(a=a.substring(1))&&(f[a]=(f[a]||[]).concat(function(a){c.attr("xlink:href","#"+a)}))}var e=c.selectAll("*"),h,d=/^\s*url\(("|'|)(.*)\1\)\s*$/;c=[];for(var f={},l=0,E=e.length;l<E;l++){h=e[l];a(h,"fill");a(h,"stroke");a(h,"filter");a(h,"mask");a(h,"clip-path");b(h);var t=v(h.node,
+"id");t&&(v(h.node,{id:h.id}),c.push({old:t,id:h.id}))}l=0;for(E=c.length;l<E;l++)if(e=f[c[l].old])for(h=0,t=e.length;h<t;h++)e[h](c[l].id)}function e(c,a,b){return function(m){m=m.slice(c,a);1==m.length&&(m=m[0]);return b?b(m):m}}function d(c){return function(){var a=c?"<"+this.type:"",b=this.node.attributes,m=this.node.childNodes;if(c)for(var e=0,h=b.length;e<h;e++)a+=" "+b[e].name+'="'+b[e].value.replace(/"/g,'\\"')+'"';if(m.length){c&&(a+=">");e=0;for(h=m.length;e<h;e++)3==m[e].nodeType?a+=m[e].nodeValue:
+1==m[e].nodeType&&(a+=x(m[e]).toString());c&&(a+="</"+this.type+">")}else c&&(a+="/>");return a}}c.attr=function(c,a){if(!c)return this;if(y(c,"string"))if(1<arguments.length){var b={};b[c]=a;c=b}else return k("snap.util.getattr."+c,this).firstDefined();for(var m in c)c[h](m)&&k("snap.util.attr."+m,this,c[m]);return this};c.getBBox=function(c){if(!a.Matrix||!a.path)return this.node.getBBox();var b=this,m=new a.Matrix;if(b.removed)return a._.box();for(;"use"==b.type;)if(c||(m=m.add(b.transform().localMatrix.translate(b.attr("x")||
+0,b.attr("y")||0))),b.original)b=b.original;else var e=b.attr("xlink:href"),b=b.original=b.node.ownerDocument.getElementById(e.substring(e.indexOf("#")+1));var e=b._,h=a.path.get[b.type]||a.path.get.deflt;try{if(c)return e.bboxwt=h?a.path.getBBox(b.realPath=h(b)):a._.box(b.node.getBBox()),a._.box(e.bboxwt);b.realPath=h(b);b.matrix=b.transform().localMatrix;e.bbox=a.path.getBBox(a.path.map(b.realPath,m.add(b.matrix)));return a._.box(e.bbox)}catch(d){return a._.box()}};var f=function(){return this.string};
+c.transform=function(c){var b=this._;if(null==c){var m=this;c=new a.Matrix(this.node.getCTM());for(var e=n(this),h=[e],d=new a.Matrix,l=e.toTransformString(),b=J(e)==J(this.matrix)?J(b.transform):l;"svg"!=m.type&&(m=m.parent());)h.push(n(m));for(m=h.length;m--;)d.add(h[m]);return{string:b,globalMatrix:c,totalMatrix:d,localMatrix:e,diffMatrix:c.clone().add(e.invert()),global:c.toTransformString(),total:d.toTransformString(),local:l,toString:f}}c instanceof a.Matrix?this.matrix=c:n(this,c);this.node&&
+("linearGradient"==this.type||"radialGradient"==this.type?v(this.node,{gradientTransform:this.matrix}):"pattern"==this.type?v(this.node,{patternTransform:this.matrix}):v(this.node,{transform:this.matrix}));return this};c.parent=function(){return x(this.node.parentNode)};c.append=c.add=function(c){if(c){if("set"==c.type){var a=this;c.forEach(function(c){a.add(c)});return this}c=x(c);this.node.appendChild(c.node);c.paper=this.paper}return this};c.appendTo=function(c){c&&(c=x(c),c.append(this));return this};
+c.prepend=function(c){if(c){if("set"==c.type){var a=this,b;c.forEach(function(c){b?b.after(c):a.prepend(c);b=c});return this}c=x(c);var m=c.parent();this.node.insertBefore(c.node,this.node.firstChild);this.add&&this.add();c.paper=this.paper;this.parent()&&this.parent().add();m&&m.add()}return this};c.prependTo=function(c){c=x(c);c.prepend(this);return this};c.before=function(c){if("set"==c.type){var a=this;c.forEach(function(c){var b=c.parent();a.node.parentNode.insertBefore(c.node,a.node);b&&b.add()});
+this.parent().add();return this}c=x(c);var b=c.parent();this.node.parentNode.insertBefore(c.node,this.node);this.parent()&&this.parent().add();b&&b.add();c.paper=this.paper;return this};c.after=function(c){c=x(c);var a=c.parent();this.node.nextSibling?this.node.parentNode.insertBefore(c.node,this.node.nextSibling):this.node.parentNode.appendChild(c.node);this.parent()&&this.parent().add();a&&a.add();c.paper=this.paper;return this};c.insertBefore=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,
+c.node);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.insertAfter=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,c.node.nextSibling);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.remove=function(){var c=this.parent();this.node.parentNode&&this.node.parentNode.removeChild(this.node);delete this.paper;this.removed=!0;c&&c.add();return this};c.select=function(c){return x(this.node.querySelector(c))};c.selectAll=
+function(c){c=this.node.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};c.asPX=function(c,a){null==a&&(a=this.attr(c));return+b(this,c,a)};c.use=function(){var c,a=this.node.id;a||(a=this.id,v(this.node,{id:a}));c="linearGradient"==this.type||"radialGradient"==this.type||"pattern"==this.type?r(this.type,this.node.parentNode):r("use",this.node.parentNode);v(c.node,{"xlink:href":"#"+a});c.original=this;return c};var l=/\S+/g;c.addClass=function(c){var a=(c||
+"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h,d;if(a.length){for(e=0;d=a[e++];)h=m.indexOf(d),~h||m.push(d);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.removeClass=function(c){var a=(c||"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h;if(m.length){for(e=0;h=a[e++];)h=m.indexOf(h),~h&&m.splice(h,1);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.hasClass=function(c){return!!~(this.node.className.baseVal.match(l)||[]).indexOf(c)};
+c.toggleClass=function(c,a){if(null!=a)return a?this.addClass(c):this.removeClass(c);var b=(c||"").match(l)||[],m=this.node,e=m.className.baseVal,h=e.match(l)||[],d,f,E;for(d=0;E=b[d++];)f=h.indexOf(E),~f?h.splice(f,1):h.push(E);b=h.join(" ");e!=b&&(m.className.baseVal=b);return this};c.clone=function(){var c=x(this.node.cloneNode(!0));v(c.node,"id")&&v(c.node,{id:c.id});m(c);c.insertAfter(this);return c};c.toDefs=function(){u(this).appendChild(this.node);return this};c.pattern=c.toPattern=function(c,
+a,b,m){var e=r("pattern",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,c=c.x);v(e.node,{x:c,y:a,width:b,height:m,patternUnits:"userSpaceOnUse",id:e.id,viewBox:[c,a,b,m].join(" ")});e.node.appendChild(this.node);return e};c.marker=function(c,a,b,m,e,h){var d=r("marker",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,e=c.refX||c.cx,h=c.refY||c.cy,c=c.x);v(d.node,{viewBox:[c,a,b,m].join(" "),markerWidth:b,markerHeight:m,
+orient:"auto",refX:e||0,refY:h||0,id:d.id});d.node.appendChild(this.node);return d};var E=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);this.attr=c;this.dur=a;b&&(this.easing=b);m&&(this.callback=m)};a._.Animation=E;a.animation=function(c,a,b,m){return new E(c,a,b,m)};c.inAnim=function(){var c=[],a;for(a in this.anims)this.anims[h](a)&&function(a){c.push({anim:new E(a._attrs,a.dur,a.easing,a._callback),mina:a,curStatus:a.status(),status:function(c){return a.status(c)},stop:function(){a.stop()}})}(this.anims[a]);
+return c};a.animate=function(c,a,b,m,e,h){"function"!=typeof e||e.length||(h=e,e=L.linear);var d=L.time();c=L(c,a,d,d+m,L.time,b,e);h&&k.once("mina.finish."+c.id,h);return c};c.stop=function(){for(var c=this.inAnim(),a=0,b=c.length;a<b;a++)c[a].stop();return this};c.animate=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);c instanceof E&&(m=c.callback,b=c.easing,a=b.dur,c=c.attr);var d=[],f=[],l={},t,ca,n,T=this,q;for(q in c)if(c[h](q)){T.equal?(n=T.equal(q,J(c[q])),t=n.from,ca=
+n.to,n=n.f):(t=+T.attr(q),ca=+c[q]);var la=y(t,"array")?t.length:1;l[q]=e(d.length,d.length+la,n);d=d.concat(t);f=f.concat(ca)}t=L.time();var p=L(d,f,t,t+a,L.time,function(c){var a={},b;for(b in l)l[h](b)&&(a[b]=l[b](c));T.attr(a)},b);T.anims[p.id]=p;p._attrs=c;p._callback=m;k("snap.animcreated."+T.id,p);k.once("mina.finish."+p.id,function(){delete T.anims[p.id];m&&m.call(T)});k.once("mina.stop."+p.id,function(){delete T.anims[p.id]});return T};var T={};c.data=function(c,b){var m=T[this.id]=T[this.id]||
+{};if(0==arguments.length)return k("snap.data.get."+this.id,this,m,null),m;if(1==arguments.length){if(a.is(c,"object")){for(var e in c)c[h](e)&&this.data(e,c[e]);return this}k("snap.data.get."+this.id,this,m[c],c);return m[c]}m[c]=b;k("snap.data.set."+this.id,this,b,c);return this};c.removeData=function(c){null==c?T[this.id]={}:T[this.id]&&delete T[this.id][c];return this};c.outerSVG=c.toString=d(1);c.innerSVG=d()})(e.prototype);a.parse=function(c){var a=G.doc.createDocumentFragment(),b=!0,m=G.doc.createElement("div");
+c=J(c);c.match(/^\s*<\s*svg(?:\s|>)/)||(c="<svg>"+c+"</svg>",b=!1);m.innerHTML=c;if(c=m.getElementsByTagName("svg")[0])if(b)a=c;else for(;c.firstChild;)a.appendChild(c.firstChild);m.innerHTML=aa;return new l(a)};l.prototype.select=e.prototype.select;l.prototype.selectAll=e.prototype.selectAll;a.fragment=function(){for(var c=Array.prototype.slice.call(arguments,0),b=G.doc.createDocumentFragment(),m=0,e=c.length;m<e;m++){var h=c[m];h.node&&h.node.nodeType&&b.appendChild(h.node);h.nodeType&&b.appendChild(h);
+"string"==typeof h&&b.appendChild(a.parse(h).node)}return new l(b)};a._.make=r;a._.wrap=x;s.prototype.el=function(c,a){var b=r(c,this.node);a&&b.attr(a);return b};k.on("snap.util.getattr",function(){var c=k.nt(),c=c.substring(c.lastIndexOf(".")+1),a=c.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});return pa[h](a)?this.node.ownerDocument.defaultView.getComputedStyle(this.node,null).getPropertyValue(a):v(this.node,c)});var pa={"alignment-baseline":0,"baseline-shift":0,clip:0,"clip-path":0,
+"clip-rule":0,color:0,"color-interpolation":0,"color-interpolation-filters":0,"color-profile":0,"color-rendering":0,cursor:0,direction:0,display:0,"dominant-baseline":0,"enable-background":0,fill:0,"fill-opacity":0,"fill-rule":0,filter:0,"flood-color":0,"flood-opacity":0,font:0,"font-family":0,"font-size":0,"font-size-adjust":0,"font-stretch":0,"font-style":0,"font-variant":0,"font-weight":0,"glyph-orientation-horizontal":0,"glyph-orientation-vertical":0,"image-rendering":0,kerning:0,"letter-spacing":0,
+"lighting-color":0,marker:0,"marker-end":0,"marker-mid":0,"marker-start":0,mask:0,opacity:0,overflow:0,"pointer-events":0,"shape-rendering":0,"stop-color":0,"stop-opacity":0,stroke:0,"stroke-dasharray":0,"stroke-dashoffset":0,"stroke-linecap":0,"stroke-linejoin":0,"stroke-miterlimit":0,"stroke-opacity":0,"stroke-width":0,"text-anchor":0,"text-decoration":0,"text-rendering":0,"unicode-bidi":0,visibility:0,"word-spacing":0,"writing-mode":0};k.on("snap.util.attr",function(c){var a=k.nt(),b={},a=a.substring(a.lastIndexOf(".")+
+1);b[a]=c;var m=a.replace(/-(\w)/gi,function(c,a){return a.toUpperCase()}),a=a.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});pa[h](a)?this.node.style[m]=null==c?aa:c:v(this.node,b)});a.ajax=function(c,a,b,m){var e=new XMLHttpRequest,h=V();if(e){if(y(a,"function"))m=b,b=a,a=null;else if(y(a,"object")){var d=[],f;for(f in a)a.hasOwnProperty(f)&&d.push(encodeURIComponent(f)+"="+encodeURIComponent(a[f]));a=d.join("&")}e.open(a?"POST":"GET",c,!0);a&&(e.setRequestHeader("X-Requested-With","XMLHttpRequest"),
+e.setRequestHeader("Content-type","application/x-www-form-urlencoded"));b&&(k.once("snap.ajax."+h+".0",b),k.once("snap.ajax."+h+".200",b),k.once("snap.ajax."+h+".304",b));e.onreadystatechange=function(){4==e.readyState&&k("snap.ajax."+h+"."+e.status,m,e)};if(4==e.readyState)return e;e.send(a);return e}};a.load=function(c,b,m){a.ajax(c,function(c){c=a.parse(c.responseText);m?b.call(m,c):b(c)})};a.getElementByPoint=function(c,a){var b,m,e=G.doc.elementFromPoint(c,a);if(G.win.opera&&"svg"==e.tagName){b=
+e;m=b.getBoundingClientRect();b=b.ownerDocument;var h=b.body,d=b.documentElement;b=m.top+(g.win.pageYOffset||d.scrollTop||h.scrollTop)-(d.clientTop||h.clientTop||0);m=m.left+(g.win.pageXOffset||d.scrollLeft||h.scrollLeft)-(d.clientLeft||h.clientLeft||0);h=e.createSVGRect();h.x=c-m;h.y=a-b;h.width=h.height=1;b=e.getIntersectionList(h,null);b.length&&(e=b[b.length-1])}return e?x(e):null};a.plugin=function(c){c(a,e,s,G,l)};return G.win.Snap=a}();C.plugin(function(a,k,y,M,A){function w(a,d,f,b,q,e){null==
+d&&"[object SVGMatrix]"==z.call(a)?(this.a=a.a,this.b=a.b,this.c=a.c,this.d=a.d,this.e=a.e,this.f=a.f):null!=a?(this.a=+a,this.b=+d,this.c=+f,this.d=+b,this.e=+q,this.f=+e):(this.a=1,this.c=this.b=0,this.d=1,this.f=this.e=0)}var z=Object.prototype.toString,d=String,f=Math;(function(n){function k(a){return a[0]*a[0]+a[1]*a[1]}function p(a){var d=f.sqrt(k(a));a[0]&&(a[0]/=d);a[1]&&(a[1]/=d)}n.add=function(a,d,e,f,n,p){var k=[[],[],[] ],u=[[this.a,this.c,this.e],[this.b,this.d,this.f],[0,0,1] ];d=[[a,
+e,n],[d,f,p],[0,0,1] ];a&&a instanceof w&&(d=[[a.a,a.c,a.e],[a.b,a.d,a.f],[0,0,1] ]);for(a=0;3>a;a++)for(e=0;3>e;e++){for(f=n=0;3>f;f++)n+=u[a][f]*d[f][e];k[a][e]=n}this.a=k[0][0];this.b=k[1][0];this.c=k[0][1];this.d=k[1][1];this.e=k[0][2];this.f=k[1][2];return this};n.invert=function(){var a=this.a*this.d-this.b*this.c;return new w(this.d/a,-this.b/a,-this.c/a,this.a/a,(this.c*this.f-this.d*this.e)/a,(this.b*this.e-this.a*this.f)/a)};n.clone=function(){return new w(this.a,this.b,this.c,this.d,this.e,
+this.f)};n.translate=function(a,d){return this.add(1,0,0,1,a,d)};n.scale=function(a,d,e,f){null==d&&(d=a);(e||f)&&this.add(1,0,0,1,e,f);this.add(a,0,0,d,0,0);(e||f)&&this.add(1,0,0,1,-e,-f);return this};n.rotate=function(b,d,e){b=a.rad(b);d=d||0;e=e||0;var l=+f.cos(b).toFixed(9);b=+f.sin(b).toFixed(9);this.add(l,b,-b,l,d,e);return this.add(1,0,0,1,-d,-e)};n.x=function(a,d){return a*this.a+d*this.c+this.e};n.y=function(a,d){return a*this.b+d*this.d+this.f};n.get=function(a){return+this[d.fromCharCode(97+
+a)].toFixed(4)};n.toString=function(){return"matrix("+[this.get(0),this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)].join()+")"};n.offset=function(){return[this.e.toFixed(4),this.f.toFixed(4)]};n.determinant=function(){return this.a*this.d-this.b*this.c};n.split=function(){var b={};b.dx=this.e;b.dy=this.f;var d=[[this.a,this.c],[this.b,this.d] ];b.scalex=f.sqrt(k(d[0]));p(d[0]);b.shear=d[0][0]*d[1][0]+d[0][1]*d[1][1];d[1]=[d[1][0]-d[0][0]*b.shear,d[1][1]-d[0][1]*b.shear];b.scaley=f.sqrt(k(d[1]));
+p(d[1]);b.shear/=b.scaley;0>this.determinant()&&(b.scalex=-b.scalex);var e=-d[0][1],d=d[1][1];0>d?(b.rotate=a.deg(f.acos(d)),0>e&&(b.rotate=360-b.rotate)):b.rotate=a.deg(f.asin(e));b.isSimple=!+b.shear.toFixed(9)&&(b.scalex.toFixed(9)==b.scaley.toFixed(9)||!b.rotate);b.isSuperSimple=!+b.shear.toFixed(9)&&b.scalex.toFixed(9)==b.scaley.toFixed(9)&&!b.rotate;b.noRotation=!+b.shear.toFixed(9)&&!b.rotate;return b};n.toTransformString=function(a){a=a||this.split();if(+a.shear.toFixed(9))return"m"+[this.get(0),
+this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)];a.scalex=+a.scalex.toFixed(4);a.scaley=+a.scaley.toFixed(4);a.rotate=+a.rotate.toFixed(4);return(a.dx||a.dy?"t"+[+a.dx.toFixed(4),+a.dy.toFixed(4)]:"")+(1!=a.scalex||1!=a.scaley?"s"+[a.scalex,a.scaley,0,0]:"")+(a.rotate?"r"+[+a.rotate.toFixed(4),0,0]:"")}})(w.prototype);a.Matrix=w;a.matrix=function(a,d,f,b,k,e){return new w(a,d,f,b,k,e)}});C.plugin(function(a,v,y,M,A){function w(h){return function(d){k.stop();d instanceof A&&1==d.node.childNodes.length&&
+("radialGradient"==d.node.firstChild.tagName||"linearGradient"==d.node.firstChild.tagName||"pattern"==d.node.firstChild.tagName)&&(d=d.node.firstChild,b(this).appendChild(d),d=u(d));if(d instanceof v)if("radialGradient"==d.type||"linearGradient"==d.type||"pattern"==d.type){d.node.id||e(d.node,{id:d.id});var f=l(d.node.id)}else f=d.attr(h);else f=a.color(d),f.error?(f=a(b(this).ownerSVGElement).gradient(d))?(f.node.id||e(f.node,{id:f.id}),f=l(f.node.id)):f=d:f=r(f);d={};d[h]=f;e(this.node,d);this.node.style[h]=
+x}}function z(a){k.stop();a==+a&&(a+="px");this.node.style.fontSize=a}function d(a){var b=[];a=a.childNodes;for(var e=0,f=a.length;e<f;e++){var l=a[e];3==l.nodeType&&b.push(l.nodeValue);"tspan"==l.tagName&&(1==l.childNodes.length&&3==l.firstChild.nodeType?b.push(l.firstChild.nodeValue):b.push(d(l)))}return b}function f(){k.stop();return this.node.style.fontSize}var n=a._.make,u=a._.wrap,p=a.is,b=a._.getSomeDefs,q=/^url\(#?([^)]+)\)$/,e=a._.$,l=a.url,r=String,s=a._.separator,x="";k.on("snap.util.attr.mask",
+function(a){if(a instanceof v||a instanceof A){k.stop();a instanceof A&&1==a.node.childNodes.length&&(a=a.node.firstChild,b(this).appendChild(a),a=u(a));if("mask"==a.type)var d=a;else d=n("mask",b(this)),d.node.appendChild(a.node);!d.node.id&&e(d.node,{id:d.id});e(this.node,{mask:l(d.id)})}});(function(a){k.on("snap.util.attr.clip",a);k.on("snap.util.attr.clip-path",a);k.on("snap.util.attr.clipPath",a)})(function(a){if(a instanceof v||a instanceof A){k.stop();if("clipPath"==a.type)var d=a;else d=
+n("clipPath",b(this)),d.node.appendChild(a.node),!d.node.id&&e(d.node,{id:d.id});e(this.node,{"clip-path":l(d.id)})}});k.on("snap.util.attr.fill",w("fill"));k.on("snap.util.attr.stroke",w("stroke"));var G=/^([lr])(?:\(([^)]*)\))?(.*)$/i;k.on("snap.util.grad.parse",function(a){a=r(a);var b=a.match(G);if(!b)return null;a=b[1];var e=b[2],b=b[3],e=e.split(/\s*,\s*/).map(function(a){return+a==a?+a:a});1==e.length&&0==e[0]&&(e=[]);b=b.split("-");b=b.map(function(a){a=a.split(":");var b={color:a[0]};a[1]&&
+(b.offset=parseFloat(a[1]));return b});return{type:a,params:e,stops:b}});k.on("snap.util.attr.d",function(b){k.stop();p(b,"array")&&p(b[0],"array")&&(b=a.path.toString.call(b));b=r(b);b.match(/[ruo]/i)&&(b=a.path.toAbsolute(b));e(this.node,{d:b})})(-1);k.on("snap.util.attr.#text",function(a){k.stop();a=r(a);for(a=M.doc.createTextNode(a);this.node.firstChild;)this.node.removeChild(this.node.firstChild);this.node.appendChild(a)})(-1);k.on("snap.util.attr.path",function(a){k.stop();this.attr({d:a})})(-1);
+k.on("snap.util.attr.class",function(a){k.stop();this.node.className.baseVal=a})(-1);k.on("snap.util.attr.viewBox",function(a){a=p(a,"object")&&"x"in a?[a.x,a.y,a.width,a.height].join(" "):p(a,"array")?a.join(" "):a;e(this.node,{viewBox:a});k.stop()})(-1);k.on("snap.util.attr.transform",function(a){this.transform(a);k.stop()})(-1);k.on("snap.util.attr.r",function(a){"rect"==this.type&&(k.stop(),e(this.node,{rx:a,ry:a}))})(-1);k.on("snap.util.attr.textpath",function(a){k.stop();if("text"==this.type){var d,
+f;if(!a&&this.textPath){for(a=this.textPath;a.node.firstChild;)this.node.appendChild(a.node.firstChild);a.remove();delete this.textPath}else if(p(a,"string")?(d=b(this),a=u(d.parentNode).path(a),d.appendChild(a.node),d=a.id,a.attr({id:d})):(a=u(a),a instanceof v&&(d=a.attr("id"),d||(d=a.id,a.attr({id:d})))),d)if(a=this.textPath,f=this.node,a)a.attr({"xlink:href":"#"+d});else{for(a=e("textPath",{"xlink:href":"#"+d});f.firstChild;)a.appendChild(f.firstChild);f.appendChild(a);this.textPath=u(a)}}})(-1);
+k.on("snap.util.attr.text",function(a){if("text"==this.type){for(var b=this.node,d=function(a){var b=e("tspan");if(p(a,"array"))for(var f=0;f<a.length;f++)b.appendChild(d(a[f]));else b.appendChild(M.doc.createTextNode(a));b.normalize&&b.normalize();return b};b.firstChild;)b.removeChild(b.firstChild);for(a=d(a);a.firstChild;)b.appendChild(a.firstChild)}k.stop()})(-1);k.on("snap.util.attr.fontSize",z)(-1);k.on("snap.util.attr.font-size",z)(-1);k.on("snap.util.getattr.transform",function(){k.stop();
+return this.transform()})(-1);k.on("snap.util.getattr.textpath",function(){k.stop();return this.textPath})(-1);(function(){function b(d){return function(){k.stop();var b=M.doc.defaultView.getComputedStyle(this.node,null).getPropertyValue("marker-"+d);return"none"==b?b:a(M.doc.getElementById(b.match(q)[1]))}}function d(a){return function(b){k.stop();var d="marker"+a.charAt(0).toUpperCase()+a.substring(1);if(""==b||!b)this.node.style[d]="none";else if("marker"==b.type){var f=b.node.id;f||e(b.node,{id:b.id});
+this.node.style[d]=l(f)}}}k.on("snap.util.getattr.marker-end",b("end"))(-1);k.on("snap.util.getattr.markerEnd",b("end"))(-1);k.on("snap.util.getattr.marker-start",b("start"))(-1);k.on("snap.util.getattr.markerStart",b("start"))(-1);k.on("snap.util.getattr.marker-mid",b("mid"))(-1);k.on("snap.util.getattr.markerMid",b("mid"))(-1);k.on("snap.util.attr.marker-end",d("end"))(-1);k.on("snap.util.attr.markerEnd",d("end"))(-1);k.on("snap.util.attr.marker-start",d("start"))(-1);k.on("snap.util.attr.markerStart",
+d("start"))(-1);k.on("snap.util.attr.marker-mid",d("mid"))(-1);k.on("snap.util.attr.markerMid",d("mid"))(-1)})();k.on("snap.util.getattr.r",function(){if("rect"==this.type&&e(this.node,"rx")==e(this.node,"ry"))return k.stop(),e(this.node,"rx")})(-1);k.on("snap.util.getattr.text",function(){if("text"==this.type||"tspan"==this.type){k.stop();var a=d(this.node);return 1==a.length?a[0]:a}})(-1);k.on("snap.util.getattr.#text",function(){return this.node.textContent})(-1);k.on("snap.util.getattr.viewBox",
+function(){k.stop();var b=e(this.node,"viewBox");if(b)return b=b.split(s),a._.box(+b[0],+b[1],+b[2],+b[3])})(-1);k.on("snap.util.getattr.points",function(){var a=e(this.node,"points");k.stop();if(a)return a.split(s)})(-1);k.on("snap.util.getattr.path",function(){var a=e(this.node,"d");k.stop();return a})(-1);k.on("snap.util.getattr.class",function(){return this.node.className.baseVal})(-1);k.on("snap.util.getattr.fontSize",f)(-1);k.on("snap.util.getattr.font-size",f)(-1)});C.plugin(function(a,v,y,
+M,A){function w(a){return a}function z(a){return function(b){return+b.toFixed(3)+a}}var d={"+":function(a,b){return a+b},"-":function(a,b){return a-b},"/":function(a,b){return a/b},"*":function(a,b){return a*b}},f=String,n=/[a-z]+$/i,u=/^\s*([+\-\/*])\s*=\s*([\d.eE+\-]+)\s*([^\d\s]+)?\s*$/;k.on("snap.util.attr",function(a){if(a=f(a).match(u)){var b=k.nt(),b=b.substring(b.lastIndexOf(".")+1),q=this.attr(b),e={};k.stop();var l=a[3]||"",r=q.match(n),s=d[a[1] ];r&&r==l?a=s(parseFloat(q),+a[2]):(q=this.asPX(b),
+a=s(this.asPX(b),this.asPX(b,a[2]+l)));isNaN(q)||isNaN(a)||(e[b]=a,this.attr(e))}})(-10);k.on("snap.util.equal",function(a,b){var q=f(this.attr(a)||""),e=f(b).match(u);if(e){k.stop();var l=e[3]||"",r=q.match(n),s=d[e[1] ];if(r&&r==l)return{from:parseFloat(q),to:s(parseFloat(q),+e[2]),f:z(r)};q=this.asPX(a);return{from:q,to:s(q,this.asPX(a,e[2]+l)),f:w}}})(-10)});C.plugin(function(a,v,y,M,A){var w=y.prototype,z=a.is;w.rect=function(a,d,k,p,b,q){var e;null==q&&(q=b);z(a,"object")&&"[object Object]"==
+a?e=a:null!=a&&(e={x:a,y:d,width:k,height:p},null!=b&&(e.rx=b,e.ry=q));return this.el("rect",e)};w.circle=function(a,d,k){var p;z(a,"object")&&"[object Object]"==a?p=a:null!=a&&(p={cx:a,cy:d,r:k});return this.el("circle",p)};var d=function(){function a(){this.parentNode.removeChild(this)}return function(d,k){var p=M.doc.createElement("img"),b=M.doc.body;p.style.cssText="position:absolute;left:-9999em;top:-9999em";p.onload=function(){k.call(p);p.onload=p.onerror=null;b.removeChild(p)};p.onerror=a;
+b.appendChild(p);p.src=d}}();w.image=function(f,n,k,p,b){var q=this.el("image");if(z(f,"object")&&"src"in f)q.attr(f);else if(null!=f){var e={"xlink:href":f,preserveAspectRatio:"none"};null!=n&&null!=k&&(e.x=n,e.y=k);null!=p&&null!=b?(e.width=p,e.height=b):d(f,function(){a._.$(q.node,{width:this.offsetWidth,height:this.offsetHeight})});a._.$(q.node,e)}return q};w.ellipse=function(a,d,k,p){var b;z(a,"object")&&"[object Object]"==a?b=a:null!=a&&(b={cx:a,cy:d,rx:k,ry:p});return this.el("ellipse",b)};
+w.path=function(a){var d;z(a,"object")&&!z(a,"array")?d=a:a&&(d={d:a});return this.el("path",d)};w.group=w.g=function(a){var d=this.el("g");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.svg=function(a,d,k,p,b,q,e,l){var r={};z(a,"object")&&null==d?r=a:(null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l]));return this.el("svg",r)};w.mask=function(a){var d=
+this.el("mask");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.ptrn=function(a,d,k,p,b,q,e,l){if(z(a,"object"))var r=a;else arguments.length?(r={},null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l])):r={patternUnits:"userSpaceOnUse"};return this.el("pattern",r)};w.use=function(a){return null!=a?(make("use",this.node),a instanceof v&&(a.attr("id")||
+a.attr({id:ID()}),a=a.attr("id")),this.el("use",{"xlink:href":a})):v.prototype.use.call(this)};w.text=function(a,d,k){var p={};z(a,"object")?p=a:null!=a&&(p={x:a,y:d,text:k||""});return this.el("text",p)};w.line=function(a,d,k,p){var b={};z(a,"object")?b=a:null!=a&&(b={x1:a,x2:k,y1:d,y2:p});return this.el("line",b)};w.polyline=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polyline",d)};
+w.polygon=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polygon",d)};(function(){function d(){return this.selectAll("stop")}function n(b,d){var f=e("stop"),k={offset:+d+"%"};b=a.color(b);k["stop-color"]=b.hex;1>b.opacity&&(k["stop-opacity"]=b.opacity);e(f,k);this.node.appendChild(f);return this}function u(){if("linearGradient"==this.type){var b=e(this.node,"x1")||0,d=e(this.node,"x2")||
+1,f=e(this.node,"y1")||0,k=e(this.node,"y2")||0;return a._.box(b,f,math.abs(d-b),math.abs(k-f))}b=this.node.r||0;return a._.box((this.node.cx||0.5)-b,(this.node.cy||0.5)-b,2*b,2*b)}function p(a,d){function f(a,b){for(var d=(b-u)/(a-w),e=w;e<a;e++)h[e].offset=+(+u+d*(e-w)).toFixed(2);w=a;u=b}var n=k("snap.util.grad.parse",null,d).firstDefined(),p;if(!n)return null;n.params.unshift(a);p="l"==n.type.toLowerCase()?b.apply(0,n.params):q.apply(0,n.params);n.type!=n.type.toLowerCase()&&e(p.node,{gradientUnits:"userSpaceOnUse"});
+var h=n.stops,n=h.length,u=0,w=0;n--;for(var v=0;v<n;v++)"offset"in h[v]&&f(v,h[v].offset);h[n].offset=h[n].offset||100;f(n,h[n].offset);for(v=0;v<=n;v++){var y=h[v];p.addStop(y.color,y.offset)}return p}function b(b,k,p,q,w){b=a._.make("linearGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{x1:k,y1:p,x2:q,y2:w});return b}function q(b,k,p,q,w,h){b=a._.make("radialGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{cx:k,cy:p,r:q});null!=w&&null!=h&&e(b.node,{fx:w,fy:h});
+return b}var e=a._.$;w.gradient=function(a){return p(this.defs,a)};w.gradientLinear=function(a,d,e,f){return b(this.defs,a,d,e,f)};w.gradientRadial=function(a,b,d,e,f){return q(this.defs,a,b,d,e,f)};w.toString=function(){var b=this.node.ownerDocument,d=b.createDocumentFragment(),b=b.createElement("div"),e=this.node.cloneNode(!0);d.appendChild(b);b.appendChild(e);a._.$(e,{xmlns:"http://www.w3.org/2000/svg"});b=b.innerHTML;d.removeChild(d.firstChild);return b};w.clear=function(){for(var a=this.node.firstChild,
+b;a;)b=a.nextSibling,"defs"!=a.tagName?a.parentNode.removeChild(a):w.clear.call({node:a}),a=b}})()});C.plugin(function(a,k,y,M){function A(a){var b=A.ps=A.ps||{};b[a]?b[a].sleep=100:b[a]={sleep:100};setTimeout(function(){for(var d in b)b[L](d)&&d!=a&&(b[d].sleep--,!b[d].sleep&&delete b[d])});return b[a]}function w(a,b,d,e){null==a&&(a=b=d=e=0);null==b&&(b=a.y,d=a.width,e=a.height,a=a.x);return{x:a,y:b,width:d,w:d,height:e,h:e,x2:a+d,y2:b+e,cx:a+d/2,cy:b+e/2,r1:F.min(d,e)/2,r2:F.max(d,e)/2,r0:F.sqrt(d*
+d+e*e)/2,path:s(a,b,d,e),vb:[a,b,d,e].join(" ")}}function z(){return this.join(",").replace(N,"$1")}function d(a){a=C(a);a.toString=z;return a}function f(a,b,d,h,f,k,l,n,p){if(null==p)return e(a,b,d,h,f,k,l,n);if(0>p||e(a,b,d,h,f,k,l,n)<p)p=void 0;else{var q=0.5,O=1-q,s;for(s=e(a,b,d,h,f,k,l,n,O);0.01<Z(s-p);)q/=2,O+=(s<p?1:-1)*q,s=e(a,b,d,h,f,k,l,n,O);p=O}return u(a,b,d,h,f,k,l,n,p)}function n(b,d){function e(a){return+(+a).toFixed(3)}return a._.cacher(function(a,h,l){a instanceof k&&(a=a.attr("d"));
+a=I(a);for(var n,p,D,q,O="",s={},c=0,t=0,r=a.length;t<r;t++){D=a[t];if("M"==D[0])n=+D[1],p=+D[2];else{q=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6]);if(c+q>h){if(d&&!s.start){n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c);O+=["C"+e(n.start.x),e(n.start.y),e(n.m.x),e(n.m.y),e(n.x),e(n.y)];if(l)return O;s.start=O;O=["M"+e(n.x),e(n.y)+"C"+e(n.n.x),e(n.n.y),e(n.end.x),e(n.end.y),e(D[5]),e(D[6])].join();c+=q;n=+D[5];p=+D[6];continue}if(!b&&!d)return n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c)}c+=q;n=+D[5];p=+D[6]}O+=
+D.shift()+D}s.end=O;return n=b?c:d?s:u(n,p,D[0],D[1],D[2],D[3],D[4],D[5],1)},null,a._.clone)}function u(a,b,d,e,h,f,k,l,n){var p=1-n,q=ma(p,3),s=ma(p,2),c=n*n,t=c*n,r=q*a+3*s*n*d+3*p*n*n*h+t*k,q=q*b+3*s*n*e+3*p*n*n*f+t*l,s=a+2*n*(d-a)+c*(h-2*d+a),t=b+2*n*(e-b)+c*(f-2*e+b),x=d+2*n*(h-d)+c*(k-2*h+d),c=e+2*n*(f-e)+c*(l-2*f+e);a=p*a+n*d;b=p*b+n*e;h=p*h+n*k;f=p*f+n*l;l=90-180*F.atan2(s-x,t-c)/S;return{x:r,y:q,m:{x:s,y:t},n:{x:x,y:c},start:{x:a,y:b},end:{x:h,y:f},alpha:l}}function p(b,d,e,h,f,n,k,l){a.is(b,
+"array")||(b=[b,d,e,h,f,n,k,l]);b=U.apply(null,b);return w(b.min.x,b.min.y,b.max.x-b.min.x,b.max.y-b.min.y)}function b(a,b,d){return b>=a.x&&b<=a.x+a.width&&d>=a.y&&d<=a.y+a.height}function q(a,d){a=w(a);d=w(d);return b(d,a.x,a.y)||b(d,a.x2,a.y)||b(d,a.x,a.y2)||b(d,a.x2,a.y2)||b(a,d.x,d.y)||b(a,d.x2,d.y)||b(a,d.x,d.y2)||b(a,d.x2,d.y2)||(a.x<d.x2&&a.x>d.x||d.x<a.x2&&d.x>a.x)&&(a.y<d.y2&&a.y>d.y||d.y<a.y2&&d.y>a.y)}function e(a,b,d,e,h,f,n,k,l){null==l&&(l=1);l=(1<l?1:0>l?0:l)/2;for(var p=[-0.1252,
+0.1252,-0.3678,0.3678,-0.5873,0.5873,-0.7699,0.7699,-0.9041,0.9041,-0.9816,0.9816],q=[0.2491,0.2491,0.2335,0.2335,0.2032,0.2032,0.1601,0.1601,0.1069,0.1069,0.0472,0.0472],s=0,c=0;12>c;c++)var t=l*p[c]+l,r=t*(t*(-3*a+9*d-9*h+3*n)+6*a-12*d+6*h)-3*a+3*d,t=t*(t*(-3*b+9*e-9*f+3*k)+6*b-12*e+6*f)-3*b+3*e,s=s+q[c]*F.sqrt(r*r+t*t);return l*s}function l(a,b,d){a=I(a);b=I(b);for(var h,f,l,n,k,s,r,O,x,c,t=d?0:[],w=0,v=a.length;w<v;w++)if(x=a[w],"M"==x[0])h=k=x[1],f=s=x[2];else{"C"==x[0]?(x=[h,f].concat(x.slice(1)),
+h=x[6],f=x[7]):(x=[h,f,h,f,k,s,k,s],h=k,f=s);for(var G=0,y=b.length;G<y;G++)if(c=b[G],"M"==c[0])l=r=c[1],n=O=c[2];else{"C"==c[0]?(c=[l,n].concat(c.slice(1)),l=c[6],n=c[7]):(c=[l,n,l,n,r,O,r,O],l=r,n=O);var z;var K=x,B=c;z=d;var H=p(K),J=p(B);if(q(H,J)){for(var H=e.apply(0,K),J=e.apply(0,B),H=~~(H/8),J=~~(J/8),U=[],A=[],F={},M=z?0:[],P=0;P<H+1;P++){var C=u.apply(0,K.concat(P/H));U.push({x:C.x,y:C.y,t:P/H})}for(P=0;P<J+1;P++)C=u.apply(0,B.concat(P/J)),A.push({x:C.x,y:C.y,t:P/J});for(P=0;P<H;P++)for(K=
+0;K<J;K++){var Q=U[P],L=U[P+1],B=A[K],C=A[K+1],N=0.001>Z(L.x-Q.x)?"y":"x",S=0.001>Z(C.x-B.x)?"y":"x",R;R=Q.x;var Y=Q.y,V=L.x,ea=L.y,fa=B.x,ga=B.y,ha=C.x,ia=C.y;if(W(R,V)<X(fa,ha)||X(R,V)>W(fa,ha)||W(Y,ea)<X(ga,ia)||X(Y,ea)>W(ga,ia))R=void 0;else{var $=(R*ea-Y*V)*(fa-ha)-(R-V)*(fa*ia-ga*ha),aa=(R*ea-Y*V)*(ga-ia)-(Y-ea)*(fa*ia-ga*ha),ja=(R-V)*(ga-ia)-(Y-ea)*(fa-ha);if(ja){var $=$/ja,aa=aa/ja,ja=+$.toFixed(2),ba=+aa.toFixed(2);R=ja<+X(R,V).toFixed(2)||ja>+W(R,V).toFixed(2)||ja<+X(fa,ha).toFixed(2)||
+ja>+W(fa,ha).toFixed(2)||ba<+X(Y,ea).toFixed(2)||ba>+W(Y,ea).toFixed(2)||ba<+X(ga,ia).toFixed(2)||ba>+W(ga,ia).toFixed(2)?void 0:{x:$,y:aa}}else R=void 0}R&&F[R.x.toFixed(4)]!=R.y.toFixed(4)&&(F[R.x.toFixed(4)]=R.y.toFixed(4),Q=Q.t+Z((R[N]-Q[N])/(L[N]-Q[N]))*(L.t-Q.t),B=B.t+Z((R[S]-B[S])/(C[S]-B[S]))*(C.t-B.t),0<=Q&&1>=Q&&0<=B&&1>=B&&(z?M++:M.push({x:R.x,y:R.y,t1:Q,t2:B})))}z=M}else z=z?0:[];if(d)t+=z;else{H=0;for(J=z.length;H<J;H++)z[H].segment1=w,z[H].segment2=G,z[H].bez1=x,z[H].bez2=c;t=t.concat(z)}}}return t}
+function r(a){var b=A(a);if(b.bbox)return C(b.bbox);if(!a)return w();a=I(a);for(var d=0,e=0,h=[],f=[],l,n=0,k=a.length;n<k;n++)l=a[n],"M"==l[0]?(d=l[1],e=l[2],h.push(d),f.push(e)):(d=U(d,e,l[1],l[2],l[3],l[4],l[5],l[6]),h=h.concat(d.min.x,d.max.x),f=f.concat(d.min.y,d.max.y),d=l[5],e=l[6]);a=X.apply(0,h);l=X.apply(0,f);h=W.apply(0,h);f=W.apply(0,f);f=w(a,l,h-a,f-l);b.bbox=C(f);return f}function s(a,b,d,e,h){if(h)return[["M",+a+ +h,b],["l",d-2*h,0],["a",h,h,0,0,1,h,h],["l",0,e-2*h],["a",h,h,0,0,1,
+-h,h],["l",2*h-d,0],["a",h,h,0,0,1,-h,-h],["l",0,2*h-e],["a",h,h,0,0,1,h,-h],["z"] ];a=[["M",a,b],["l",d,0],["l",0,e],["l",-d,0],["z"] ];a.toString=z;return a}function x(a,b,d,e,h){null==h&&null==e&&(e=d);a=+a;b=+b;d=+d;e=+e;if(null!=h){var f=Math.PI/180,l=a+d*Math.cos(-e*f);a+=d*Math.cos(-h*f);var n=b+d*Math.sin(-e*f);b+=d*Math.sin(-h*f);d=[["M",l,n],["A",d,d,0,+(180<h-e),0,a,b] ]}else d=[["M",a,b],["m",0,-e],["a",d,e,0,1,1,0,2*e],["a",d,e,0,1,1,0,-2*e],["z"] ];d.toString=z;return d}function G(b){var e=
+A(b);if(e.abs)return d(e.abs);Q(b,"array")&&Q(b&&b[0],"array")||(b=a.parsePathString(b));if(!b||!b.length)return[["M",0,0] ];var h=[],f=0,l=0,n=0,k=0,p=0;"M"==b[0][0]&&(f=+b[0][1],l=+b[0][2],n=f,k=l,p++,h[0]=["M",f,l]);for(var q=3==b.length&&"M"==b[0][0]&&"R"==b[1][0].toUpperCase()&&"Z"==b[2][0].toUpperCase(),s,r,w=p,c=b.length;w<c;w++){h.push(s=[]);r=b[w];p=r[0];if(p!=p.toUpperCase())switch(s[0]=p.toUpperCase(),s[0]){case "A":s[1]=r[1];s[2]=r[2];s[3]=r[3];s[4]=r[4];s[5]=r[5];s[6]=+r[6]+f;s[7]=+r[7]+
+l;break;case "V":s[1]=+r[1]+l;break;case "H":s[1]=+r[1]+f;break;case "R":for(var t=[f,l].concat(r.slice(1)),u=2,v=t.length;u<v;u++)t[u]=+t[u]+f,t[++u]=+t[u]+l;h.pop();h=h.concat(P(t,q));break;case "O":h.pop();t=x(f,l,r[1],r[2]);t.push(t[0]);h=h.concat(t);break;case "U":h.pop();h=h.concat(x(f,l,r[1],r[2],r[3]));s=["U"].concat(h[h.length-1].slice(-2));break;case "M":n=+r[1]+f,k=+r[2]+l;default:for(u=1,v=r.length;u<v;u++)s[u]=+r[u]+(u%2?f:l)}else if("R"==p)t=[f,l].concat(r.slice(1)),h.pop(),h=h.concat(P(t,
+q)),s=["R"].concat(r.slice(-2));else if("O"==p)h.pop(),t=x(f,l,r[1],r[2]),t.push(t[0]),h=h.concat(t);else if("U"==p)h.pop(),h=h.concat(x(f,l,r[1],r[2],r[3])),s=["U"].concat(h[h.length-1].slice(-2));else for(t=0,u=r.length;t<u;t++)s[t]=r[t];p=p.toUpperCase();if("O"!=p)switch(s[0]){case "Z":f=+n;l=+k;break;case "H":f=s[1];break;case "V":l=s[1];break;case "M":n=s[s.length-2],k=s[s.length-1];default:f=s[s.length-2],l=s[s.length-1]}}h.toString=z;e.abs=d(h);return h}function h(a,b,d,e){return[a,b,d,e,d,
+e]}function J(a,b,d,e,h,f){var l=1/3,n=2/3;return[l*a+n*d,l*b+n*e,l*h+n*d,l*f+n*e,h,f]}function K(b,d,e,h,f,l,n,k,p,s){var r=120*S/180,q=S/180*(+f||0),c=[],t,x=a._.cacher(function(a,b,c){var d=a*F.cos(c)-b*F.sin(c);a=a*F.sin(c)+b*F.cos(c);return{x:d,y:a}});if(s)v=s[0],t=s[1],l=s[2],u=s[3];else{t=x(b,d,-q);b=t.x;d=t.y;t=x(k,p,-q);k=t.x;p=t.y;F.cos(S/180*f);F.sin(S/180*f);t=(b-k)/2;v=(d-p)/2;u=t*t/(e*e)+v*v/(h*h);1<u&&(u=F.sqrt(u),e*=u,h*=u);var u=e*e,w=h*h,u=(l==n?-1:1)*F.sqrt(Z((u*w-u*v*v-w*t*t)/
+(u*v*v+w*t*t)));l=u*e*v/h+(b+k)/2;var u=u*-h*t/e+(d+p)/2,v=F.asin(((d-u)/h).toFixed(9));t=F.asin(((p-u)/h).toFixed(9));v=b<l?S-v:v;t=k<l?S-t:t;0>v&&(v=2*S+v);0>t&&(t=2*S+t);n&&v>t&&(v-=2*S);!n&&t>v&&(t-=2*S)}if(Z(t-v)>r){var c=t,w=k,G=p;t=v+r*(n&&t>v?1:-1);k=l+e*F.cos(t);p=u+h*F.sin(t);c=K(k,p,e,h,f,0,n,w,G,[t,c,l,u])}l=t-v;f=F.cos(v);r=F.sin(v);n=F.cos(t);t=F.sin(t);l=F.tan(l/4);e=4/3*e*l;l*=4/3*h;h=[b,d];b=[b+e*r,d-l*f];d=[k+e*t,p-l*n];k=[k,p];b[0]=2*h[0]-b[0];b[1]=2*h[1]-b[1];if(s)return[b,d,k].concat(c);
+c=[b,d,k].concat(c).join().split(",");s=[];k=0;for(p=c.length;k<p;k++)s[k]=k%2?x(c[k-1],c[k],q).y:x(c[k],c[k+1],q).x;return s}function U(a,b,d,e,h,f,l,k){for(var n=[],p=[[],[] ],s,r,c,t,q=0;2>q;++q)0==q?(r=6*a-12*d+6*h,s=-3*a+9*d-9*h+3*l,c=3*d-3*a):(r=6*b-12*e+6*f,s=-3*b+9*e-9*f+3*k,c=3*e-3*b),1E-12>Z(s)?1E-12>Z(r)||(s=-c/r,0<s&&1>s&&n.push(s)):(t=r*r-4*c*s,c=F.sqrt(t),0>t||(t=(-r+c)/(2*s),0<t&&1>t&&n.push(t),s=(-r-c)/(2*s),0<s&&1>s&&n.push(s)));for(r=q=n.length;q--;)s=n[q],c=1-s,p[0][q]=c*c*c*a+3*
+c*c*s*d+3*c*s*s*h+s*s*s*l,p[1][q]=c*c*c*b+3*c*c*s*e+3*c*s*s*f+s*s*s*k;p[0][r]=a;p[1][r]=b;p[0][r+1]=l;p[1][r+1]=k;p[0].length=p[1].length=r+2;return{min:{x:X.apply(0,p[0]),y:X.apply(0,p[1])},max:{x:W.apply(0,p[0]),y:W.apply(0,p[1])}}}function I(a,b){var e=!b&&A(a);if(!b&&e.curve)return d(e.curve);var f=G(a),l=b&&G(b),n={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},k={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},p=function(a,b,c){if(!a)return["C",b.x,b.y,b.x,b.y,b.x,b.y];a[0]in{T:1,Q:1}||(b.qx=b.qy=null);
+switch(a[0]){case "M":b.X=a[1];b.Y=a[2];break;case "A":a=["C"].concat(K.apply(0,[b.x,b.y].concat(a.slice(1))));break;case "S":"C"==c||"S"==c?(c=2*b.x-b.bx,b=2*b.y-b.by):(c=b.x,b=b.y);a=["C",c,b].concat(a.slice(1));break;case "T":"Q"==c||"T"==c?(b.qx=2*b.x-b.qx,b.qy=2*b.y-b.qy):(b.qx=b.x,b.qy=b.y);a=["C"].concat(J(b.x,b.y,b.qx,b.qy,a[1],a[2]));break;case "Q":b.qx=a[1];b.qy=a[2];a=["C"].concat(J(b.x,b.y,a[1],a[2],a[3],a[4]));break;case "L":a=["C"].concat(h(b.x,b.y,a[1],a[2]));break;case "H":a=["C"].concat(h(b.x,
+b.y,a[1],b.y));break;case "V":a=["C"].concat(h(b.x,b.y,b.x,a[1]));break;case "Z":a=["C"].concat(h(b.x,b.y,b.X,b.Y))}return a},s=function(a,b){if(7<a[b].length){a[b].shift();for(var c=a[b];c.length;)q[b]="A",l&&(u[b]="A"),a.splice(b++,0,["C"].concat(c.splice(0,6)));a.splice(b,1);v=W(f.length,l&&l.length||0)}},r=function(a,b,c,d,e){a&&b&&"M"==a[e][0]&&"M"!=b[e][0]&&(b.splice(e,0,["M",d.x,d.y]),c.bx=0,c.by=0,c.x=a[e][1],c.y=a[e][2],v=W(f.length,l&&l.length||0))},q=[],u=[],c="",t="",x=0,v=W(f.length,
+l&&l.length||0);for(;x<v;x++){f[x]&&(c=f[x][0]);"C"!=c&&(q[x]=c,x&&(t=q[x-1]));f[x]=p(f[x],n,t);"A"!=q[x]&&"C"==c&&(q[x]="C");s(f,x);l&&(l[x]&&(c=l[x][0]),"C"!=c&&(u[x]=c,x&&(t=u[x-1])),l[x]=p(l[x],k,t),"A"!=u[x]&&"C"==c&&(u[x]="C"),s(l,x));r(f,l,n,k,x);r(l,f,k,n,x);var w=f[x],z=l&&l[x],y=w.length,U=l&&z.length;n.x=w[y-2];n.y=w[y-1];n.bx=$(w[y-4])||n.x;n.by=$(w[y-3])||n.y;k.bx=l&&($(z[U-4])||k.x);k.by=l&&($(z[U-3])||k.y);k.x=l&&z[U-2];k.y=l&&z[U-1]}l||(e.curve=d(f));return l?[f,l]:f}function P(a,
+b){for(var d=[],e=0,h=a.length;h-2*!b>e;e+=2){var f=[{x:+a[e-2],y:+a[e-1]},{x:+a[e],y:+a[e+1]},{x:+a[e+2],y:+a[e+3]},{x:+a[e+4],y:+a[e+5]}];b?e?h-4==e?f[3]={x:+a[0],y:+a[1]}:h-2==e&&(f[2]={x:+a[0],y:+a[1]},f[3]={x:+a[2],y:+a[3]}):f[0]={x:+a[h-2],y:+a[h-1]}:h-4==e?f[3]=f[2]:e||(f[0]={x:+a[e],y:+a[e+1]});d.push(["C",(-f[0].x+6*f[1].x+f[2].x)/6,(-f[0].y+6*f[1].y+f[2].y)/6,(f[1].x+6*f[2].x-f[3].x)/6,(f[1].y+6*f[2].y-f[3].y)/6,f[2].x,f[2].y])}return d}y=k.prototype;var Q=a.is,C=a._.clone,L="hasOwnProperty",
+N=/,?([a-z]),?/gi,$=parseFloat,F=Math,S=F.PI,X=F.min,W=F.max,ma=F.pow,Z=F.abs;M=n(1);var na=n(),ba=n(0,1),V=a._unit2px;a.path=A;a.path.getTotalLength=M;a.path.getPointAtLength=na;a.path.getSubpath=function(a,b,d){if(1E-6>this.getTotalLength(a)-d)return ba(a,b).end;a=ba(a,d,1);return b?ba(a,b).end:a};y.getTotalLength=function(){if(this.node.getTotalLength)return this.node.getTotalLength()};y.getPointAtLength=function(a){return na(this.attr("d"),a)};y.getSubpath=function(b,d){return a.path.getSubpath(this.attr("d"),
+b,d)};a._.box=w;a.path.findDotsAtSegment=u;a.path.bezierBBox=p;a.path.isPointInsideBBox=b;a.path.isBBoxIntersect=q;a.path.intersection=function(a,b){return l(a,b)};a.path.intersectionNumber=function(a,b){return l(a,b,1)};a.path.isPointInside=function(a,d,e){var h=r(a);return b(h,d,e)&&1==l(a,[["M",d,e],["H",h.x2+10] ],1)%2};a.path.getBBox=r;a.path.get={path:function(a){return a.attr("path")},circle:function(a){a=V(a);return x(a.cx,a.cy,a.r)},ellipse:function(a){a=V(a);return x(a.cx||0,a.cy||0,a.rx,
+a.ry)},rect:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height,a.rx,a.ry)},image:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height)},line:function(a){return"M"+[a.attr("x1")||0,a.attr("y1")||0,a.attr("x2"),a.attr("y2")]},polyline:function(a){return"M"+a.attr("points")},polygon:function(a){return"M"+a.attr("points")+"z"},deflt:function(a){a=a.node.getBBox();return s(a.x,a.y,a.width,a.height)}};a.path.toRelative=function(b){var e=A(b),h=String.prototype.toLowerCase;if(e.rel)return d(e.rel);
+a.is(b,"array")&&a.is(b&&b[0],"array")||(b=a.parsePathString(b));var f=[],l=0,n=0,k=0,p=0,s=0;"M"==b[0][0]&&(l=b[0][1],n=b[0][2],k=l,p=n,s++,f.push(["M",l,n]));for(var r=b.length;s<r;s++){var q=f[s]=[],x=b[s];if(x[0]!=h.call(x[0]))switch(q[0]=h.call(x[0]),q[0]){case "a":q[1]=x[1];q[2]=x[2];q[3]=x[3];q[4]=x[4];q[5]=x[5];q[6]=+(x[6]-l).toFixed(3);q[7]=+(x[7]-n).toFixed(3);break;case "v":q[1]=+(x[1]-n).toFixed(3);break;case "m":k=x[1],p=x[2];default:for(var c=1,t=x.length;c<t;c++)q[c]=+(x[c]-(c%2?l:
+n)).toFixed(3)}else for(f[s]=[],"m"==x[0]&&(k=x[1]+l,p=x[2]+n),q=0,c=x.length;q<c;q++)f[s][q]=x[q];x=f[s].length;switch(f[s][0]){case "z":l=k;n=p;break;case "h":l+=+f[s][x-1];break;case "v":n+=+f[s][x-1];break;default:l+=+f[s][x-2],n+=+f[s][x-1]}}f.toString=z;e.rel=d(f);return f};a.path.toAbsolute=G;a.path.toCubic=I;a.path.map=function(a,b){if(!b)return a;var d,e,h,f,l,n,k;a=I(a);h=0;for(l=a.length;h<l;h++)for(k=a[h],f=1,n=k.length;f<n;f+=2)d=b.x(k[f],k[f+1]),e=b.y(k[f],k[f+1]),k[f]=d,k[f+1]=e;return a};
+a.path.toString=z;a.path.clone=d});C.plugin(function(a,v,y,C){var A=Math.max,w=Math.min,z=function(a){this.items=[];this.bindings={};this.length=0;this.type="set";if(a)for(var f=0,n=a.length;f<n;f++)a[f]&&(this[this.items.length]=this.items[this.items.length]=a[f],this.length++)};v=z.prototype;v.push=function(){for(var a,f,n=0,k=arguments.length;n<k;n++)if(a=arguments[n])f=this.items.length,this[f]=this.items[f]=a,this.length++;return this};v.pop=function(){this.length&&delete this[this.length--];
+return this.items.pop()};v.forEach=function(a,f){for(var n=0,k=this.items.length;n<k&&!1!==a.call(f,this.items[n],n);n++);return this};v.animate=function(d,f,n,u){"function"!=typeof n||n.length||(u=n,n=L.linear);d instanceof a._.Animation&&(u=d.callback,n=d.easing,f=n.dur,d=d.attr);var p=arguments;if(a.is(d,"array")&&a.is(p[p.length-1],"array"))var b=!0;var q,e=function(){q?this.b=q:q=this.b},l=0,r=u&&function(){l++==this.length&&u.call(this)};return this.forEach(function(a,l){k.once("snap.animcreated."+
+a.id,e);b?p[l]&&a.animate.apply(a,p[l]):a.animate(d,f,n,r)})};v.remove=function(){for(;this.length;)this.pop().remove();return this};v.bind=function(a,f,k){var u={};if("function"==typeof f)this.bindings[a]=f;else{var p=k||a;this.bindings[a]=function(a){u[p]=a;f.attr(u)}}return this};v.attr=function(a){var f={},k;for(k in a)if(this.bindings[k])this.bindings[k](a[k]);else f[k]=a[k];a=0;for(k=this.items.length;a<k;a++)this.items[a].attr(f);return this};v.clear=function(){for(;this.length;)this.pop()};
+v.splice=function(a,f,k){a=0>a?A(this.length+a,0):a;f=A(0,w(this.length-a,f));var u=[],p=[],b=[],q;for(q=2;q<arguments.length;q++)b.push(arguments[q]);for(q=0;q<f;q++)p.push(this[a+q]);for(;q<this.length-a;q++)u.push(this[a+q]);var e=b.length;for(q=0;q<e+u.length;q++)this.items[a+q]=this[a+q]=q<e?b[q]:u[q-e];for(q=this.items.length=this.length-=f-e;this[q];)delete this[q++];return new z(p)};v.exclude=function(a){for(var f=0,k=this.length;f<k;f++)if(this[f]==a)return this.splice(f,1),!0;return!1};
+v.insertAfter=function(a){for(var f=this.items.length;f--;)this.items[f].insertAfter(a);return this};v.getBBox=function(){for(var a=[],f=[],k=[],u=[],p=this.items.length;p--;)if(!this.items[p].removed){var b=this.items[p].getBBox();a.push(b.x);f.push(b.y);k.push(b.x+b.width);u.push(b.y+b.height)}a=w.apply(0,a);f=w.apply(0,f);k=A.apply(0,k);u=A.apply(0,u);return{x:a,y:f,x2:k,y2:u,width:k-a,height:u-f,cx:a+(k-a)/2,cy:f+(u-f)/2}};v.clone=function(a){a=new z;for(var f=0,k=this.items.length;f<k;f++)a.push(this.items[f].clone());
+return a};v.toString=function(){return"Snap\u2018s set"};v.type="set";a.set=function(){var a=new z;arguments.length&&a.push.apply(a,Array.prototype.slice.call(arguments,0));return a}});C.plugin(function(a,v,y,C){function A(a){var b=a[0];switch(b.toLowerCase()){case "t":return[b,0,0];case "m":return[b,1,0,0,1,0,0];case "r":return 4==a.length?[b,0,a[2],a[3] ]:[b,0];case "s":return 5==a.length?[b,1,1,a[3],a[4] ]:3==a.length?[b,1,1]:[b,1]}}function w(b,d,f){d=q(d).replace(/\.{3}|\u2026/g,b);b=a.parseTransformString(b)||
+[];d=a.parseTransformString(d)||[];for(var k=Math.max(b.length,d.length),p=[],v=[],h=0,w,z,y,I;h<k;h++){y=b[h]||A(d[h]);I=d[h]||A(y);if(y[0]!=I[0]||"r"==y[0].toLowerCase()&&(y[2]!=I[2]||y[3]!=I[3])||"s"==y[0].toLowerCase()&&(y[3]!=I[3]||y[4]!=I[4])){b=a._.transform2matrix(b,f());d=a._.transform2matrix(d,f());p=[["m",b.a,b.b,b.c,b.d,b.e,b.f] ];v=[["m",d.a,d.b,d.c,d.d,d.e,d.f] ];break}p[h]=[];v[h]=[];w=0;for(z=Math.max(y.length,I.length);w<z;w++)w in y&&(p[h][w]=y[w]),w in I&&(v[h][w]=I[w])}return{from:u(p),
+to:u(v),f:n(p)}}function z(a){return a}function d(a){return function(b){return+b.toFixed(3)+a}}function f(b){return a.rgb(b[0],b[1],b[2])}function n(a){var b=0,d,f,k,n,h,p,q=[];d=0;for(f=a.length;d<f;d++){h="[";p=['"'+a[d][0]+'"'];k=1;for(n=a[d].length;k<n;k++)p[k]="val["+b++ +"]";h+=p+"]";q[d]=h}return Function("val","return Snap.path.toString.call(["+q+"])")}function u(a){for(var b=[],d=0,f=a.length;d<f;d++)for(var k=1,n=a[d].length;k<n;k++)b.push(a[d][k]);return b}var p={},b=/[a-z]+$/i,q=String;
+p.stroke=p.fill="colour";v.prototype.equal=function(a,b){return k("snap.util.equal",this,a,b).firstDefined()};k.on("snap.util.equal",function(e,k){var r,s;r=q(this.attr(e)||"");var x=this;if(r==+r&&k==+k)return{from:+r,to:+k,f:z};if("colour"==p[e])return r=a.color(r),s=a.color(k),{from:[r.r,r.g,r.b,r.opacity],to:[s.r,s.g,s.b,s.opacity],f:f};if("transform"==e||"gradientTransform"==e||"patternTransform"==e)return k instanceof a.Matrix&&(k=k.toTransformString()),a._.rgTransform.test(k)||(k=a._.svgTransform2string(k)),
+w(r,k,function(){return x.getBBox(1)});if("d"==e||"path"==e)return r=a.path.toCubic(r,k),{from:u(r[0]),to:u(r[1]),f:n(r[0])};if("points"==e)return r=q(r).split(a._.separator),s=q(k).split(a._.separator),{from:r,to:s,f:function(a){return a}};aUnit=r.match(b);s=q(k).match(b);return aUnit&&aUnit==s?{from:parseFloat(r),to:parseFloat(k),f:d(aUnit)}:{from:this.asPX(e),to:this.asPX(e,k),f:z}})});C.plugin(function(a,v,y,C){var A=v.prototype,w="createTouch"in C.doc;v="click dblclick mousedown mousemove mouseout mouseover mouseup touchstart touchmove touchend touchcancel".split(" ");
+var z={mousedown:"touchstart",mousemove:"touchmove",mouseup:"touchend"},d=function(a,b){var d="y"==a?"scrollTop":"scrollLeft",e=b&&b.node?b.node.ownerDocument:C.doc;return e[d in e.documentElement?"documentElement":"body"][d]},f=function(){this.returnValue=!1},n=function(){return this.originalEvent.preventDefault()},u=function(){this.cancelBubble=!0},p=function(){return this.originalEvent.stopPropagation()},b=function(){if(C.doc.addEventListener)return function(a,b,e,f){var k=w&&z[b]?z[b]:b,l=function(k){var l=
+d("y",f),q=d("x",f);if(w&&z.hasOwnProperty(b))for(var r=0,u=k.targetTouches&&k.targetTouches.length;r<u;r++)if(k.targetTouches[r].target==a||a.contains(k.targetTouches[r].target)){u=k;k=k.targetTouches[r];k.originalEvent=u;k.preventDefault=n;k.stopPropagation=p;break}return e.call(f,k,k.clientX+q,k.clientY+l)};b!==k&&a.addEventListener(b,l,!1);a.addEventListener(k,l,!1);return function(){b!==k&&a.removeEventListener(b,l,!1);a.removeEventListener(k,l,!1);return!0}};if(C.doc.attachEvent)return function(a,
+b,e,h){var k=function(a){a=a||h.node.ownerDocument.window.event;var b=d("y",h),k=d("x",h),k=a.clientX+k,b=a.clientY+b;a.preventDefault=a.preventDefault||f;a.stopPropagation=a.stopPropagation||u;return e.call(h,a,k,b)};a.attachEvent("on"+b,k);return function(){a.detachEvent("on"+b,k);return!0}}}(),q=[],e=function(a){for(var b=a.clientX,e=a.clientY,f=d("y"),l=d("x"),n,p=q.length;p--;){n=q[p];if(w)for(var r=a.touches&&a.touches.length,u;r--;){if(u=a.touches[r],u.identifier==n.el._drag.id||n.el.node.contains(u.target)){b=
+u.clientX;e=u.clientY;(a.originalEvent?a.originalEvent:a).preventDefault();break}}else a.preventDefault();b+=l;e+=f;k("snap.drag.move."+n.el.id,n.move_scope||n.el,b-n.el._drag.x,e-n.el._drag.y,b,e,a)}},l=function(b){a.unmousemove(e).unmouseup(l);for(var d=q.length,f;d--;)f=q[d],f.el._drag={},k("snap.drag.end."+f.el.id,f.end_scope||f.start_scope||f.move_scope||f.el,b);q=[]};for(y=v.length;y--;)(function(d){a[d]=A[d]=function(e,f){a.is(e,"function")&&(this.events=this.events||[],this.events.push({name:d,
+f:e,unbind:b(this.node||document,d,e,f||this)}));return this};a["un"+d]=A["un"+d]=function(a){for(var b=this.events||[],e=b.length;e--;)if(b[e].name==d&&(b[e].f==a||!a)){b[e].unbind();b.splice(e,1);!b.length&&delete this.events;break}return this}})(v[y]);A.hover=function(a,b,d,e){return this.mouseover(a,d).mouseout(b,e||d)};A.unhover=function(a,b){return this.unmouseover(a).unmouseout(b)};var r=[];A.drag=function(b,d,f,h,n,p){function u(r,v,w){(r.originalEvent||r).preventDefault();this._drag.x=v;
+this._drag.y=w;this._drag.id=r.identifier;!q.length&&a.mousemove(e).mouseup(l);q.push({el:this,move_scope:h,start_scope:n,end_scope:p});d&&k.on("snap.drag.start."+this.id,d);b&&k.on("snap.drag.move."+this.id,b);f&&k.on("snap.drag.end."+this.id,f);k("snap.drag.start."+this.id,n||h||this,v,w,r)}if(!arguments.length){var v;return this.drag(function(a,b){this.attr({transform:v+(v?"T":"t")+[a,b]})},function(){v=this.transform().local})}this._drag={};r.push({el:this,start:u});this.mousedown(u);return this};
+A.undrag=function(){for(var b=r.length;b--;)r[b].el==this&&(this.unmousedown(r[b].start),r.splice(b,1),k.unbind("snap.drag.*."+this.id));!r.length&&a.unmousemove(e).unmouseup(l);return this}});C.plugin(function(a,v,y,C){y=y.prototype;var A=/^\s*url\((.+)\)/,w=String,z=a._.$;a.filter={};y.filter=function(d){var f=this;"svg"!=f.type&&(f=f.paper);d=a.parse(w(d));var k=a._.id(),u=z("filter");z(u,{id:k,filterUnits:"userSpaceOnUse"});u.appendChild(d.node);f.defs.appendChild(u);return new v(u)};k.on("snap.util.getattr.filter",
+function(){k.stop();var d=z(this.node,"filter");if(d)return(d=w(d).match(A))&&a.select(d[1])});k.on("snap.util.attr.filter",function(d){if(d instanceof v&&"filter"==d.type){k.stop();var f=d.node.id;f||(z(d.node,{id:d.id}),f=d.id);z(this.node,{filter:a.url(f)})}d&&"none"!=d||(k.stop(),this.node.removeAttribute("filter"))});a.filter.blur=function(d,f){null==d&&(d=2);return a.format('<feGaussianBlur stdDeviation="{def}"/>',{def:null==f?d:[d,f]})};a.filter.blur.toString=function(){return this()};a.filter.shadow=
+function(d,f,k,u,p){"string"==typeof k&&(p=u=k,k=4);"string"!=typeof u&&(p=u,u="#000");null==k&&(k=4);null==p&&(p=1);null==d&&(d=0,f=2);null==f&&(f=d);u=a.color(u||"#000");return a.format('<feGaussianBlur in="SourceAlpha" stdDeviation="{blur}"/><feOffset dx="{dx}" dy="{dy}" result="offsetblur"/><feFlood flood-color="{color}"/><feComposite in2="offsetblur" operator="in"/><feComponentTransfer><feFuncA type="linear" slope="{opacity}"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>',
+{color:u,dx:d,dy:f,blur:k,opacity:p})};a.filter.shadow.toString=function(){return this()};a.filter.grayscale=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {b} {h} 0 0 0 0 0 1 0"/>',{a:0.2126+0.7874*(1-d),b:0.7152-0.7152*(1-d),c:0.0722-0.0722*(1-d),d:0.2126-0.2126*(1-d),e:0.7152+0.2848*(1-d),f:0.0722-0.0722*(1-d),g:0.2126-0.2126*(1-d),h:0.0722+0.9278*(1-d)})};a.filter.grayscale.toString=function(){return this()};a.filter.sepia=
+function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {h} {i} 0 0 0 0 0 1 0"/>',{a:0.393+0.607*(1-d),b:0.769-0.769*(1-d),c:0.189-0.189*(1-d),d:0.349-0.349*(1-d),e:0.686+0.314*(1-d),f:0.168-0.168*(1-d),g:0.272-0.272*(1-d),h:0.534-0.534*(1-d),i:0.131+0.869*(1-d)})};a.filter.sepia.toString=function(){return this()};a.filter.saturate=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="saturate" values="{amount}"/>',{amount:1-
+d})};a.filter.saturate.toString=function(){return this()};a.filter.hueRotate=function(d){return a.format('<feColorMatrix type="hueRotate" values="{angle}"/>',{angle:d||0})};a.filter.hueRotate.toString=function(){return this()};a.filter.invert=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="table" tableValues="{amount} {amount2}"/><feFuncG type="table" tableValues="{amount} {amount2}"/><feFuncB type="table" tableValues="{amount} {amount2}"/></feComponentTransfer>',{amount:d,
+amount2:1-d})};a.filter.invert.toString=function(){return this()};a.filter.brightness=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}"/><feFuncG type="linear" slope="{amount}"/><feFuncB type="linear" slope="{amount}"/></feComponentTransfer>',{amount:d})};a.filter.brightness.toString=function(){return this()};a.filter.contrast=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}" intercept="{amount2}"/><feFuncG type="linear" slope="{amount}" intercept="{amount2}"/><feFuncB type="linear" slope="{amount}" intercept="{amount2}"/></feComponentTransfer>',
+{amount:d,amount2:0.5-d/2})};a.filter.contrast.toString=function(){return this()}});return C});
+
+]]> </script>
+<script> <![CDATA[
+
+(function (glob, factory) {
+    // AMD support
+    if (typeof define === "function" && define.amd) {
+        // Define as an anonymous module
+        define("Gadfly", ["Snap.svg"], function (Snap) {
+            return factory(Snap);
+        });
+    } else {
+        // Browser globals (glob is window)
+        // Snap adds itself to window
+        glob.Gadfly = factory(glob.Snap);
+    }
+}(this, function (Snap) {
+
+var Gadfly = {};
+
+// Get an x/y coordinate value in pixels
+var xPX = function(fig, x) {
+    var client_box = fig.node.getBoundingClientRect();
+    return x * fig.node.viewBox.baseVal.width / client_box.width;
+};
+
+var yPX = function(fig, y) {
+    var client_box = fig.node.getBoundingClientRect();
+    return y * fig.node.viewBox.baseVal.height / client_box.height;
+};
+
+
+Snap.plugin(function (Snap, Element, Paper, global) {
+    // Traverse upwards from a snap element to find and return the first
+    // note with the "plotroot" class.
+    Element.prototype.plotroot = function () {
+        var element = this;
+        while (!element.hasClass("plotroot") && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.svgroot = function () {
+        var element = this;
+        while (element.node.nodeName != "svg" && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.plotbounds = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x0: bbox.x,
+            x1: bbox.x + bbox.width,
+            y0: bbox.y,
+            y1: bbox.y + bbox.height
+        };
+    };
+
+    Element.prototype.plotcenter = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x: bbox.x + bbox.width / 2,
+            y: bbox.y + bbox.height / 2
+        };
+    };
+
+    // Emulate IE style mouseenter/mouseleave events, since Microsoft always
+    // does everything right.
+    // See: http://www.dynamic-tools.net/toolbox/isMouseLeaveOrEnter/
+    var events = ["mouseenter", "mouseleave"];
+
+    for (i in events) {
+        (function (event_name) {
+            var event_name = events[i];
+            Element.prototype[event_name] = function (fn, scope) {
+                if (Snap.is(fn, "function")) {
+                    var fn2 = function (event) {
+                        if (event.type != "mouseover" && event.type != "mouseout") {
+                            return;
+                        }
+
+                        var reltg = event.relatedTarget ? event.relatedTarget :
+                            event.type == "mouseout" ? event.toElement : event.fromElement;
+                        while (reltg && reltg != this.node) reltg = reltg.parentNode;
+
+                        if (reltg != this.node) {
+                            return fn.apply(this, event);
+                        }
+                    };
+
+                    if (event_name == "mouseenter") {
+                        this.mouseover(fn2, scope);
+                    } else {
+                        this.mouseout(fn2, scope);
+                    }
+                }
+                return this;
+            };
+        })(events[i]);
+    }
+
+
+    Element.prototype.mousewheel = function (fn, scope) {
+        if (Snap.is(fn, "function")) {
+            var el = this;
+            var fn2 = function (event) {
+                fn.apply(el, [event]);
+            };
+        }
+
+        this.node.addEventListener(
+            /Firefox/i.test(navigator.userAgent) ? "DOMMouseScroll" : "mousewheel",
+            fn2);
+
+        return this;
+    };
+
+
+    // Snap's attr function can be too slow for things like panning/zooming.
+    // This is a function to directly update element attributes without going
+    // through eve.
+    Element.prototype.attribute = function(key, val) {
+        if (val === undefined) {
+            return this.node.getAttribute(key);
+        } else {
+            this.node.setAttribute(key, val);
+            return this;
+        }
+    };
+
+    Element.prototype.init_gadfly = function() {
+        this.mouseenter(Gadfly.plot_mouseover)
+            .mouseleave(Gadfly.plot_mouseout)
+            .dblclick(Gadfly.plot_dblclick)
+            .mousewheel(Gadfly.guide_background_scroll)
+            .drag(Gadfly.guide_background_drag_onmove,
+                  Gadfly.guide_background_drag_onstart,
+                  Gadfly.guide_background_drag_onend);
+        this.mouseenter(function (event) {
+            init_pan_zoom(this.plotroot());
+        });
+        return this;
+    };
+});
+
+
+// When the plot is moused over, emphasize the grid lines.
+Gadfly.plot_mouseover = function(event) {
+    var root = this.plotroot();
+
+    var keyboard_zoom = function(event) {
+        if (event.which == 187) { // plus
+            increase_zoom_by_position(root, 0.1, true);
+        } else if (event.which == 189) { // minus
+            increase_zoom_by_position(root, -0.1, true);
+        }
+    };
+    root.data("keyboard_zoom", keyboard_zoom);
+    window.addEventListener("keyup", keyboard_zoom);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    xgridlines.data("unfocused_strokedash",
+                    xgridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+    ygridlines.data("unfocused_strokedash",
+                    ygridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+
+    // emphasize grid lines
+    var destcolor = root.data("focused_xgrid_color");
+    xgridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("focused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // reveal zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 1.0}, 250);
+};
+
+// Reset pan and zoom on double click
+Gadfly.plot_dblclick = function(event) {
+  set_plot_pan_zoom(this.plotroot(), 0.0, 0.0, 1.0);
+};
+
+// Unemphasize grid lines on mouse out.
+Gadfly.plot_mouseout = function(event) {
+    var root = this.plotroot();
+
+    window.removeEventListener("keyup", root.data("keyboard_zoom"));
+    root.data("keyboard_zoom", undefined);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    var destcolor = root.data("unfocused_xgrid_color");
+
+    xgridlines.attribute("stroke-dasharray", xgridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("unfocused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", ygridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // hide zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 0.0}, 250);
+};
+
+
+var set_geometry_transform = function(root, tx, ty, scale) {
+    var xscalable = root.hasClass("xscalable"),
+        yscalable = root.hasClass("yscalable");
+
+    var old_scale = root.data("scale");
+
+    var xscale = xscalable ? scale : 1.0,
+        yscale = yscalable ? scale : 1.0;
+
+    tx = xscalable ? tx : 0.0;
+    ty = yscalable ? ty : 0.0;
+
+    var t = new Snap.Matrix().translate(tx, ty).scale(xscale, yscale);
+
+    root.selectAll(".geometry, image")
+        .forEach(function (element, i) {
+            element.transform(t);
+        });
+
+    bounds = root.plotbounds();
+
+    if (yscalable) {
+        var xfixed_t = new Snap.Matrix().translate(0, ty).scale(1.0, yscale);
+        root.selectAll(".xfixed")
+            .forEach(function (element, i) {
+                element.transform(xfixed_t);
+            });
+
+        root.select(".ylabels")
+            .transform(xfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1, 1/scale, cx, cy).add(st);
+                    element.transform(unscale_t);
+
+                    var y = cy * scale + ty;
+                    element.attr("visibility",
+                        bounds.y0 <= y && y <= bounds.y1 ? "visible" : "hidden");
+                }
+            });
+    }
+
+    if (xscalable) {
+        var yfixed_t = new Snap.Matrix().translate(tx, 0).scale(xscale, 1.0);
+        var xtrans = new Snap.Matrix().translate(tx, 0);
+        root.selectAll(".yfixed")
+            .forEach(function (element, i) {
+                element.transform(yfixed_t);
+            });
+
+        root.select(".xlabels")
+            .transform(yfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1/scale, 1, cx, cy).add(st);
+
+                    element.transform(unscale_t);
+
+                    var x = cx * scale + tx;
+                    element.attr("visibility",
+                        bounds.x0 <= x && x <= bounds.x1 ? "visible" : "hidden");
+                    }
+            });
+    }
+
+    // we must unscale anything that is scale invariance: widths, raiduses, etc.
+    var size_attribs = ["font-size"];
+    var unscaled_selection = ".geometry, .geometry *";
+    if (xscalable) {
+        size_attribs.push("rx");
+        unscaled_selection += ", .xgridlines";
+    }
+    if (yscalable) {
+        size_attribs.push("ry");
+        unscaled_selection += ", .ygridlines";
+    }
+
+    root.selectAll(unscaled_selection)
+        .forEach(function (element, i) {
+            // circle need special help
+            if (element.node.nodeName == "circle") {
+                var cx = element.attribute("cx"),
+                    cy = element.attribute("cy");
+                unscale_t = new Snap.Matrix().scale(1/xscale, 1/yscale,
+                                                        cx, cy);
+                element.transform(unscale_t);
+                return;
+            }
+
+            for (i in size_attribs) {
+                var key = size_attribs[i];
+                var val = parseFloat(element.attribute(key));
+                if (val !== undefined && val != 0 && !isNaN(val)) {
+                    element.attribute(key, val * old_scale / scale);
+                }
+            }
+        });
+};
+
+
+// Find the most appropriate tick scale and update label visibility.
+var update_tickscale = function(root, scale, axis) {
+    if (!root.hasClass(axis + "scalable")) return;
+
+    var tickscales = root.data(axis + "tickscales");
+    var best_tickscale = 1.0;
+    var best_tickscale_dist = Infinity;
+    for (tickscale in tickscales) {
+        var dist = Math.abs(Math.log(tickscale) - Math.log(scale));
+        if (dist < best_tickscale_dist) {
+            best_tickscale_dist = dist;
+            best_tickscale = tickscale;
+        }
+    }
+
+    if (best_tickscale != root.data(axis + "tickscale")) {
+        root.data(axis + "tickscale", best_tickscale);
+        var mark_inscale_gridlines = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        var mark_inscale_labels = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        root.select("." + axis + "gridlines").selectAll("path").forEach(mark_inscale_gridlines);
+        root.select("." + axis + "labels").selectAll("text").forEach(mark_inscale_labels);
+    }
+};
+
+
+var set_plot_pan_zoom = function(root, tx, ty, scale) {
+    var old_scale = root.data("scale");
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    // compute the viewport derived from tx, ty, and scale
+    var x_min = -width * scale - (scale * width - width),
+        x_max = width * scale,
+        y_min = -height * scale - (scale * height - height),
+        y_max = height * scale;
+
+    var x0 = bounds.x0 - scale * bounds.x0,
+        y0 = bounds.y0 - scale * bounds.y0;
+
+    var tx = Math.max(Math.min(tx - x0, x_max), x_min),
+        ty = Math.max(Math.min(ty - y0, y_max), y_min);
+
+    tx += x0;
+    ty += y0;
+
+    // when the scale change, we may need to alter which set of
+    // ticks is being displayed
+    if (scale != old_scale) {
+        update_tickscale(root, scale, "x");
+        update_tickscale(root, scale, "y");
+    }
+
+    set_geometry_transform(root, tx, ty, scale);
+
+    root.data("scale", scale);
+    root.data("tx", tx);
+    root.data("ty", ty);
+};
+
+
+var scale_centered_translation = function(root, scale) {
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    var tx0 = root.data("tx"),
+        ty0 = root.data("ty");
+
+    var scale0 = root.data("scale");
+
+    // how off from center the current view is
+    var xoff = tx0 - (bounds.x0 * (1 - scale0) + (width * (1 - scale0)) / 2),
+        yoff = ty0 - (bounds.y0 * (1 - scale0) + (height * (1 - scale0)) / 2);
+
+    // rescale offsets
+    xoff = xoff * scale / scale0;
+    yoff = yoff * scale / scale0;
+
+    // adjust for the panel position being scaled
+    var x_edge_adjust = bounds.x0 * (1 - scale),
+        y_edge_adjust = bounds.y0 * (1 - scale);
+
+    return {
+        x: xoff + x_edge_adjust + (width - width * scale) / 2,
+        y: yoff + y_edge_adjust + (height - height * scale) / 2
+    };
+};
+
+
+// Initialize data for panning zooming if it isn't already.
+var init_pan_zoom = function(root) {
+    if (root.data("zoompan-ready")) {
+        return;
+    }
+
+    // The non-scaling-stroke trick. Rather than try to correct for the
+    // stroke-width when zooming, we force it to a fixed value.
+    var px_per_mm = root.node.getCTM().a;
+
+    // Drag events report deltas in pixels, which we'd like to convert to
+    // millimeters.
+    root.data("px_per_mm", px_per_mm);
+
+    root.selectAll("path")
+        .forEach(function (element, i) {
+        sw = element.asPX("stroke-width") * px_per_mm;
+        if (sw > 0) {
+            element.attribute("stroke-width", sw);
+            element.attribute("vector-effect", "non-scaling-stroke");
+        }
+    });
+
+    // Store ticks labels original tranformation
+    root.selectAll(".xlabels > text, .ylabels > text")
+        .forEach(function (element, i) {
+            var lm = element.transform().localMatrix;
+            element.data("static_transform",
+                new Snap.Matrix(lm.a, lm.b, lm.c, lm.d, lm.e, lm.f));
+        });
+
+    var xgridlines = root.select(".xgridlines");
+    var ygridlines = root.select(".ygridlines");
+    var xlabels = root.select(".xlabels");
+    var ylabels = root.select(".ylabels");
+
+    if (root.data("tx") === undefined) root.data("tx", 0);
+    if (root.data("ty") === undefined) root.data("ty", 0);
+    if (root.data("scale") === undefined) root.data("scale", 1.0);
+    if (root.data("xtickscales") === undefined) {
+
+        // index all the tick scales that are listed
+        var xtickscales = {};
+        var ytickscales = {};
+        var add_x_tick_scales = function (element, i) {
+            xtickscales[element.attribute("gadfly:scale")] = true;
+        };
+        var add_y_tick_scales = function (element, i) {
+            ytickscales[element.attribute("gadfly:scale")] = true;
+        };
+
+        if (xgridlines) xgridlines.selectAll("path").forEach(add_x_tick_scales);
+        if (ygridlines) ygridlines.selectAll("path").forEach(add_y_tick_scales);
+        if (xlabels) xlabels.selectAll("text").forEach(add_x_tick_scales);
+        if (ylabels) ylabels.selectAll("text").forEach(add_y_tick_scales);
+
+        root.data("xtickscales", xtickscales);
+        root.data("ytickscales", ytickscales);
+        root.data("xtickscale", 1.0);
+    }
+
+    var min_scale = 1.0, max_scale = 1.0;
+    for (scale in xtickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    for (scale in ytickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    root.data("min_scale", min_scale);
+    root.data("max_scale", max_scale);
+
+    // store the original positions of labels
+    if (xlabels) {
+        xlabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("x", element.asPX("x"));
+               });
+    }
+
+    if (ylabels) {
+        ylabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("y", element.asPX("y"));
+               });
+    }
+
+    // mark grid lines and ticks as in or out of scale.
+    var mark_inscale = function (element, i) {
+        element.attribute("gadfly:inscale", element.attribute("gadfly:scale") == 1.0);
+    };
+
+    if (xgridlines) xgridlines.selectAll("path").forEach(mark_inscale);
+    if (ygridlines) ygridlines.selectAll("path").forEach(mark_inscale);
+    if (xlabels) xlabels.selectAll("text").forEach(mark_inscale);
+    if (ylabels) ylabels.selectAll("text").forEach(mark_inscale);
+
+    // figure out the upper ond lower bounds on panning using the maximum
+    // and minum grid lines
+    var bounds = root.plotbounds();
+    var pan_bounds = {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 0.0,
+        y1: 0.0
+    };
+
+    if (xgridlines) {
+        xgridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.x1 - bbox.x < pan_bounds.x0) {
+                        pan_bounds.x0 = bounds.x1 - bbox.x;
+                    }
+                    if (bounds.x0 - bbox.x > pan_bounds.x1) {
+                        pan_bounds.x1 = bounds.x0 - bbox.x;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    if (ygridlines) {
+        ygridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.y1 - bbox.y < pan_bounds.y0) {
+                        pan_bounds.y0 = bounds.y1 - bbox.y;
+                    }
+                    if (bounds.y0 - bbox.y > pan_bounds.y1) {
+                        pan_bounds.y1 = bounds.y0 - bbox.y;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    // nudge these values a little
+    pan_bounds.x0 -= 5;
+    pan_bounds.x1 += 5;
+    pan_bounds.y0 -= 5;
+    pan_bounds.y1 += 5;
+    root.data("pan_bounds", pan_bounds);
+
+    root.data("zoompan-ready", true)
+};
+
+
+// drag actions, i.e. zooming and panning
+var pan_action = {
+    start: function(root, x, y, event) {
+        root.data("dx", 0);
+        root.data("dy", 0);
+        root.data("tx0", root.data("tx"));
+        root.data("ty0", root.data("ty"));
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var px_per_mm = root.data("px_per_mm");
+        dx /= px_per_mm;
+        dy /= px_per_mm;
+
+        var tx0 = root.data("tx"),
+            ty0 = root.data("ty");
+
+        var dx0 = root.data("dx"),
+            dy0 = root.data("dy");
+
+        root.data("dx", dx);
+        root.data("dy", dy);
+
+        dx = dx - dx0;
+        dy = dy - dy0;
+
+        var tx = tx0 + dx,
+            ty = ty0 + dy;
+
+        set_plot_pan_zoom(root, tx, ty, root.data("scale"));
+    },
+    end: function(root, event) {
+
+    },
+    cancel: function(root) {
+        set_plot_pan_zoom(root, root.data("tx0"), root.data("ty0"), root.data("scale"));
+    }
+};
+
+var zoom_box;
+var zoom_action = {
+    start: function(root, x, y, event) {
+        var bounds = root.plotbounds();
+        var width = bounds.x1 - bounds.x0,
+            height = bounds.y1 - bounds.y0;
+        var ratio = width / height;
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        x = xscalable ? x / px_per_mm : bounds.x0;
+        y = yscalable ? y / px_per_mm : bounds.y0;
+        var w = xscalable ? 0 : width;
+        var h = yscalable ? 0 : height;
+        zoom_box = root.rect(x, y, w, h).attr({
+            "fill": "#000",
+            "opacity": 0.25
+        });
+        zoom_box.data("ratio", ratio);
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        var bounds = root.plotbounds();
+        if (yscalable) {
+            y /= px_per_mm;
+            y = Math.max(bounds.y0, y);
+            y = Math.min(bounds.y1, y);
+        } else {
+            y = bounds.y1;
+        }
+        if (xscalable) {
+            x /= px_per_mm;
+            x = Math.max(bounds.x0, x);
+            x = Math.min(bounds.x1, x);
+        } else {
+            x = bounds.x1;
+        }
+
+        dx = x - zoom_box.attr("x");
+        dy = y - zoom_box.attr("y");
+        if (xscalable && yscalable) {
+            var ratio = zoom_box.data("ratio");
+            var width = Math.min(Math.abs(dx), ratio * Math.abs(dy));
+            var height = Math.min(Math.abs(dy), Math.abs(dx) / ratio);
+            dx = width * dx / Math.abs(dx);
+            dy = height * dy / Math.abs(dy);
+        }
+        var xoffset = 0,
+            yoffset = 0;
+        if (dx < 0) {
+            xoffset = dx;
+            dx = -1 * dx;
+        }
+        if (dy < 0) {
+            yoffset = dy;
+            dy = -1 * dy;
+        }
+        if (isNaN(dy)) {
+            dy = 0.0;
+        }
+        if (isNaN(dx)) {
+            dx = 0.0;
+        }
+        zoom_box.transform("T" + xoffset + "," + yoffset);
+        zoom_box.attr("width", dx);
+        zoom_box.attr("height", dy);
+    },
+    end: function(root, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var zoom_bounds = zoom_box.getBBox();
+        if (zoom_bounds.width * zoom_bounds.height <= 0) {
+            return;
+        }
+        var plot_bounds = root.plotbounds();
+        var zoom_factor = 1.0;
+        if (yscalable) {
+            zoom_factor = (plot_bounds.y1 - plot_bounds.y0) / zoom_bounds.height;
+        } else {
+            zoom_factor = (plot_bounds.x1 - plot_bounds.x0) / zoom_bounds.width;
+        }
+        var tx = (root.data("tx") - zoom_bounds.x) * zoom_factor + plot_bounds.x0,
+            ty = (root.data("ty") - zoom_bounds.y) * zoom_factor + plot_bounds.y0;
+        set_plot_pan_zoom(root, tx, ty, root.data("scale") * zoom_factor);
+        zoom_box.remove();
+    },
+    cancel: function(root) {
+        zoom_box.remove();
+    }
+};
+
+
+Gadfly.guide_background_drag_onstart = function(x, y, event) {
+    var root = this.plotroot();
+    var scalable = root.hasClass("xscalable") || root.hasClass("yscalable");
+    var zoomable = !event.altKey && !event.ctrlKey && event.shiftKey && scalable;
+    var panable = !event.altKey && !event.ctrlKey && !event.shiftKey && scalable;
+    var drag_action = zoomable ? zoom_action :
+                      panable  ? pan_action :
+                                 undefined;
+    root.data("drag_action", drag_action);
+    if (drag_action) {
+        var cancel_drag_action = function(event) {
+            if (event.which == 27) { // esc key
+                drag_action.cancel(root);
+                root.data("drag_action", undefined);
+            }
+        };
+        window.addEventListener("keyup", cancel_drag_action);
+        root.data("cancel_drag_action", cancel_drag_action);
+        drag_action.start(root, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.update(root, dx, dy, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onend = function(event) {
+    var root = this.plotroot();
+    window.removeEventListener("keyup", root.data("cancel_drag_action"));
+    root.data("cancel_drag_action", undefined);
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.end(root, event);
+    }
+    root.data("drag_action", undefined);
+};
+
+
+Gadfly.guide_background_scroll = function(event) {
+    if (event.shiftKey) {
+        increase_zoom_by_position(this.plotroot(), 0.001 * event.wheelDelta);
+        event.preventDefault();
+    }
+};
+
+
+Gadfly.zoomslider_button_mouseover = function(event) {
+    this.select(".button_logo")
+         .animate({fill: this.data("mouseover_color")}, 100);
+};
+
+
+Gadfly.zoomslider_button_mouseout = function(event) {
+     this.select(".button_logo")
+         .animate({fill: this.data("mouseout_color")}, 100);
+};
+
+
+Gadfly.zoomslider_zoomout_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), -0.1, true);
+};
+
+
+Gadfly.zoomslider_zoomin_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), 0.1, true);
+};
+
+
+Gadfly.zoomslider_track_click = function(event) {
+    // TODO
+};
+
+
+// Map slider position x to scale y using the function y = a*exp(b*x)+c.
+// The constants a, b, and c are solved using the constraint that the function
+// should go through the points (0; min_scale), (0.5; 1), and (1; max_scale).
+var scale_from_slider_position = function(position, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return a * Math.exp(b * position) + c;
+}
+
+// inverse of scale_from_slider_position
+var slider_position_from_scale = function(scale, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return 1 / b * Math.log((scale - c) / a);
+}
+
+var increase_zoom_by_position = function(root, delta_position, animate) {
+    var scale = root.data("scale"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale");
+    var position = slider_position_from_scale(scale, min_scale, max_scale);
+    position += delta_position;
+    scale = scale_from_slider_position(position, min_scale, max_scale);
+    set_zoom(root, scale, animate);
+}
+
+var set_zoom = function(root, scale, animate) {
+    var min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("scale");
+    var new_scale = Math.max(min_scale, Math.min(scale, max_scale));
+    if (animate) {
+        Snap.animate(
+            old_scale,
+            new_scale,
+            function (new_scale) {
+                update_plot_scale(root, new_scale);
+            },
+            200);
+    } else {
+        update_plot_scale(root, new_scale);
+    }
+}
+
+
+var update_plot_scale = function(root, new_scale) {
+    var trans = scale_centered_translation(root, new_scale);
+    set_plot_pan_zoom(root, trans.x, trans.y, new_scale);
+
+    root.selectAll(".zoomslider_thumb")
+        .forEach(function (element, i) {
+            var min_pos = element.data("min_pos"),
+                max_pos = element.data("max_pos"),
+                min_scale = root.data("min_scale"),
+                max_scale = root.data("max_scale");
+            var xmid = (min_pos + max_pos) / 2;
+            var xpos = slider_position_from_scale(new_scale, min_scale, max_scale);
+            element.transform(new Snap.Matrix().translate(
+                Math.max(min_pos, Math.min(
+                         max_pos, min_pos + (max_pos - min_pos) * xpos)) - xmid, 0));
+    });
+};
+
+
+Gadfly.zoomslider_thumb_dragmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var min_pos = this.data("min_pos"),
+        max_pos = this.data("max_pos"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("old_scale");
+
+    var px_per_mm = root.data("px_per_mm");
+    dx /= px_per_mm;
+    dy /= px_per_mm;
+
+    var xmid = (min_pos + max_pos) / 2;
+    var xpos = slider_position_from_scale(old_scale, min_scale, max_scale) +
+                   dx / (max_pos - min_pos);
+
+    // compute the new scale
+    var new_scale = scale_from_slider_position(xpos, min_scale, max_scale);
+    new_scale = Math.min(max_scale, Math.max(min_scale, new_scale));
+
+    update_plot_scale(root, new_scale);
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragstart = function(x, y, event) {
+    this.animate({fill: this.data("mouseover_color")}, 100);
+    var root = this.plotroot();
+
+    // keep track of what the scale was when we started dragging
+    root.data("old_scale", root.data("scale"));
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragend = function(event) {
+    this.animate({fill: this.data("mouseout_color")}, 100);
+    event.stopPropagation();
+};
+
+
+var toggle_color_class = function(root, color_class, ison) {
+    var guides = root.selectAll(".guide." + color_class + ",.guide ." + color_class);
+    var geoms = root.selectAll(".geometry." + color_class + ",.geometry ." + color_class);
+    if (ison) {
+        guides.animate({opacity: 0.5}, 250);
+        geoms.animate({opacity: 0.0}, 250);
+    } else {
+        guides.animate({opacity: 1.0}, 250);
+        geoms.animate({opacity: 1.0}, 250);
+    }
+};
+
+
+Gadfly.colorkey_swatch_click = function(event) {
+    var root = this.plotroot();
+    var color_class = this.data("color_class");
+
+    if (event.shiftKey) {
+        root.selectAll(".colorkey text")
+            .forEach(function (element) {
+                var other_color_class = element.data("color_class");
+                if (other_color_class != color_class) {
+                    toggle_color_class(root, other_color_class,
+                                       element.attr("opacity") == 1.0);
+                }
+            });
+    } else {
+        toggle_color_class(root, color_class, this.attr("opacity") == 1.0);
+    }
+};
+
+
+return Gadfly;
+
+}));
+
+
+//@ sourceURL=gadfly.js
+
+(function (glob, factory) {
+    // AMD support
+      if (typeof require === "function" && typeof define === "function" && define.amd) {
+        require(["Snap.svg", "Gadfly"], function (Snap, Gadfly) {
+            factory(Snap, Gadfly);
+        });
+      } else {
+          factory(glob.Snap, glob.Gadfly);
+      }
+})(window, function (Snap, Gadfly) {
+    var fig = Snap("#fig-2818e351c0b64d329dd1446ada8e8069");
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-4")
+   .drag(function() {}, function() {}, function() {});
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-8")
+   .init_gadfly();
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-11")
+   .plotroot().data("unfocused_ygrid_color", "#D0D0E0")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-11")
+   .plotroot().data("focused_ygrid_color", "#A0A0A0")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-12")
+   .plotroot().data("unfocused_xgrid_color", "#D0D0E0")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-12")
+   .plotroot().data("focused_xgrid_color", "#A0A0A0")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-20")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-20")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-20")
+   .click(Gadfly.zoomslider_zoomin_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-22")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-22")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-22")
+   .click(Gadfly.zoomslider_track_click);
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-23")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-23")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-23")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-23")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-23")
+   .drag(Gadfly.zoomslider_thumb_dragmove,
+     Gadfly.zoomslider_thumb_dragstart,
+     Gadfly.zoomslider_thumb_dragend)
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-24")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-24")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-2818e351c0b64d329dd1446ada8e8069-element-24")
+   .click(Gadfly.zoomslider_zoomout_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+    });
+]]> </script>
+</svg>
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:gadfly="http://www.gadflyjl.org/ns"
+     version="1.2"
+     width="141.42mm" height="100mm" viewBox="0 0 141.42 100"
+     stroke="none"
+     fill="#000000"
+     stroke-width="0.3"
+     font-size="3.88"
+
+     id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f">
+<g class="plotroot xscalable yscalable" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-1">
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-2">
+    <text x="64.7" y="88.39" text-anchor="middle" dy="0.6em">Measurement Number</text>
+  </g>
+  <g class="guide xlabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-3">
+    <text x="-116.52" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-150</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-100</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">-50</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">50</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="visible">100</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">150</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">200</text>
+    <text x="245.92" y="84.39" text-anchor="middle" gadfly:scale="1.0" visibility="hidden">250</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-100</text>
+    <text x="-66.68" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-95</text>
+    <text x="-62.15" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-90</text>
+    <text x="-57.62" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-85</text>
+    <text x="-53.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-80</text>
+    <text x="-48.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-75</text>
+    <text x="-44.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-70</text>
+    <text x="-39.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-65</text>
+    <text x="-34.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-60</text>
+    <text x="-30.44" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-55</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-50</text>
+    <text x="-21.38" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-45</text>
+    <text x="-16.85" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-40</text>
+    <text x="-12.32" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-35</text>
+    <text x="-7.78" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-30</text>
+    <text x="-3.25" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-25</text>
+    <text x="1.28" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-20</text>
+    <text x="5.81" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-15</text>
+    <text x="10.34" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-10</text>
+    <text x="14.87" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">-5</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">0</text>
+    <text x="23.93" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">5</text>
+    <text x="28.46" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">10</text>
+    <text x="32.99" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">15</text>
+    <text x="37.52" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">20</text>
+    <text x="42.05" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">25</text>
+    <text x="46.58" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">30</text>
+    <text x="51.11" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">35</text>
+    <text x="55.64" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">40</text>
+    <text x="60.17" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">45</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">50</text>
+    <text x="69.23" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">55</text>
+    <text x="73.76" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">60</text>
+    <text x="78.29" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">65</text>
+    <text x="82.83" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">70</text>
+    <text x="87.36" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">75</text>
+    <text x="91.89" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">80</text>
+    <text x="96.42" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">85</text>
+    <text x="100.95" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">90</text>
+    <text x="105.48" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">95</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">100</text>
+    <text x="114.54" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">105</text>
+    <text x="119.07" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">110</text>
+    <text x="123.6" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">115</text>
+    <text x="128.13" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">120</text>
+    <text x="132.66" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">125</text>
+    <text x="137.19" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">130</text>
+    <text x="141.72" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">135</text>
+    <text x="146.25" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">140</text>
+    <text x="150.78" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">145</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">150</text>
+    <text x="159.84" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">155</text>
+    <text x="164.37" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">160</text>
+    <text x="168.9" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">165</text>
+    <text x="173.43" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">170</text>
+    <text x="177.97" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">175</text>
+    <text x="182.5" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">180</text>
+    <text x="187.03" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">185</text>
+    <text x="191.56" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">190</text>
+    <text x="196.09" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">195</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="10.0" visibility="hidden">200</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">-100</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">100</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="0.5" visibility="hidden">200</text>
+    <text x="-71.21" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-100</text>
+    <text x="-62.15" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-90</text>
+    <text x="-53.09" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-80</text>
+    <text x="-44.03" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-70</text>
+    <text x="-34.97" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-60</text>
+    <text x="-25.91" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-50</text>
+    <text x="-16.85" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-40</text>
+    <text x="-7.78" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-30</text>
+    <text x="1.28" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-20</text>
+    <text x="10.34" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">-10</text>
+    <text x="19.4" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">0</text>
+    <text x="28.46" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">10</text>
+    <text x="37.52" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">20</text>
+    <text x="46.58" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">30</text>
+    <text x="55.64" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">40</text>
+    <text x="64.7" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">50</text>
+    <text x="73.76" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">60</text>
+    <text x="82.83" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">70</text>
+    <text x="91.89" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">80</text>
+    <text x="100.95" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">90</text>
+    <text x="110.01" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">100</text>
+    <text x="119.07" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">110</text>
+    <text x="128.13" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">120</text>
+    <text x="137.19" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">130</text>
+    <text x="146.25" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">140</text>
+    <text x="155.31" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">150</text>
+    <text x="164.37" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">160</text>
+    <text x="173.43" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">170</text>
+    <text x="182.5" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">180</text>
+    <text x="191.56" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">190</text>
+    <text x="200.62" y="84.39" text-anchor="middle" gadfly:scale="5.0" visibility="hidden">200</text>
+  </g>
+  <g class="guide colorkey" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-4">
+    <g fill="#4C404B" font-size="2.82" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-5">
+      <text x="115.82" y="44.85" dy="0.35em">Filtered Estimate</text>
+      <text x="115.82" y="48.48" dy="0.35em">Measurements</text>
+      <text x="115.82" y="52.1" dy="0.35em">True Value </text>
+    </g>
+    <g stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-6">
+      <rect x="113.01" y="43.94" width="1.81" height="1.81" fill="#00BFFF"/>
+      <rect x="113.01" y="47.57" width="1.81" height="1.81" fill="#D4CA3A"/>
+      <rect x="113.01" y="51.2" width="1.81" height="1.81" fill="#FF5EA0"/>
+    </g>
+    <g fill="#362A35" font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-7">
+      <text x="113.01" y="41.03">Colour Key</text>
+    </g>
+  </g>
+  <g clip-path="url(#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-9)" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-8">
+    <g pointer-events="visible" opacity="1" fill="#000000" fill-opacity="0.000" stroke="#000000" stroke-opacity="0.000" class="guide background" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-10">
+      <rect x="17.4" y="12.61" width="94.61" height="68.1"/>
+    </g>
+    <g class="guide ygridlines xfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-11">
+      <path fill="none" d="M17.4,155.64 L 112.01 155.64" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-62.31 L 112.01 -62.31" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,140.25 L 112.01 140.25" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,137.69 L 112.01 137.69" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,135.13 L 112.01 135.13" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,132.56 L 112.01 132.56" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,127.43 L 112.01 127.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,124.87 L 112.01 124.87" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,122.31 L 112.01 122.31" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,119.74 L 112.01 119.74" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,114.61 L 112.01 114.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,112.05 L 112.01 112.05" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,109.48 L 112.01 109.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,106.92 L 112.01 106.92" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,101.79 L 112.01 101.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,99.23 L 112.01 99.23" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,96.66 L 112.01 96.66" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,94.1 L 112.01 94.1" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,88.97 L 112.01 88.97" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,86.41 L 112.01 86.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,83.84 L 112.01 83.84" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,81.28 L 112.01 81.28" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,76.15 L 112.01 76.15" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,73.59 L 112.01 73.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,71.02 L 112.01 71.02" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,68.46 L 112.01 68.46" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,63.33 L 112.01 63.33" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,60.77 L 112.01 60.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,58.2 L 112.01 58.2" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,55.64 L 112.01 55.64" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,50.51 L 112.01 50.51" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,47.95 L 112.01 47.95" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,45.38 L 112.01 45.38" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,42.82 L 112.01 42.82" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,37.69 L 112.01 37.69" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,35.12 L 112.01 35.12" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,32.56 L 112.01 32.56" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,30 L 112.01 30" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,24.87 L 112.01 24.87" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,22.3 L 112.01 22.3" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,19.74 L 112.01 19.74" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,17.18 L 112.01 17.18" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,12.05 L 112.01 12.05" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,9.48 L 112.01 9.48" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,6.92 L 112.01 6.92" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,4.36 L 112.01 4.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-0.77 L 112.01 -0.77" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-3.34 L 112.01 -3.34" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-5.9 L 112.01 -5.9" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-8.47 L 112.01 -8.47" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-13.59 L 112.01 -13.59" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-16.16 L 112.01 -16.16" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-18.72 L 112.01 -18.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-21.29 L 112.01 -21.29" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-26.41 L 112.01 -26.41" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-28.98 L 112.01 -28.98" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-31.54 L 112.01 -31.54" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-34.11 L 112.01 -34.11" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-39.24 L 112.01 -39.24" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-41.8 L 112.01 -41.8" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-44.36 L 112.01 -44.36" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-46.93 L 112.01 -46.93" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,181.28 L 112.01 181.28" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,-75.13 L 112.01 -75.13" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M17.4,142.82 L 112.01 142.82" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,136.41 L 112.01 136.41" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,130 L 112.01 130" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,123.59 L 112.01 123.59" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,117.18 L 112.01 117.18" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,110.77 L 112.01 110.77" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,104.36 L 112.01 104.36" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,97.95 L 112.01 97.95" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,91.54 L 112.01 91.54" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,85.13 L 112.01 85.13" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,78.72 L 112.01 78.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,72.3 L 112.01 72.3" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,65.89 L 112.01 65.89" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,59.48 L 112.01 59.48" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,53.07 L 112.01 53.07" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,46.66 L 112.01 46.66" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,40.25 L 112.01 40.25" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,33.84 L 112.01 33.84" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,27.43 L 112.01 27.43" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,21.02 L 112.01 21.02" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,14.61 L 112.01 14.61" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,8.2 L 112.01 8.2" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,1.79 L 112.01 1.79" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-4.62 L 112.01 -4.62" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-11.03 L 112.01 -11.03" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-17.44 L 112.01 -17.44" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-23.85 L 112.01 -23.85" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-30.26 L 112.01 -30.26" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-36.67 L 112.01 -36.67" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-43.08 L 112.01 -43.08" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M17.4,-49.49 L 112.01 -49.49" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="guide xgridlines yfixed" stroke-dasharray="0.5,0.5" stroke-width="0.2" stroke="#D0D0E0" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-12">
+      <path fill="none" d="M-116.52,12.61 L -116.52 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="1.0" visibility="visible"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M245.92,12.61 L 245.92 80.72" gadfly:scale="1.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-66.68,12.61 L -66.68 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-62.15,12.61 L -62.15 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-57.62,12.61 L -57.62 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-53.09,12.61 L -53.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-48.56,12.61 L -48.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-44.03,12.61 L -44.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-39.5,12.61 L -39.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-34.97,12.61 L -34.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-30.44,12.61 L -30.44 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-21.38,12.61 L -21.38 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-16.85,12.61 L -16.85 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-12.32,12.61 L -12.32 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-7.78,12.61 L -7.78 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-3.25,12.61 L -3.25 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M1.28,12.61 L 1.28 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M5.81,12.61 L 5.81 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M10.34,12.61 L 10.34 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M14.87,12.61 L 14.87 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M23.93,12.61 L 23.93 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M28.46,12.61 L 28.46 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M32.99,12.61 L 32.99 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M37.52,12.61 L 37.52 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M42.05,12.61 L 42.05 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M46.58,12.61 L 46.58 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M51.11,12.61 L 51.11 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M55.64,12.61 L 55.64 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M60.17,12.61 L 60.17 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M69.23,12.61 L 69.23 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M73.76,12.61 L 73.76 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M78.29,12.61 L 78.29 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M82.83,12.61 L 82.83 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M87.36,12.61 L 87.36 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M91.89,12.61 L 91.89 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M96.42,12.61 L 96.42 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M100.95,12.61 L 100.95 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M105.48,12.61 L 105.48 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M114.54,12.61 L 114.54 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M119.07,12.61 L 119.07 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M123.6,12.61 L 123.6 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M128.13,12.61 L 128.13 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M132.66,12.61 L 132.66 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M137.19,12.61 L 137.19 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M141.72,12.61 L 141.72 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M146.25,12.61 L 146.25 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M150.78,12.61 L 150.78 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M159.84,12.61 L 159.84 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M164.37,12.61 L 164.37 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M168.9,12.61 L 168.9 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M173.43,12.61 L 173.43 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M177.97,12.61 L 177.97 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M182.5,12.61 L 182.5 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M187.03,12.61 L 187.03 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M191.56,12.61 L 191.56 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M196.09,12.61 L 196.09 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="10.0" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="0.5" visibility="hidden"/>
+      <path fill="none" d="M-71.21,12.61 L -71.21 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-62.15,12.61 L -62.15 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-53.09,12.61 L -53.09 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-44.03,12.61 L -44.03 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-34.97,12.61 L -34.97 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-25.91,12.61 L -25.91 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-16.85,12.61 L -16.85 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M-7.78,12.61 L -7.78 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M1.28,12.61 L 1.28 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M10.34,12.61 L 10.34 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M19.4,12.61 L 19.4 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M28.46,12.61 L 28.46 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M37.52,12.61 L 37.52 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M46.58,12.61 L 46.58 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M55.64,12.61 L 55.64 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M64.7,12.61 L 64.7 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M73.76,12.61 L 73.76 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M82.83,12.61 L 82.83 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M91.89,12.61 L 91.89 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M100.95,12.61 L 100.95 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M110.01,12.61 L 110.01 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M119.07,12.61 L 119.07 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M128.13,12.61 L 128.13 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M137.19,12.61 L 137.19 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M146.25,12.61 L 146.25 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M155.31,12.61 L 155.31 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M164.37,12.61 L 164.37 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M173.43,12.61 L 173.43 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M182.5,12.61 L 182.5 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M191.56,12.61 L 191.56 80.72" gadfly:scale="5.0" visibility="hidden"/>
+      <path fill="none" d="M200.62,12.61 L 200.62 80.72" gadfly:scale="5.0" visibility="hidden"/>
+    </g>
+    <g class="plotpanel" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-13">
+      <g stroke-width="0.3" stroke="#000000" stroke-opacity="0.000" class="geometry" fill="#BDE8FF" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-14">
+        <path d="M110.01,53.38 L 109.1 52.9 108.2 52.77 107.29 52.76 106.38 52.46 105.48 51.89 104.57 52.87 103.67 52.28 102.76 52.03 101.85 51.82 100.95 52.52 100.04 53.24 99.13 53.57 98.23 54.09 97.32 54.58 96.42 55.06 95.51 54.99 94.6 55.03 93.7 55.3 92.79 55.74 91.89 55.35 90.98 54.9 90.07 54.67 89.17 53.9 88.26 54.07 87.36 54.34 86.45 54.13 85.54 54.02 84.64 54.29 83.73 54.48 82.83 54.67 81.92 54.8 81.01 55.21 80.11 55.28 79.2 54.56 78.29 55.01 77.39 55.35 76.48 55.09 75.58 55.39 74.67 55.58 73.76 55.15 72.86 55.24 71.95 55.71 71.05 55.55 70.14 54.65 69.23 53.59 68.33 53.71 67.42 53.05 66.52 52.59 65.61 52.66 64.7 53.85 63.8 54.02 62.89 54.16 61.98 54.53 61.08 55.11 60.17 55.67 59.27 55.26 58.36 55.21 57.45 55.36 56.55 55.08 55.64 55.16 54.74 54.97 53.83 54.79 52.92 54.76 52.02 54.51 51.11 54.71 50.21 54.62 49.3 54.28 48.39 54.56 47.49 53.84 46.58 54.3 45.68 53.71 44.77 53.89 43.86 54.52 42.96 55.39 42.05 54.46 41.14 53.84 40.24 54.41 39.33 54.81 38.43 55.7 37.52 55.25 36.61 55.47 35.71 55.92 34.8 57.32 33.9 57.27 32.99 59.36 32.08 61.28 31.18 57.86 30.27 60.34 29.37 65.35 28.46 69.47 27.55 71.43 26.65 76.79 25.74 78.14 24.83 77.84 23.93 70.27 23.02 70.67 22.12 69.61 21.21 69.29 20.3 72.53 19.4 59.48 19.4 33.84 20.3 21.7 21.21 19.79 22.12 23.05 23.02 28.31 23.93 32.5 24.83 44.41 25.74 47.81 26.65 48.72 27.55 45.13 28.46 44.81 29.37 42.23 30.27 38.78 31.18 37.98 32.08 43.15 32.99 42.77 33.9 42.06 34.8 43.38 35.71 43.1 36.61 43.65 37.52 44.31 38.43 45.52 39.33 45.27 40.24 45.42 41.14 45.32 42.05 46.35 42.96 47.63 43.86 47.03 44.77 46.63 45.68 46.66 46.58 47.41 47.49 47.09 48.39 47.93 49.3 47.75 50.21 48.17 51.11 48.32 52.02 48.17 52.92 48.46 53.83 48.52 54.74 48.73 55.64 48.94 56.55 48.88 57.45 49.17 58.36 49.03 59.27 49.08 60.17 49.51 61.08 48.94 61.98 48.37 62.89 48.01 63.8 47.88 64.7 47.74 65.61 46.57 66.52 46.54 67.42 47.03 68.33 47.73 69.23 47.65 70.14 48.75 71.05 49.68 71.95 49.86 72.86 49.41 73.76 49.32 74.67 49.76 75.58 49.57 76.48 49.27 77.39 49.53 78.29 49.19 79.2 48.75 80.11 49.47 81.01 49.41 81.92 49 82.83 48.88 83.73 48.7 84.64 48.53 85.54 48.27 86.45 48.39 87.36 48.61 88.26 48.37 89.17 48.21 90.07 49 90.98 49.24 91.89 49.7 92.79 50.1 93.7 49.66 94.6 49.39 95.51 49.35 96.42 49.43 97.32 48.95 98.23 48.46 99.13 47.95 100.04 47.63 100.95 46.92 101.85 46.23 102.76 46.46 103.67 46.73 104.57 47.34 105.48 46.37 106.38 46.95 107.29 47.27 108.2 47.29 109.1 47.42 110.01 47.91 z"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#00BFFF" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-15">
+        <path fill="none" d="M19.4,46.66 L 20.3 47.12 21.21 44.54 22.12 46.33 23.02 49.49 23.93 51.39 24.83 61.13 25.74 62.98 26.65 62.76 27.55 58.28 28.46 57.14 29.37 53.79 30.27 49.56 31.18 47.92 32.08 52.22 32.99 51.06 33.9 49.66 34.8 50.35 35.71 49.51 36.61 49.56 37.52 49.78 38.43 50.61 39.33 50.04 40.24 49.91 41.14 49.58 42.05 50.41 42.96 51.51 43.86 50.78 44.77 50.26 45.68 50.19 46.58 50.85 47.49 50.47 48.39 51.25 49.3 51.01 50.21 51.39 51.11 51.51 52.02 51.34 52.92 51.61 53.83 51.65 54.74 51.85 55.64 52.05 56.55 51.98 57.45 52.26 58.36 52.12 59.27 52.17 60.17 52.59 61.08 52.03 61.98 51.45 62.89 51.08 63.8 50.95 64.7 50.8 65.61 49.61 66.52 49.57 67.42 50.04 68.33 50.72 69.23 50.62 70.14 51.7 71.05 52.62 71.95 52.79 72.86 52.33 73.76 52.23 74.67 52.67 75.58 52.48 76.48 52.18 77.39 52.44 78.29 52.1 79.2 51.65 80.11 52.37 81.01 52.31 81.92 51.9 82.83 51.77 83.73 51.59 84.64 51.41 85.54 51.15 86.45 51.26 87.36 51.48 88.26 51.22 89.17 51.05 90.07 51.83 90.98 52.07 91.89 52.53 92.79 52.92 93.7 52.48 94.6 52.21 95.51 52.17 96.42 52.24 97.32 51.76 98.23 51.27 99.13 50.76 100.04 50.44 100.95 49.72 101.85 49.02 102.76 49.25 103.67 49.5 104.57 50.11 105.48 49.13 106.38 49.7 107.29 50.02 108.2 50.03 109.1 50.16 110.01 50.65"/>
+      </g>
+      <g stroke-width="0.3" fill="#000000" fill-opacity="0.000" class="geometry" stroke-dasharray="none" stroke="#FF5EA0" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-16">
+        <path fill="none" d="M19.4,50.51 L 20.3 50.51 21.21 50.51 22.12 50.51 23.02 50.51 23.93 50.51 24.83 50.51 25.74 50.51 26.65 50.51 27.55 50.51 28.46 50.51 29.37 50.51 30.27 50.51 31.18 50.51 32.08 50.51 32.99 50.51 33.9 50.51 34.8 50.51 35.71 50.51 36.61 50.51 37.52 50.51 38.43 50.51 39.33 50.51 40.24 50.51 41.14 50.51 42.05 50.51 42.96 50.51 43.86 50.51 44.77 50.51 45.68 50.51 46.58 50.51 47.49 50.51 48.39 50.51 49.3 50.51 50.21 50.51 51.11 50.51 52.02 50.51 52.92 50.51 53.83 50.51 54.74 50.51 55.64 50.51 56.55 50.51 57.45 50.51 58.36 50.51 59.27 50.51 60.17 50.51 61.08 50.51 61.98 50.51 62.89 50.51 63.8 50.51 64.7 50.51 65.61 50.51 66.52 50.51 67.42 50.51 68.33 50.51 69.23 50.51 70.14 50.51 71.05 50.51 71.95 50.51 72.86 50.51 73.76 50.51 74.67 50.51 75.58 50.51 76.48 50.51 77.39 50.51 78.29 50.51 79.2 50.51 80.11 50.51 81.01 50.51 81.92 50.51 82.83 50.51 83.73 50.51 84.64 50.51 85.54 50.51 86.45 50.51 87.36 50.51 88.26 50.51 89.17 50.51 90.07 50.51 90.98 50.51 91.89 50.51 92.79 50.51 93.7 50.51 94.6 50.51 95.51 50.51 96.42 50.51 97.32 50.51 98.23 50.51 99.13 50.51 100.04 50.51 100.95 50.51 101.85 50.51 102.76 50.51 103.67 50.51 104.57 50.51 105.48 50.51 106.38 50.51 107.29 50.51 108.2 50.51 109.1 50.51 110.01 50.51"/>
+      </g>
+    </g>
+    <g opacity="0" class="guide zoomslider" stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-17">
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-18">
+        <rect x="105.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-19">
+          <path d="M105.81,17.21 L 106.61 17.21 106.61 16.41 107.41 16.41 107.41 17.21 108.21 17.21 108.21 18.01 107.41 18.01 107.41 18.81 106.61 18.81 106.61 18.01 105.81 18.01 z"/>
+        </g>
+      </g>
+      <g fill="#EAEAEA" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-20">
+        <rect x="85.51" y="15.61" width="19" height="4"/>
+      </g>
+      <g class="zoomslider_thumb" fill="#6A6A6A" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21">
+        <rect x="94.01" y="15.61" width="2" height="4"/>
+      </g>
+      <g fill="#EAEAEA" stroke-width="0.3" stroke-opacity="0" stroke="#6A6A6A" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-22">
+        <rect x="81.01" y="15.61" width="4" height="4"/>
+        <g class="button_logo" fill="#6A6A6A" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-23">
+          <path d="M81.81,17.21 L 84.21 17.21 84.21 18.01 81.81 18.01 z"/>
+        </g>
+      </g>
+    </g>
+  </g>
+  <g class="guide ylabels" font-size="2.82" font-family="'PT Sans Caption','Helvetica Neue','Helvetica',sans-serif" fill="#6C606B" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-24">
+    <text x="16.4" y="155.64" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-8</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-7</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-6</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-5</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-4</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">-3</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">-2</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">-1</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">0</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">1</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">2</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="visible">3</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">4</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">5</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">6</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">7</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">8</text>
+    <text x="16.4" y="-62.31" text-anchor="end" dy="0.35em" gadfly:scale="1.0" visibility="hidden">9</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-7.0</text>
+    <text x="16.4" y="140.25" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.8</text>
+    <text x="16.4" y="137.69" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.6</text>
+    <text x="16.4" y="135.13" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.4</text>
+    <text x="16.4" y="132.56" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.2</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-6.0</text>
+    <text x="16.4" y="127.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.8</text>
+    <text x="16.4" y="124.87" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.6</text>
+    <text x="16.4" y="122.31" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.4</text>
+    <text x="16.4" y="119.74" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.2</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-5.0</text>
+    <text x="16.4" y="114.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.8</text>
+    <text x="16.4" y="112.05" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.6</text>
+    <text x="16.4" y="109.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.4</text>
+    <text x="16.4" y="106.92" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.2</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-4.0</text>
+    <text x="16.4" y="101.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.8</text>
+    <text x="16.4" y="99.23" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.6</text>
+    <text x="16.4" y="96.66" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.4</text>
+    <text x="16.4" y="94.1" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.2</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-3.0</text>
+    <text x="16.4" y="88.97" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.8</text>
+    <text x="16.4" y="86.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.6</text>
+    <text x="16.4" y="83.84" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.4</text>
+    <text x="16.4" y="81.28" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.2</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-2.0</text>
+    <text x="16.4" y="76.15" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.8</text>
+    <text x="16.4" y="73.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.6</text>
+    <text x="16.4" y="71.02" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.4</text>
+    <text x="16.4" y="68.46" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.2</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-1.0</text>
+    <text x="16.4" y="63.33" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.8</text>
+    <text x="16.4" y="60.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.6</text>
+    <text x="16.4" y="58.2" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.4</text>
+    <text x="16.4" y="55.64" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">-0.2</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.0</text>
+    <text x="16.4" y="50.51" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.2</text>
+    <text x="16.4" y="47.95" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.4</text>
+    <text x="16.4" y="45.38" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.6</text>
+    <text x="16.4" y="42.82" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">0.8</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.0</text>
+    <text x="16.4" y="37.69" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.2</text>
+    <text x="16.4" y="35.12" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.4</text>
+    <text x="16.4" y="32.56" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.6</text>
+    <text x="16.4" y="30" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">1.8</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.0</text>
+    <text x="16.4" y="24.87" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.2</text>
+    <text x="16.4" y="22.3" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.4</text>
+    <text x="16.4" y="19.74" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.6</text>
+    <text x="16.4" y="17.18" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">2.8</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.0</text>
+    <text x="16.4" y="12.05" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.2</text>
+    <text x="16.4" y="9.48" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.4</text>
+    <text x="16.4" y="6.92" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.6</text>
+    <text x="16.4" y="4.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">3.8</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.0</text>
+    <text x="16.4" y="-0.77" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.2</text>
+    <text x="16.4" y="-3.34" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.4</text>
+    <text x="16.4" y="-5.9" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.6</text>
+    <text x="16.4" y="-8.47" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">4.8</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.0</text>
+    <text x="16.4" y="-13.59" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.2</text>
+    <text x="16.4" y="-16.16" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.4</text>
+    <text x="16.4" y="-18.72" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.6</text>
+    <text x="16.4" y="-21.29" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">5.8</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.0</text>
+    <text x="16.4" y="-26.41" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.2</text>
+    <text x="16.4" y="-28.98" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.4</text>
+    <text x="16.4" y="-31.54" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.6</text>
+    <text x="16.4" y="-34.11" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">6.8</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.0</text>
+    <text x="16.4" y="-39.24" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.2</text>
+    <text x="16.4" y="-41.8" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.4</text>
+    <text x="16.4" y="-44.36" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.6</text>
+    <text x="16.4" y="-46.93" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">7.8</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="10.0" visibility="hidden">8.0</text>
+    <text x="16.4" y="181.28" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-10</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">-5</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">0</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">5</text>
+    <text x="16.4" y="-75.13" text-anchor="end" dy="0.35em" gadfly:scale="0.5" visibility="hidden">10</text>
+    <text x="16.4" y="142.82" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-7.0</text>
+    <text x="16.4" y="136.41" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-6.5</text>
+    <text x="16.4" y="130" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-6.0</text>
+    <text x="16.4" y="123.59" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5.5</text>
+    <text x="16.4" y="117.18" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-5.0</text>
+    <text x="16.4" y="110.77" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-4.5</text>
+    <text x="16.4" y="104.36" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-4.0</text>
+    <text x="16.4" y="97.95" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-3.5</text>
+    <text x="16.4" y="91.54" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-3.0</text>
+    <text x="16.4" y="85.13" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-2.5</text>
+    <text x="16.4" y="78.72" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-2.0</text>
+    <text x="16.4" y="72.3" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-1.5</text>
+    <text x="16.4" y="65.89" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-1.0</text>
+    <text x="16.4" y="59.48" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">-0.5</text>
+    <text x="16.4" y="53.07" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0.0</text>
+    <text x="16.4" y="46.66" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">0.5</text>
+    <text x="16.4" y="40.25" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">1.0</text>
+    <text x="16.4" y="33.84" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">1.5</text>
+    <text x="16.4" y="27.43" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">2.0</text>
+    <text x="16.4" y="21.02" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">2.5</text>
+    <text x="16.4" y="14.61" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">3.0</text>
+    <text x="16.4" y="8.2" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">3.5</text>
+    <text x="16.4" y="1.79" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">4.0</text>
+    <text x="16.4" y="-4.62" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">4.5</text>
+    <text x="16.4" y="-11.03" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5.0</text>
+    <text x="16.4" y="-17.44" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">5.5</text>
+    <text x="16.4" y="-23.85" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">6.0</text>
+    <text x="16.4" y="-30.26" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">6.5</text>
+    <text x="16.4" y="-36.67" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">7.0</text>
+    <text x="16.4" y="-43.08" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">7.5</text>
+    <text x="16.4" y="-49.49" text-anchor="end" dy="0.35em" gadfly:scale="5.0" visibility="hidden">8.0</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-25">
+    <text x="8.81" y="44.66" text-anchor="middle" dy="0.35em" transform="rotate(-90, 8.81, 46.66)">Growth Rate</text>
+  </g>
+  <g font-size="3.88" font-family="'PT Sans','Helvetica Neue','Helvetica',sans-serif" fill="#564A55" stroke="#000000" stroke-opacity="0.000" id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-26">
+    <text x="64.7" y="10.61" text-anchor="middle">Extended Kalman Filter Example</text>
+  </g>
+</g>
+<defs>
+<clipPath id="fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-9">
+  <path d="M17.4,12.61 L 112.01 12.61 112.01 80.72 17.4 80.72" />
+</clipPath
+></defs>
+<script> <![CDATA[
+(function(N){var k=/[\.\/]/,L=/\s*,\s*/,C=function(a,d){return a-d},a,v,y={n:{}},M=function(){for(var a=0,d=this.length;a<d;a++)if("undefined"!=typeof this[a])return this[a]},A=function(){for(var a=this.length;--a;)if("undefined"!=typeof this[a])return this[a]},w=function(k,d){k=String(k);var f=v,n=Array.prototype.slice.call(arguments,2),u=w.listeners(k),p=0,b,q=[],e={},l=[],r=a;l.firstDefined=M;l.lastDefined=A;a=k;for(var s=v=0,x=u.length;s<x;s++)"zIndex"in u[s]&&(q.push(u[s].zIndex),0>u[s].zIndex&&
+(e[u[s].zIndex]=u[s]));for(q.sort(C);0>q[p];)if(b=e[q[p++] ],l.push(b.apply(d,n)),v)return v=f,l;for(s=0;s<x;s++)if(b=u[s],"zIndex"in b)if(b.zIndex==q[p]){l.push(b.apply(d,n));if(v)break;do if(p++,(b=e[q[p] ])&&l.push(b.apply(d,n)),v)break;while(b)}else e[b.zIndex]=b;else if(l.push(b.apply(d,n)),v)break;v=f;a=r;return l};w._events=y;w.listeners=function(a){a=a.split(k);var d=y,f,n,u,p,b,q,e,l=[d],r=[];u=0;for(p=a.length;u<p;u++){e=[];b=0;for(q=l.length;b<q;b++)for(d=l[b].n,f=[d[a[u] ],d["*"] ],n=2;n--;)if(d=
+f[n])e.push(d),r=r.concat(d.f||[]);l=e}return r};w.on=function(a,d){a=String(a);if("function"!=typeof d)return function(){};for(var f=a.split(L),n=0,u=f.length;n<u;n++)(function(a){a=a.split(k);for(var b=y,f,e=0,l=a.length;e<l;e++)b=b.n,b=b.hasOwnProperty(a[e])&&b[a[e] ]||(b[a[e] ]={n:{}});b.f=b.f||[];e=0;for(l=b.f.length;e<l;e++)if(b.f[e]==d){f=!0;break}!f&&b.f.push(d)})(f[n]);return function(a){+a==+a&&(d.zIndex=+a)}};w.f=function(a){var d=[].slice.call(arguments,1);return function(){w.apply(null,
+[a,null].concat(d).concat([].slice.call(arguments,0)))}};w.stop=function(){v=1};w.nt=function(k){return k?(new RegExp("(?:\\.|\\/|^)"+k+"(?:\\.|\\/|$)")).test(a):a};w.nts=function(){return a.split(k)};w.off=w.unbind=function(a,d){if(a){var f=a.split(L);if(1<f.length)for(var n=0,u=f.length;n<u;n++)w.off(f[n],d);else{for(var f=a.split(k),p,b,q,e,l=[y],n=0,u=f.length;n<u;n++)for(e=0;e<l.length;e+=q.length-2){q=[e,1];p=l[e].n;if("*"!=f[n])p[f[n] ]&&q.push(p[f[n] ]);else for(b in p)p.hasOwnProperty(b)&&
+q.push(p[b]);l.splice.apply(l,q)}n=0;for(u=l.length;n<u;n++)for(p=l[n];p.n;){if(d){if(p.f){e=0;for(f=p.f.length;e<f;e++)if(p.f[e]==d){p.f.splice(e,1);break}!p.f.length&&delete p.f}for(b in p.n)if(p.n.hasOwnProperty(b)&&p.n[b].f){q=p.n[b].f;e=0;for(f=q.length;e<f;e++)if(q[e]==d){q.splice(e,1);break}!q.length&&delete p.n[b].f}}else for(b in delete p.f,p.n)p.n.hasOwnProperty(b)&&p.n[b].f&&delete p.n[b].f;p=p.n}}}else w._events=y={n:{}}};w.once=function(a,d){var f=function(){w.unbind(a,f);return d.apply(this,
+arguments)};return w.on(a,f)};w.version="0.4.2";w.toString=function(){return"You are running Eve 0.4.2"};"undefined"!=typeof module&&module.exports?module.exports=w:"function"===typeof define&&define.amd?define("eve",[],function(){return w}):N.eve=w})(this);
+(function(N,k){"function"===typeof define&&define.amd?define("Snap.svg",["eve"],function(L){return k(N,L)}):k(N,N.eve)})(this,function(N,k){var L=function(a){var k={},y=N.requestAnimationFrame||N.webkitRequestAnimationFrame||N.mozRequestAnimationFrame||N.oRequestAnimationFrame||N.msRequestAnimationFrame||function(a){setTimeout(a,16)},M=Array.isArray||function(a){return a instanceof Array||"[object Array]"==Object.prototype.toString.call(a)},A=0,w="M"+(+new Date).toString(36),z=function(a){if(null==
+a)return this.s;var b=this.s-a;this.b+=this.dur*b;this.B+=this.dur*b;this.s=a},d=function(a){if(null==a)return this.spd;this.spd=a},f=function(a){if(null==a)return this.dur;this.s=this.s*a/this.dur;this.dur=a},n=function(){delete k[this.id];this.update();a("mina.stop."+this.id,this)},u=function(){this.pdif||(delete k[this.id],this.update(),this.pdif=this.get()-this.b)},p=function(){this.pdif&&(this.b=this.get()-this.pdif,delete this.pdif,k[this.id]=this)},b=function(){var a;if(M(this.start)){a=[];
+for(var b=0,e=this.start.length;b<e;b++)a[b]=+this.start[b]+(this.end[b]-this.start[b])*this.easing(this.s)}else a=+this.start+(this.end-this.start)*this.easing(this.s);this.set(a)},q=function(){var l=0,b;for(b in k)if(k.hasOwnProperty(b)){var e=k[b],f=e.get();l++;e.s=(f-e.b)/(e.dur/e.spd);1<=e.s&&(delete k[b],e.s=1,l--,function(b){setTimeout(function(){a("mina.finish."+b.id,b)})}(e));e.update()}l&&y(q)},e=function(a,r,s,x,G,h,J){a={id:w+(A++).toString(36),start:a,end:r,b:s,s:0,dur:x-s,spd:1,get:G,
+set:h,easing:J||e.linear,status:z,speed:d,duration:f,stop:n,pause:u,resume:p,update:b};k[a.id]=a;r=0;for(var K in k)if(k.hasOwnProperty(K)&&(r++,2==r))break;1==r&&y(q);return a};e.time=Date.now||function(){return+new Date};e.getById=function(a){return k[a]||null};e.linear=function(a){return a};e.easeout=function(a){return Math.pow(a,1.7)};e.easein=function(a){return Math.pow(a,0.48)};e.easeinout=function(a){if(1==a)return 1;if(0==a)return 0;var b=0.48-a/1.04,e=Math.sqrt(0.1734+b*b);a=e-b;a=Math.pow(Math.abs(a),
+1/3)*(0>a?-1:1);b=-e-b;b=Math.pow(Math.abs(b),1/3)*(0>b?-1:1);a=a+b+0.5;return 3*(1-a)*a*a+a*a*a};e.backin=function(a){return 1==a?1:a*a*(2.70158*a-1.70158)};e.backout=function(a){if(0==a)return 0;a-=1;return a*a*(2.70158*a+1.70158)+1};e.elastic=function(a){return a==!!a?a:Math.pow(2,-10*a)*Math.sin(2*(a-0.075)*Math.PI/0.3)+1};e.bounce=function(a){a<1/2.75?a*=7.5625*a:a<2/2.75?(a-=1.5/2.75,a=7.5625*a*a+0.75):a<2.5/2.75?(a-=2.25/2.75,a=7.5625*a*a+0.9375):(a-=2.625/2.75,a=7.5625*a*a+0.984375);return a};
+return N.mina=e}("undefined"==typeof k?function(){}:k),C=function(){function a(c,t){if(c){if(c.tagName)return x(c);if(y(c,"array")&&a.set)return a.set.apply(a,c);if(c instanceof e)return c;if(null==t)return c=G.doc.querySelector(c),x(c)}return new s(null==c?"100%":c,null==t?"100%":t)}function v(c,a){if(a){"#text"==c&&(c=G.doc.createTextNode(a.text||""));"string"==typeof c&&(c=v(c));if("string"==typeof a)return"xlink:"==a.substring(0,6)?c.getAttributeNS(m,a.substring(6)):"xml:"==a.substring(0,4)?c.getAttributeNS(la,
+a.substring(4)):c.getAttribute(a);for(var da in a)if(a[h](da)){var b=J(a[da]);b?"xlink:"==da.substring(0,6)?c.setAttributeNS(m,da.substring(6),b):"xml:"==da.substring(0,4)?c.setAttributeNS(la,da.substring(4),b):c.setAttribute(da,b):c.removeAttribute(da)}}else c=G.doc.createElementNS(la,c);return c}function y(c,a){a=J.prototype.toLowerCase.call(a);return"finite"==a?isFinite(c):"array"==a&&(c instanceof Array||Array.isArray&&Array.isArray(c))?!0:"null"==a&&null===c||a==typeof c&&null!==c||"object"==
+a&&c===Object(c)||$.call(c).slice(8,-1).toLowerCase()==a}function M(c){if("function"==typeof c||Object(c)!==c)return c;var a=new c.constructor,b;for(b in c)c[h](b)&&(a[b]=M(c[b]));return a}function A(c,a,b){function m(){var e=Array.prototype.slice.call(arguments,0),f=e.join("\u2400"),d=m.cache=m.cache||{},l=m.count=m.count||[];if(d[h](f)){a:for(var e=l,l=f,B=0,H=e.length;B<H;B++)if(e[B]===l){e.push(e.splice(B,1)[0]);break a}return b?b(d[f]):d[f]}1E3<=l.length&&delete d[l.shift()];l.push(f);d[f]=c.apply(a,
+e);return b?b(d[f]):d[f]}return m}function w(c,a,b,m,e,f){return null==e?(c-=b,a-=m,c||a?(180*I.atan2(-a,-c)/C+540)%360:0):w(c,a,e,f)-w(b,m,e,f)}function z(c){return c%360*C/180}function d(c){var a=[];c=c.replace(/(?:^|\s)(\w+)\(([^)]+)\)/g,function(c,b,m){m=m.split(/\s*,\s*|\s+/);"rotate"==b&&1==m.length&&m.push(0,0);"scale"==b&&(2<m.length?m=m.slice(0,2):2==m.length&&m.push(0,0),1==m.length&&m.push(m[0],0,0));"skewX"==b?a.push(["m",1,0,I.tan(z(m[0])),1,0,0]):"skewY"==b?a.push(["m",1,I.tan(z(m[0])),
+0,1,0,0]):a.push([b.charAt(0)].concat(m));return c});return a}function f(c,t){var b=O(c),m=new a.Matrix;if(b)for(var e=0,f=b.length;e<f;e++){var h=b[e],d=h.length,B=J(h[0]).toLowerCase(),H=h[0]!=B,l=H?m.invert():0,E;"t"==B&&2==d?m.translate(h[1],0):"t"==B&&3==d?H?(d=l.x(0,0),B=l.y(0,0),H=l.x(h[1],h[2]),l=l.y(h[1],h[2]),m.translate(H-d,l-B)):m.translate(h[1],h[2]):"r"==B?2==d?(E=E||t,m.rotate(h[1],E.x+E.width/2,E.y+E.height/2)):4==d&&(H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.rotate(h[1],H,l)):m.rotate(h[1],
+h[2],h[3])):"s"==B?2==d||3==d?(E=E||t,m.scale(h[1],h[d-1],E.x+E.width/2,E.y+E.height/2)):4==d?H?(H=l.x(h[2],h[3]),l=l.y(h[2],h[3]),m.scale(h[1],h[1],H,l)):m.scale(h[1],h[1],h[2],h[3]):5==d&&(H?(H=l.x(h[3],h[4]),l=l.y(h[3],h[4]),m.scale(h[1],h[2],H,l)):m.scale(h[1],h[2],h[3],h[4])):"m"==B&&7==d&&m.add(h[1],h[2],h[3],h[4],h[5],h[6])}return m}function n(c,t){if(null==t){var m=!0;t="linearGradient"==c.type||"radialGradient"==c.type?c.node.getAttribute("gradientTransform"):"pattern"==c.type?c.node.getAttribute("patternTransform"):
+c.node.getAttribute("transform");if(!t)return new a.Matrix;t=d(t)}else t=a._.rgTransform.test(t)?J(t).replace(/\.{3}|\u2026/g,c._.transform||aa):d(t),y(t,"array")&&(t=a.path?a.path.toString.call(t):J(t)),c._.transform=t;var b=f(t,c.getBBox(1));if(m)return b;c.matrix=b}function u(c){c=c.node.ownerSVGElement&&x(c.node.ownerSVGElement)||c.node.parentNode&&x(c.node.parentNode)||a.select("svg")||a(0,0);var t=c.select("defs"),t=null==t?!1:t.node;t||(t=r("defs",c.node).node);return t}function p(c){return c.node.ownerSVGElement&&
+x(c.node.ownerSVGElement)||a.select("svg")}function b(c,a,m){function b(c){if(null==c)return aa;if(c==+c)return c;v(B,{width:c});try{return B.getBBox().width}catch(a){return 0}}function h(c){if(null==c)return aa;if(c==+c)return c;v(B,{height:c});try{return B.getBBox().height}catch(a){return 0}}function e(b,B){null==a?d[b]=B(c.attr(b)||0):b==a&&(d=B(null==m?c.attr(b)||0:m))}var f=p(c).node,d={},B=f.querySelector(".svg---mgr");B||(B=v("rect"),v(B,{x:-9E9,y:-9E9,width:10,height:10,"class":"svg---mgr",
+fill:"none"}),f.appendChild(B));switch(c.type){case "rect":e("rx",b),e("ry",h);case "image":e("width",b),e("height",h);case "text":e("x",b);e("y",h);break;case "circle":e("cx",b);e("cy",h);e("r",b);break;case "ellipse":e("cx",b);e("cy",h);e("rx",b);e("ry",h);break;case "line":e("x1",b);e("x2",b);e("y1",h);e("y2",h);break;case "marker":e("refX",b);e("markerWidth",b);e("refY",h);e("markerHeight",h);break;case "radialGradient":e("fx",b);e("fy",h);break;case "tspan":e("dx",b);e("dy",h);break;default:e(a,
+b)}f.removeChild(B);return d}function q(c){y(c,"array")||(c=Array.prototype.slice.call(arguments,0));for(var a=0,b=0,m=this.node;this[a];)delete this[a++];for(a=0;a<c.length;a++)"set"==c[a].type?c[a].forEach(function(c){m.appendChild(c.node)}):m.appendChild(c[a].node);for(var h=m.childNodes,a=0;a<h.length;a++)this[b++]=x(h[a]);return this}function e(c){if(c.snap in E)return E[c.snap];var a=this.id=V(),b;try{b=c.ownerSVGElement}catch(m){}this.node=c;b&&(this.paper=new s(b));this.type=c.tagName;this.anims=
+{};this._={transform:[]};c.snap=a;E[a]=this;"g"==this.type&&(this.add=q);if(this.type in{g:1,mask:1,pattern:1})for(var e in s.prototype)s.prototype[h](e)&&(this[e]=s.prototype[e])}function l(c){this.node=c}function r(c,a){var b=v(c);a.appendChild(b);return x(b)}function s(c,a){var b,m,f,d=s.prototype;if(c&&"svg"==c.tagName){if(c.snap in E)return E[c.snap];var l=c.ownerDocument;b=new e(c);m=c.getElementsByTagName("desc")[0];f=c.getElementsByTagName("defs")[0];m||(m=v("desc"),m.appendChild(l.createTextNode("Created with Snap")),
+b.node.appendChild(m));f||(f=v("defs"),b.node.appendChild(f));b.defs=f;for(var ca in d)d[h](ca)&&(b[ca]=d[ca]);b.paper=b.root=b}else b=r("svg",G.doc.body),v(b.node,{height:a,version:1.1,width:c,xmlns:la});return b}function x(c){return!c||c instanceof e||c instanceof l?c:c.tagName&&"svg"==c.tagName.toLowerCase()?new s(c):c.tagName&&"object"==c.tagName.toLowerCase()&&"image/svg+xml"==c.type?new s(c.contentDocument.getElementsByTagName("svg")[0]):new e(c)}a.version="0.3.0";a.toString=function(){return"Snap v"+
+this.version};a._={};var G={win:N,doc:N.document};a._.glob=G;var h="hasOwnProperty",J=String,K=parseFloat,U=parseInt,I=Math,P=I.max,Q=I.min,Y=I.abs,C=I.PI,aa="",$=Object.prototype.toString,F=/^\s*((#[a-f\d]{6})|(#[a-f\d]{3})|rgba?\(\s*([\d\.]+%?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+%?(?:\s*,\s*[\d\.]+%?)?)\s*\)|hsba?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\)|hsla?\(\s*([\d\.]+(?:deg|\xb0|%)?\s*,\s*[\d\.]+%?\s*,\s*[\d\.]+(?:%?\s*,\s*[\d\.]+)?%?)\s*\))\s*$/i;a._.separator=
+RegExp("[,\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]+");var S=RegExp("[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*"),X={hs:1,rg:1},W=RegExp("([a-z])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)",
+"ig"),ma=RegExp("([rstm])[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029,]*((-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*)+)","ig"),Z=RegExp("(-?\\d*\\.?\\d*(?:e[\\-+]?\\d+)?)[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*,?[\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*",
+"ig"),na=0,ba="S"+(+new Date).toString(36),V=function(){return ba+(na++).toString(36)},m="http://www.w3.org/1999/xlink",la="http://www.w3.org/2000/svg",E={},ca=a.url=function(c){return"url('#"+c+"')"};a._.$=v;a._.id=V;a.format=function(){var c=/\{([^\}]+)\}/g,a=/(?:(?:^|\.)(.+?)(?=\[|\.|$|\()|\[('|")(.+?)\2\])(\(\))?/g,b=function(c,b,m){var h=m;b.replace(a,function(c,a,b,m,t){a=a||m;h&&(a in h&&(h=h[a]),"function"==typeof h&&t&&(h=h()))});return h=(null==h||h==m?c:h)+""};return function(a,m){return J(a).replace(c,
+function(c,a){return b(c,a,m)})}}();a._.clone=M;a._.cacher=A;a.rad=z;a.deg=function(c){return 180*c/C%360};a.angle=w;a.is=y;a.snapTo=function(c,a,b){b=y(b,"finite")?b:10;if(y(c,"array"))for(var m=c.length;m--;){if(Y(c[m]-a)<=b)return c[m]}else{c=+c;m=a%c;if(m<b)return a-m;if(m>c-b)return a-m+c}return a};a.getRGB=A(function(c){if(!c||(c=J(c)).indexOf("-")+1)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};if("none"==c)return{r:-1,g:-1,b:-1,hex:"none",toString:ka};!X[h](c.toLowerCase().substring(0,
+2))&&"#"!=c.charAt()&&(c=T(c));if(!c)return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka};var b,m,e,f,d;if(c=c.match(F)){c[2]&&(e=U(c[2].substring(5),16),m=U(c[2].substring(3,5),16),b=U(c[2].substring(1,3),16));c[3]&&(e=U((d=c[3].charAt(3))+d,16),m=U((d=c[3].charAt(2))+d,16),b=U((d=c[3].charAt(1))+d,16));c[4]&&(d=c[4].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b*=2.55),m=K(d[1]),"%"==d[1].slice(-1)&&(m*=2.55),e=K(d[2]),"%"==d[2].slice(-1)&&(e*=2.55),"rgba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),
+d[3]&&"%"==d[3].slice(-1)&&(f/=100));if(c[5])return d=c[5].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsba"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsb2rgb(b,m,e,f);if(c[6])return d=c[6].split(S),b=K(d[0]),"%"==d[0].slice(-1)&&(b/=100),m=K(d[1]),"%"==d[1].slice(-1)&&(m/=100),e=K(d[2]),"%"==d[2].slice(-1)&&(e/=100),
+"deg"!=d[0].slice(-3)&&"\u00b0"!=d[0].slice(-1)||(b/=360),"hsla"==c[1].toLowerCase().slice(0,4)&&(f=K(d[3])),d[3]&&"%"==d[3].slice(-1)&&(f/=100),a.hsl2rgb(b,m,e,f);b=Q(I.round(b),255);m=Q(I.round(m),255);e=Q(I.round(e),255);f=Q(P(f,0),1);c={r:b,g:m,b:e,toString:ka};c.hex="#"+(16777216|e|m<<8|b<<16).toString(16).slice(1);c.opacity=y(f,"finite")?f:1;return c}return{r:-1,g:-1,b:-1,hex:"none",error:1,toString:ka}},a);a.hsb=A(function(c,b,m){return a.hsb2rgb(c,b,m).hex});a.hsl=A(function(c,b,m){return a.hsl2rgb(c,
+b,m).hex});a.rgb=A(function(c,a,b,m){if(y(m,"finite")){var e=I.round;return"rgba("+[e(c),e(a),e(b),+m.toFixed(2)]+")"}return"#"+(16777216|b|a<<8|c<<16).toString(16).slice(1)});var T=function(c){var a=G.doc.getElementsByTagName("head")[0]||G.doc.getElementsByTagName("svg")[0];T=A(function(c){if("red"==c.toLowerCase())return"rgb(255, 0, 0)";a.style.color="rgb(255, 0, 0)";a.style.color=c;c=G.doc.defaultView.getComputedStyle(a,aa).getPropertyValue("color");return"rgb(255, 0, 0)"==c?null:c});return T(c)},
+qa=function(){return"hsb("+[this.h,this.s,this.b]+")"},ra=function(){return"hsl("+[this.h,this.s,this.l]+")"},ka=function(){return 1==this.opacity||null==this.opacity?this.hex:"rgba("+[this.r,this.g,this.b,this.opacity]+")"},D=function(c,b,m){null==b&&y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&(m=c.b,b=c.g,c=c.r);null==b&&y(c,string)&&(m=a.getRGB(c),c=m.r,b=m.g,m=m.b);if(1<c||1<b||1<m)c/=255,b/=255,m/=255;return[c,b,m]},oa=function(c,b,m,e){c=I.round(255*c);b=I.round(255*b);m=I.round(255*m);c={r:c,
+g:b,b:m,opacity:y(e,"finite")?e:1,hex:a.rgb(c,b,m),toString:ka};y(e,"finite")&&(c.opacity=e);return c};a.color=function(c){var b;y(c,"object")&&"h"in c&&"s"in c&&"b"in c?(b=a.hsb2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):y(c,"object")&&"h"in c&&"s"in c&&"l"in c?(b=a.hsl2rgb(c),c.r=b.r,c.g=b.g,c.b=b.b,c.opacity=1,c.hex=b.hex):(y(c,"string")&&(c=a.getRGB(c)),y(c,"object")&&"r"in c&&"g"in c&&"b"in c&&!("error"in c)?(b=a.rgb2hsl(c),c.h=b.h,c.s=b.s,c.l=b.l,b=a.rgb2hsb(c),c.v=b.b):(c={hex:"none"},
+c.r=c.g=c.b=c.h=c.s=c.v=c.l=-1,c.error=1));c.toString=ka;return c};a.hsb2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"b"in c&&(b=c.b,a=c.s,c=c.h,m=c.o);var e,h,d;c=360*c%360/60;d=b*a;a=d*(1-Y(c%2-1));b=e=h=b-d;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.hsl2rgb=function(c,a,b,m){y(c,"object")&&"h"in c&&"s"in c&&"l"in c&&(b=c.l,a=c.s,c=c.h);if(1<c||1<a||1<b)c/=360,a/=100,b/=100;var e,h,d;c=360*c%360/60;d=2*a*(0.5>b?b:1-b);a=d*(1-Y(c%2-1));b=e=
+h=b-d/2;c=~~c;b+=[d,a,0,0,a,d][c];e+=[a,d,d,a,0,0][c];h+=[0,0,a,d,d,a][c];return oa(b,e,h,m)};a.rgb2hsb=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e;m=P(c,a,b);e=m-Q(c,a,b);c=((0==e?0:m==c?(a-b)/e:m==a?(b-c)/e+2:(c-a)/e+4)+360)%6*60/360;return{h:c,s:0==e?0:e/m,b:m,toString:qa}};a.rgb2hsl=function(c,a,b){b=D(c,a,b);c=b[0];a=b[1];b=b[2];var m,e,h;m=P(c,a,b);e=Q(c,a,b);h=m-e;c=((0==h?0:m==c?(a-b)/h:m==a?(b-c)/h+2:(c-a)/h+4)+360)%6*60/360;m=(m+e)/2;return{h:c,s:0==h?0:0.5>m?h/(2*m):h/(2-2*
+m),l:m,toString:ra}};a.parsePathString=function(c){if(!c)return null;var b=a.path(c);if(b.arr)return a.path.clone(b.arr);var m={a:7,c:6,o:2,h:1,l:2,m:2,r:4,q:4,s:4,t:2,v:1,u:3,z:0},e=[];y(c,"array")&&y(c[0],"array")&&(e=a.path.clone(c));e.length||J(c).replace(W,function(c,a,b){var h=[];c=a.toLowerCase();b.replace(Z,function(c,a){a&&h.push(+a)});"m"==c&&2<h.length&&(e.push([a].concat(h.splice(0,2))),c="l",a="m"==a?"l":"L");"o"==c&&1==h.length&&e.push([a,h[0] ]);if("r"==c)e.push([a].concat(h));else for(;h.length>=
+m[c]&&(e.push([a].concat(h.splice(0,m[c]))),m[c]););});e.toString=a.path.toString;b.arr=a.path.clone(e);return e};var O=a.parseTransformString=function(c){if(!c)return null;var b=[];y(c,"array")&&y(c[0],"array")&&(b=a.path.clone(c));b.length||J(c).replace(ma,function(c,a,m){var e=[];a.toLowerCase();m.replace(Z,function(c,a){a&&e.push(+a)});b.push([a].concat(e))});b.toString=a.path.toString;return b};a._.svgTransform2string=d;a._.rgTransform=RegExp("^[a-z][\t\n\x0B\f\r \u00a0\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000\u2028\u2029]*-?\\.?\\d",
+"i");a._.transform2matrix=f;a._unit2px=b;a._.getSomeDefs=u;a._.getSomeSVG=p;a.select=function(c){return x(G.doc.querySelector(c))};a.selectAll=function(c){c=G.doc.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};setInterval(function(){for(var c in E)if(E[h](c)){var a=E[c],b=a.node;("svg"!=a.type&&!b.ownerSVGElement||"svg"==a.type&&(!b.parentNode||"ownerSVGElement"in b.parentNode&&!b.ownerSVGElement))&&delete E[c]}},1E4);(function(c){function m(c){function a(c,
+b){var m=v(c.node,b);(m=(m=m&&m.match(d))&&m[2])&&"#"==m.charAt()&&(m=m.substring(1))&&(f[m]=(f[m]||[]).concat(function(a){var m={};m[b]=ca(a);v(c.node,m)}))}function b(c){var a=v(c.node,"xlink:href");a&&"#"==a.charAt()&&(a=a.substring(1))&&(f[a]=(f[a]||[]).concat(function(a){c.attr("xlink:href","#"+a)}))}var e=c.selectAll("*"),h,d=/^\s*url\(("|'|)(.*)\1\)\s*$/;c=[];for(var f={},l=0,E=e.length;l<E;l++){h=e[l];a(h,"fill");a(h,"stroke");a(h,"filter");a(h,"mask");a(h,"clip-path");b(h);var t=v(h.node,
+"id");t&&(v(h.node,{id:h.id}),c.push({old:t,id:h.id}))}l=0;for(E=c.length;l<E;l++)if(e=f[c[l].old])for(h=0,t=e.length;h<t;h++)e[h](c[l].id)}function e(c,a,b){return function(m){m=m.slice(c,a);1==m.length&&(m=m[0]);return b?b(m):m}}function d(c){return function(){var a=c?"<"+this.type:"",b=this.node.attributes,m=this.node.childNodes;if(c)for(var e=0,h=b.length;e<h;e++)a+=" "+b[e].name+'="'+b[e].value.replace(/"/g,'\\"')+'"';if(m.length){c&&(a+=">");e=0;for(h=m.length;e<h;e++)3==m[e].nodeType?a+=m[e].nodeValue:
+1==m[e].nodeType&&(a+=x(m[e]).toString());c&&(a+="</"+this.type+">")}else c&&(a+="/>");return a}}c.attr=function(c,a){if(!c)return this;if(y(c,"string"))if(1<arguments.length){var b={};b[c]=a;c=b}else return k("snap.util.getattr."+c,this).firstDefined();for(var m in c)c[h](m)&&k("snap.util.attr."+m,this,c[m]);return this};c.getBBox=function(c){if(!a.Matrix||!a.path)return this.node.getBBox();var b=this,m=new a.Matrix;if(b.removed)return a._.box();for(;"use"==b.type;)if(c||(m=m.add(b.transform().localMatrix.translate(b.attr("x")||
+0,b.attr("y")||0))),b.original)b=b.original;else var e=b.attr("xlink:href"),b=b.original=b.node.ownerDocument.getElementById(e.substring(e.indexOf("#")+1));var e=b._,h=a.path.get[b.type]||a.path.get.deflt;try{if(c)return e.bboxwt=h?a.path.getBBox(b.realPath=h(b)):a._.box(b.node.getBBox()),a._.box(e.bboxwt);b.realPath=h(b);b.matrix=b.transform().localMatrix;e.bbox=a.path.getBBox(a.path.map(b.realPath,m.add(b.matrix)));return a._.box(e.bbox)}catch(d){return a._.box()}};var f=function(){return this.string};
+c.transform=function(c){var b=this._;if(null==c){var m=this;c=new a.Matrix(this.node.getCTM());for(var e=n(this),h=[e],d=new a.Matrix,l=e.toTransformString(),b=J(e)==J(this.matrix)?J(b.transform):l;"svg"!=m.type&&(m=m.parent());)h.push(n(m));for(m=h.length;m--;)d.add(h[m]);return{string:b,globalMatrix:c,totalMatrix:d,localMatrix:e,diffMatrix:c.clone().add(e.invert()),global:c.toTransformString(),total:d.toTransformString(),local:l,toString:f}}c instanceof a.Matrix?this.matrix=c:n(this,c);this.node&&
+("linearGradient"==this.type||"radialGradient"==this.type?v(this.node,{gradientTransform:this.matrix}):"pattern"==this.type?v(this.node,{patternTransform:this.matrix}):v(this.node,{transform:this.matrix}));return this};c.parent=function(){return x(this.node.parentNode)};c.append=c.add=function(c){if(c){if("set"==c.type){var a=this;c.forEach(function(c){a.add(c)});return this}c=x(c);this.node.appendChild(c.node);c.paper=this.paper}return this};c.appendTo=function(c){c&&(c=x(c),c.append(this));return this};
+c.prepend=function(c){if(c){if("set"==c.type){var a=this,b;c.forEach(function(c){b?b.after(c):a.prepend(c);b=c});return this}c=x(c);var m=c.parent();this.node.insertBefore(c.node,this.node.firstChild);this.add&&this.add();c.paper=this.paper;this.parent()&&this.parent().add();m&&m.add()}return this};c.prependTo=function(c){c=x(c);c.prepend(this);return this};c.before=function(c){if("set"==c.type){var a=this;c.forEach(function(c){var b=c.parent();a.node.parentNode.insertBefore(c.node,a.node);b&&b.add()});
+this.parent().add();return this}c=x(c);var b=c.parent();this.node.parentNode.insertBefore(c.node,this.node);this.parent()&&this.parent().add();b&&b.add();c.paper=this.paper;return this};c.after=function(c){c=x(c);var a=c.parent();this.node.nextSibling?this.node.parentNode.insertBefore(c.node,this.node.nextSibling):this.node.parentNode.appendChild(c.node);this.parent()&&this.parent().add();a&&a.add();c.paper=this.paper;return this};c.insertBefore=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,
+c.node);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.insertAfter=function(c){c=x(c);var a=this.parent();c.node.parentNode.insertBefore(this.node,c.node.nextSibling);this.paper=c.paper;a&&a.add();c.parent()&&c.parent().add();return this};c.remove=function(){var c=this.parent();this.node.parentNode&&this.node.parentNode.removeChild(this.node);delete this.paper;this.removed=!0;c&&c.add();return this};c.select=function(c){return x(this.node.querySelector(c))};c.selectAll=
+function(c){c=this.node.querySelectorAll(c);for(var b=(a.set||Array)(),m=0;m<c.length;m++)b.push(x(c[m]));return b};c.asPX=function(c,a){null==a&&(a=this.attr(c));return+b(this,c,a)};c.use=function(){var c,a=this.node.id;a||(a=this.id,v(this.node,{id:a}));c="linearGradient"==this.type||"radialGradient"==this.type||"pattern"==this.type?r(this.type,this.node.parentNode):r("use",this.node.parentNode);v(c.node,{"xlink:href":"#"+a});c.original=this;return c};var l=/\S+/g;c.addClass=function(c){var a=(c||
+"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h,d;if(a.length){for(e=0;d=a[e++];)h=m.indexOf(d),~h||m.push(d);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.removeClass=function(c){var a=(c||"").match(l)||[];c=this.node;var b=c.className.baseVal,m=b.match(l)||[],e,h;if(m.length){for(e=0;h=a[e++];)h=m.indexOf(h),~h&&m.splice(h,1);a=m.join(" ");b!=a&&(c.className.baseVal=a)}return this};c.hasClass=function(c){return!!~(this.node.className.baseVal.match(l)||[]).indexOf(c)};
+c.toggleClass=function(c,a){if(null!=a)return a?this.addClass(c):this.removeClass(c);var b=(c||"").match(l)||[],m=this.node,e=m.className.baseVal,h=e.match(l)||[],d,f,E;for(d=0;E=b[d++];)f=h.indexOf(E),~f?h.splice(f,1):h.push(E);b=h.join(" ");e!=b&&(m.className.baseVal=b);return this};c.clone=function(){var c=x(this.node.cloneNode(!0));v(c.node,"id")&&v(c.node,{id:c.id});m(c);c.insertAfter(this);return c};c.toDefs=function(){u(this).appendChild(this.node);return this};c.pattern=c.toPattern=function(c,
+a,b,m){var e=r("pattern",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,c=c.x);v(e.node,{x:c,y:a,width:b,height:m,patternUnits:"userSpaceOnUse",id:e.id,viewBox:[c,a,b,m].join(" ")});e.node.appendChild(this.node);return e};c.marker=function(c,a,b,m,e,h){var d=r("marker",u(this));null==c&&(c=this.getBBox());y(c,"object")&&"x"in c&&(a=c.y,b=c.width,m=c.height,e=c.refX||c.cx,h=c.refY||c.cy,c=c.x);v(d.node,{viewBox:[c,a,b,m].join(" "),markerWidth:b,markerHeight:m,
+orient:"auto",refX:e||0,refY:h||0,id:d.id});d.node.appendChild(this.node);return d};var E=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);this.attr=c;this.dur=a;b&&(this.easing=b);m&&(this.callback=m)};a._.Animation=E;a.animation=function(c,a,b,m){return new E(c,a,b,m)};c.inAnim=function(){var c=[],a;for(a in this.anims)this.anims[h](a)&&function(a){c.push({anim:new E(a._attrs,a.dur,a.easing,a._callback),mina:a,curStatus:a.status(),status:function(c){return a.status(c)},stop:function(){a.stop()}})}(this.anims[a]);
+return c};a.animate=function(c,a,b,m,e,h){"function"!=typeof e||e.length||(h=e,e=L.linear);var d=L.time();c=L(c,a,d,d+m,L.time,b,e);h&&k.once("mina.finish."+c.id,h);return c};c.stop=function(){for(var c=this.inAnim(),a=0,b=c.length;a<b;a++)c[a].stop();return this};c.animate=function(c,a,b,m){"function"!=typeof b||b.length||(m=b,b=L.linear);c instanceof E&&(m=c.callback,b=c.easing,a=b.dur,c=c.attr);var d=[],f=[],l={},t,ca,n,T=this,q;for(q in c)if(c[h](q)){T.equal?(n=T.equal(q,J(c[q])),t=n.from,ca=
+n.to,n=n.f):(t=+T.attr(q),ca=+c[q]);var la=y(t,"array")?t.length:1;l[q]=e(d.length,d.length+la,n);d=d.concat(t);f=f.concat(ca)}t=L.time();var p=L(d,f,t,t+a,L.time,function(c){var a={},b;for(b in l)l[h](b)&&(a[b]=l[b](c));T.attr(a)},b);T.anims[p.id]=p;p._attrs=c;p._callback=m;k("snap.animcreated."+T.id,p);k.once("mina.finish."+p.id,function(){delete T.anims[p.id];m&&m.call(T)});k.once("mina.stop."+p.id,function(){delete T.anims[p.id]});return T};var T={};c.data=function(c,b){var m=T[this.id]=T[this.id]||
+{};if(0==arguments.length)return k("snap.data.get."+this.id,this,m,null),m;if(1==arguments.length){if(a.is(c,"object")){for(var e in c)c[h](e)&&this.data(e,c[e]);return this}k("snap.data.get."+this.id,this,m[c],c);return m[c]}m[c]=b;k("snap.data.set."+this.id,this,b,c);return this};c.removeData=function(c){null==c?T[this.id]={}:T[this.id]&&delete T[this.id][c];return this};c.outerSVG=c.toString=d(1);c.innerSVG=d()})(e.prototype);a.parse=function(c){var a=G.doc.createDocumentFragment(),b=!0,m=G.doc.createElement("div");
+c=J(c);c.match(/^\s*<\s*svg(?:\s|>)/)||(c="<svg>"+c+"</svg>",b=!1);m.innerHTML=c;if(c=m.getElementsByTagName("svg")[0])if(b)a=c;else for(;c.firstChild;)a.appendChild(c.firstChild);m.innerHTML=aa;return new l(a)};l.prototype.select=e.prototype.select;l.prototype.selectAll=e.prototype.selectAll;a.fragment=function(){for(var c=Array.prototype.slice.call(arguments,0),b=G.doc.createDocumentFragment(),m=0,e=c.length;m<e;m++){var h=c[m];h.node&&h.node.nodeType&&b.appendChild(h.node);h.nodeType&&b.appendChild(h);
+"string"==typeof h&&b.appendChild(a.parse(h).node)}return new l(b)};a._.make=r;a._.wrap=x;s.prototype.el=function(c,a){var b=r(c,this.node);a&&b.attr(a);return b};k.on("snap.util.getattr",function(){var c=k.nt(),c=c.substring(c.lastIndexOf(".")+1),a=c.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});return pa[h](a)?this.node.ownerDocument.defaultView.getComputedStyle(this.node,null).getPropertyValue(a):v(this.node,c)});var pa={"alignment-baseline":0,"baseline-shift":0,clip:0,"clip-path":0,
+"clip-rule":0,color:0,"color-interpolation":0,"color-interpolation-filters":0,"color-profile":0,"color-rendering":0,cursor:0,direction:0,display:0,"dominant-baseline":0,"enable-background":0,fill:0,"fill-opacity":0,"fill-rule":0,filter:0,"flood-color":0,"flood-opacity":0,font:0,"font-family":0,"font-size":0,"font-size-adjust":0,"font-stretch":0,"font-style":0,"font-variant":0,"font-weight":0,"glyph-orientation-horizontal":0,"glyph-orientation-vertical":0,"image-rendering":0,kerning:0,"letter-spacing":0,
+"lighting-color":0,marker:0,"marker-end":0,"marker-mid":0,"marker-start":0,mask:0,opacity:0,overflow:0,"pointer-events":0,"shape-rendering":0,"stop-color":0,"stop-opacity":0,stroke:0,"stroke-dasharray":0,"stroke-dashoffset":0,"stroke-linecap":0,"stroke-linejoin":0,"stroke-miterlimit":0,"stroke-opacity":0,"stroke-width":0,"text-anchor":0,"text-decoration":0,"text-rendering":0,"unicode-bidi":0,visibility:0,"word-spacing":0,"writing-mode":0};k.on("snap.util.attr",function(c){var a=k.nt(),b={},a=a.substring(a.lastIndexOf(".")+
+1);b[a]=c;var m=a.replace(/-(\w)/gi,function(c,a){return a.toUpperCase()}),a=a.replace(/[A-Z]/g,function(c){return"-"+c.toLowerCase()});pa[h](a)?this.node.style[m]=null==c?aa:c:v(this.node,b)});a.ajax=function(c,a,b,m){var e=new XMLHttpRequest,h=V();if(e){if(y(a,"function"))m=b,b=a,a=null;else if(y(a,"object")){var d=[],f;for(f in a)a.hasOwnProperty(f)&&d.push(encodeURIComponent(f)+"="+encodeURIComponent(a[f]));a=d.join("&")}e.open(a?"POST":"GET",c,!0);a&&(e.setRequestHeader("X-Requested-With","XMLHttpRequest"),
+e.setRequestHeader("Content-type","application/x-www-form-urlencoded"));b&&(k.once("snap.ajax."+h+".0",b),k.once("snap.ajax."+h+".200",b),k.once("snap.ajax."+h+".304",b));e.onreadystatechange=function(){4==e.readyState&&k("snap.ajax."+h+"."+e.status,m,e)};if(4==e.readyState)return e;e.send(a);return e}};a.load=function(c,b,m){a.ajax(c,function(c){c=a.parse(c.responseText);m?b.call(m,c):b(c)})};a.getElementByPoint=function(c,a){var b,m,e=G.doc.elementFromPoint(c,a);if(G.win.opera&&"svg"==e.tagName){b=
+e;m=b.getBoundingClientRect();b=b.ownerDocument;var h=b.body,d=b.documentElement;b=m.top+(g.win.pageYOffset||d.scrollTop||h.scrollTop)-(d.clientTop||h.clientTop||0);m=m.left+(g.win.pageXOffset||d.scrollLeft||h.scrollLeft)-(d.clientLeft||h.clientLeft||0);h=e.createSVGRect();h.x=c-m;h.y=a-b;h.width=h.height=1;b=e.getIntersectionList(h,null);b.length&&(e=b[b.length-1])}return e?x(e):null};a.plugin=function(c){c(a,e,s,G,l)};return G.win.Snap=a}();C.plugin(function(a,k,y,M,A){function w(a,d,f,b,q,e){null==
+d&&"[object SVGMatrix]"==z.call(a)?(this.a=a.a,this.b=a.b,this.c=a.c,this.d=a.d,this.e=a.e,this.f=a.f):null!=a?(this.a=+a,this.b=+d,this.c=+f,this.d=+b,this.e=+q,this.f=+e):(this.a=1,this.c=this.b=0,this.d=1,this.f=this.e=0)}var z=Object.prototype.toString,d=String,f=Math;(function(n){function k(a){return a[0]*a[0]+a[1]*a[1]}function p(a){var d=f.sqrt(k(a));a[0]&&(a[0]/=d);a[1]&&(a[1]/=d)}n.add=function(a,d,e,f,n,p){var k=[[],[],[] ],u=[[this.a,this.c,this.e],[this.b,this.d,this.f],[0,0,1] ];d=[[a,
+e,n],[d,f,p],[0,0,1] ];a&&a instanceof w&&(d=[[a.a,a.c,a.e],[a.b,a.d,a.f],[0,0,1] ]);for(a=0;3>a;a++)for(e=0;3>e;e++){for(f=n=0;3>f;f++)n+=u[a][f]*d[f][e];k[a][e]=n}this.a=k[0][0];this.b=k[1][0];this.c=k[0][1];this.d=k[1][1];this.e=k[0][2];this.f=k[1][2];return this};n.invert=function(){var a=this.a*this.d-this.b*this.c;return new w(this.d/a,-this.b/a,-this.c/a,this.a/a,(this.c*this.f-this.d*this.e)/a,(this.b*this.e-this.a*this.f)/a)};n.clone=function(){return new w(this.a,this.b,this.c,this.d,this.e,
+this.f)};n.translate=function(a,d){return this.add(1,0,0,1,a,d)};n.scale=function(a,d,e,f){null==d&&(d=a);(e||f)&&this.add(1,0,0,1,e,f);this.add(a,0,0,d,0,0);(e||f)&&this.add(1,0,0,1,-e,-f);return this};n.rotate=function(b,d,e){b=a.rad(b);d=d||0;e=e||0;var l=+f.cos(b).toFixed(9);b=+f.sin(b).toFixed(9);this.add(l,b,-b,l,d,e);return this.add(1,0,0,1,-d,-e)};n.x=function(a,d){return a*this.a+d*this.c+this.e};n.y=function(a,d){return a*this.b+d*this.d+this.f};n.get=function(a){return+this[d.fromCharCode(97+
+a)].toFixed(4)};n.toString=function(){return"matrix("+[this.get(0),this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)].join()+")"};n.offset=function(){return[this.e.toFixed(4),this.f.toFixed(4)]};n.determinant=function(){return this.a*this.d-this.b*this.c};n.split=function(){var b={};b.dx=this.e;b.dy=this.f;var d=[[this.a,this.c],[this.b,this.d] ];b.scalex=f.sqrt(k(d[0]));p(d[0]);b.shear=d[0][0]*d[1][0]+d[0][1]*d[1][1];d[1]=[d[1][0]-d[0][0]*b.shear,d[1][1]-d[0][1]*b.shear];b.scaley=f.sqrt(k(d[1]));
+p(d[1]);b.shear/=b.scaley;0>this.determinant()&&(b.scalex=-b.scalex);var e=-d[0][1],d=d[1][1];0>d?(b.rotate=a.deg(f.acos(d)),0>e&&(b.rotate=360-b.rotate)):b.rotate=a.deg(f.asin(e));b.isSimple=!+b.shear.toFixed(9)&&(b.scalex.toFixed(9)==b.scaley.toFixed(9)||!b.rotate);b.isSuperSimple=!+b.shear.toFixed(9)&&b.scalex.toFixed(9)==b.scaley.toFixed(9)&&!b.rotate;b.noRotation=!+b.shear.toFixed(9)&&!b.rotate;return b};n.toTransformString=function(a){a=a||this.split();if(+a.shear.toFixed(9))return"m"+[this.get(0),
+this.get(1),this.get(2),this.get(3),this.get(4),this.get(5)];a.scalex=+a.scalex.toFixed(4);a.scaley=+a.scaley.toFixed(4);a.rotate=+a.rotate.toFixed(4);return(a.dx||a.dy?"t"+[+a.dx.toFixed(4),+a.dy.toFixed(4)]:"")+(1!=a.scalex||1!=a.scaley?"s"+[a.scalex,a.scaley,0,0]:"")+(a.rotate?"r"+[+a.rotate.toFixed(4),0,0]:"")}})(w.prototype);a.Matrix=w;a.matrix=function(a,d,f,b,k,e){return new w(a,d,f,b,k,e)}});C.plugin(function(a,v,y,M,A){function w(h){return function(d){k.stop();d instanceof A&&1==d.node.childNodes.length&&
+("radialGradient"==d.node.firstChild.tagName||"linearGradient"==d.node.firstChild.tagName||"pattern"==d.node.firstChild.tagName)&&(d=d.node.firstChild,b(this).appendChild(d),d=u(d));if(d instanceof v)if("radialGradient"==d.type||"linearGradient"==d.type||"pattern"==d.type){d.node.id||e(d.node,{id:d.id});var f=l(d.node.id)}else f=d.attr(h);else f=a.color(d),f.error?(f=a(b(this).ownerSVGElement).gradient(d))?(f.node.id||e(f.node,{id:f.id}),f=l(f.node.id)):f=d:f=r(f);d={};d[h]=f;e(this.node,d);this.node.style[h]=
+x}}function z(a){k.stop();a==+a&&(a+="px");this.node.style.fontSize=a}function d(a){var b=[];a=a.childNodes;for(var e=0,f=a.length;e<f;e++){var l=a[e];3==l.nodeType&&b.push(l.nodeValue);"tspan"==l.tagName&&(1==l.childNodes.length&&3==l.firstChild.nodeType?b.push(l.firstChild.nodeValue):b.push(d(l)))}return b}function f(){k.stop();return this.node.style.fontSize}var n=a._.make,u=a._.wrap,p=a.is,b=a._.getSomeDefs,q=/^url\(#?([^)]+)\)$/,e=a._.$,l=a.url,r=String,s=a._.separator,x="";k.on("snap.util.attr.mask",
+function(a){if(a instanceof v||a instanceof A){k.stop();a instanceof A&&1==a.node.childNodes.length&&(a=a.node.firstChild,b(this).appendChild(a),a=u(a));if("mask"==a.type)var d=a;else d=n("mask",b(this)),d.node.appendChild(a.node);!d.node.id&&e(d.node,{id:d.id});e(this.node,{mask:l(d.id)})}});(function(a){k.on("snap.util.attr.clip",a);k.on("snap.util.attr.clip-path",a);k.on("snap.util.attr.clipPath",a)})(function(a){if(a instanceof v||a instanceof A){k.stop();if("clipPath"==a.type)var d=a;else d=
+n("clipPath",b(this)),d.node.appendChild(a.node),!d.node.id&&e(d.node,{id:d.id});e(this.node,{"clip-path":l(d.id)})}});k.on("snap.util.attr.fill",w("fill"));k.on("snap.util.attr.stroke",w("stroke"));var G=/^([lr])(?:\(([^)]*)\))?(.*)$/i;k.on("snap.util.grad.parse",function(a){a=r(a);var b=a.match(G);if(!b)return null;a=b[1];var e=b[2],b=b[3],e=e.split(/\s*,\s*/).map(function(a){return+a==a?+a:a});1==e.length&&0==e[0]&&(e=[]);b=b.split("-");b=b.map(function(a){a=a.split(":");var b={color:a[0]};a[1]&&
+(b.offset=parseFloat(a[1]));return b});return{type:a,params:e,stops:b}});k.on("snap.util.attr.d",function(b){k.stop();p(b,"array")&&p(b[0],"array")&&(b=a.path.toString.call(b));b=r(b);b.match(/[ruo]/i)&&(b=a.path.toAbsolute(b));e(this.node,{d:b})})(-1);k.on("snap.util.attr.#text",function(a){k.stop();a=r(a);for(a=M.doc.createTextNode(a);this.node.firstChild;)this.node.removeChild(this.node.firstChild);this.node.appendChild(a)})(-1);k.on("snap.util.attr.path",function(a){k.stop();this.attr({d:a})})(-1);
+k.on("snap.util.attr.class",function(a){k.stop();this.node.className.baseVal=a})(-1);k.on("snap.util.attr.viewBox",function(a){a=p(a,"object")&&"x"in a?[a.x,a.y,a.width,a.height].join(" "):p(a,"array")?a.join(" "):a;e(this.node,{viewBox:a});k.stop()})(-1);k.on("snap.util.attr.transform",function(a){this.transform(a);k.stop()})(-1);k.on("snap.util.attr.r",function(a){"rect"==this.type&&(k.stop(),e(this.node,{rx:a,ry:a}))})(-1);k.on("snap.util.attr.textpath",function(a){k.stop();if("text"==this.type){var d,
+f;if(!a&&this.textPath){for(a=this.textPath;a.node.firstChild;)this.node.appendChild(a.node.firstChild);a.remove();delete this.textPath}else if(p(a,"string")?(d=b(this),a=u(d.parentNode).path(a),d.appendChild(a.node),d=a.id,a.attr({id:d})):(a=u(a),a instanceof v&&(d=a.attr("id"),d||(d=a.id,a.attr({id:d})))),d)if(a=this.textPath,f=this.node,a)a.attr({"xlink:href":"#"+d});else{for(a=e("textPath",{"xlink:href":"#"+d});f.firstChild;)a.appendChild(f.firstChild);f.appendChild(a);this.textPath=u(a)}}})(-1);
+k.on("snap.util.attr.text",function(a){if("text"==this.type){for(var b=this.node,d=function(a){var b=e("tspan");if(p(a,"array"))for(var f=0;f<a.length;f++)b.appendChild(d(a[f]));else b.appendChild(M.doc.createTextNode(a));b.normalize&&b.normalize();return b};b.firstChild;)b.removeChild(b.firstChild);for(a=d(a);a.firstChild;)b.appendChild(a.firstChild)}k.stop()})(-1);k.on("snap.util.attr.fontSize",z)(-1);k.on("snap.util.attr.font-size",z)(-1);k.on("snap.util.getattr.transform",function(){k.stop();
+return this.transform()})(-1);k.on("snap.util.getattr.textpath",function(){k.stop();return this.textPath})(-1);(function(){function b(d){return function(){k.stop();var b=M.doc.defaultView.getComputedStyle(this.node,null).getPropertyValue("marker-"+d);return"none"==b?b:a(M.doc.getElementById(b.match(q)[1]))}}function d(a){return function(b){k.stop();var d="marker"+a.charAt(0).toUpperCase()+a.substring(1);if(""==b||!b)this.node.style[d]="none";else if("marker"==b.type){var f=b.node.id;f||e(b.node,{id:b.id});
+this.node.style[d]=l(f)}}}k.on("snap.util.getattr.marker-end",b("end"))(-1);k.on("snap.util.getattr.markerEnd",b("end"))(-1);k.on("snap.util.getattr.marker-start",b("start"))(-1);k.on("snap.util.getattr.markerStart",b("start"))(-1);k.on("snap.util.getattr.marker-mid",b("mid"))(-1);k.on("snap.util.getattr.markerMid",b("mid"))(-1);k.on("snap.util.attr.marker-end",d("end"))(-1);k.on("snap.util.attr.markerEnd",d("end"))(-1);k.on("snap.util.attr.marker-start",d("start"))(-1);k.on("snap.util.attr.markerStart",
+d("start"))(-1);k.on("snap.util.attr.marker-mid",d("mid"))(-1);k.on("snap.util.attr.markerMid",d("mid"))(-1)})();k.on("snap.util.getattr.r",function(){if("rect"==this.type&&e(this.node,"rx")==e(this.node,"ry"))return k.stop(),e(this.node,"rx")})(-1);k.on("snap.util.getattr.text",function(){if("text"==this.type||"tspan"==this.type){k.stop();var a=d(this.node);return 1==a.length?a[0]:a}})(-1);k.on("snap.util.getattr.#text",function(){return this.node.textContent})(-1);k.on("snap.util.getattr.viewBox",
+function(){k.stop();var b=e(this.node,"viewBox");if(b)return b=b.split(s),a._.box(+b[0],+b[1],+b[2],+b[3])})(-1);k.on("snap.util.getattr.points",function(){var a=e(this.node,"points");k.stop();if(a)return a.split(s)})(-1);k.on("snap.util.getattr.path",function(){var a=e(this.node,"d");k.stop();return a})(-1);k.on("snap.util.getattr.class",function(){return this.node.className.baseVal})(-1);k.on("snap.util.getattr.fontSize",f)(-1);k.on("snap.util.getattr.font-size",f)(-1)});C.plugin(function(a,v,y,
+M,A){function w(a){return a}function z(a){return function(b){return+b.toFixed(3)+a}}var d={"+":function(a,b){return a+b},"-":function(a,b){return a-b},"/":function(a,b){return a/b},"*":function(a,b){return a*b}},f=String,n=/[a-z]+$/i,u=/^\s*([+\-\/*])\s*=\s*([\d.eE+\-]+)\s*([^\d\s]+)?\s*$/;k.on("snap.util.attr",function(a){if(a=f(a).match(u)){var b=k.nt(),b=b.substring(b.lastIndexOf(".")+1),q=this.attr(b),e={};k.stop();var l=a[3]||"",r=q.match(n),s=d[a[1] ];r&&r==l?a=s(parseFloat(q),+a[2]):(q=this.asPX(b),
+a=s(this.asPX(b),this.asPX(b,a[2]+l)));isNaN(q)||isNaN(a)||(e[b]=a,this.attr(e))}})(-10);k.on("snap.util.equal",function(a,b){var q=f(this.attr(a)||""),e=f(b).match(u);if(e){k.stop();var l=e[3]||"",r=q.match(n),s=d[e[1] ];if(r&&r==l)return{from:parseFloat(q),to:s(parseFloat(q),+e[2]),f:z(r)};q=this.asPX(a);return{from:q,to:s(q,this.asPX(a,e[2]+l)),f:w}}})(-10)});C.plugin(function(a,v,y,M,A){var w=y.prototype,z=a.is;w.rect=function(a,d,k,p,b,q){var e;null==q&&(q=b);z(a,"object")&&"[object Object]"==
+a?e=a:null!=a&&(e={x:a,y:d,width:k,height:p},null!=b&&(e.rx=b,e.ry=q));return this.el("rect",e)};w.circle=function(a,d,k){var p;z(a,"object")&&"[object Object]"==a?p=a:null!=a&&(p={cx:a,cy:d,r:k});return this.el("circle",p)};var d=function(){function a(){this.parentNode.removeChild(this)}return function(d,k){var p=M.doc.createElement("img"),b=M.doc.body;p.style.cssText="position:absolute;left:-9999em;top:-9999em";p.onload=function(){k.call(p);p.onload=p.onerror=null;b.removeChild(p)};p.onerror=a;
+b.appendChild(p);p.src=d}}();w.image=function(f,n,k,p,b){var q=this.el("image");if(z(f,"object")&&"src"in f)q.attr(f);else if(null!=f){var e={"xlink:href":f,preserveAspectRatio:"none"};null!=n&&null!=k&&(e.x=n,e.y=k);null!=p&&null!=b?(e.width=p,e.height=b):d(f,function(){a._.$(q.node,{width:this.offsetWidth,height:this.offsetHeight})});a._.$(q.node,e)}return q};w.ellipse=function(a,d,k,p){var b;z(a,"object")&&"[object Object]"==a?b=a:null!=a&&(b={cx:a,cy:d,rx:k,ry:p});return this.el("ellipse",b)};
+w.path=function(a){var d;z(a,"object")&&!z(a,"array")?d=a:a&&(d={d:a});return this.el("path",d)};w.group=w.g=function(a){var d=this.el("g");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.svg=function(a,d,k,p,b,q,e,l){var r={};z(a,"object")&&null==d?r=a:(null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l]));return this.el("svg",r)};w.mask=function(a){var d=
+this.el("mask");1==arguments.length&&a&&!a.type?d.attr(a):arguments.length&&d.add(Array.prototype.slice.call(arguments,0));return d};w.ptrn=function(a,d,k,p,b,q,e,l){if(z(a,"object"))var r=a;else arguments.length?(r={},null!=a&&(r.x=a),null!=d&&(r.y=d),null!=k&&(r.width=k),null!=p&&(r.height=p),null!=b&&null!=q&&null!=e&&null!=l&&(r.viewBox=[b,q,e,l])):r={patternUnits:"userSpaceOnUse"};return this.el("pattern",r)};w.use=function(a){return null!=a?(make("use",this.node),a instanceof v&&(a.attr("id")||
+a.attr({id:ID()}),a=a.attr("id")),this.el("use",{"xlink:href":a})):v.prototype.use.call(this)};w.text=function(a,d,k){var p={};z(a,"object")?p=a:null!=a&&(p={x:a,y:d,text:k||""});return this.el("text",p)};w.line=function(a,d,k,p){var b={};z(a,"object")?b=a:null!=a&&(b={x1:a,x2:k,y1:d,y2:p});return this.el("line",b)};w.polyline=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polyline",d)};
+w.polygon=function(a){1<arguments.length&&(a=Array.prototype.slice.call(arguments,0));var d={};z(a,"object")&&!z(a,"array")?d=a:null!=a&&(d={points:a});return this.el("polygon",d)};(function(){function d(){return this.selectAll("stop")}function n(b,d){var f=e("stop"),k={offset:+d+"%"};b=a.color(b);k["stop-color"]=b.hex;1>b.opacity&&(k["stop-opacity"]=b.opacity);e(f,k);this.node.appendChild(f);return this}function u(){if("linearGradient"==this.type){var b=e(this.node,"x1")||0,d=e(this.node,"x2")||
+1,f=e(this.node,"y1")||0,k=e(this.node,"y2")||0;return a._.box(b,f,math.abs(d-b),math.abs(k-f))}b=this.node.r||0;return a._.box((this.node.cx||0.5)-b,(this.node.cy||0.5)-b,2*b,2*b)}function p(a,d){function f(a,b){for(var d=(b-u)/(a-w),e=w;e<a;e++)h[e].offset=+(+u+d*(e-w)).toFixed(2);w=a;u=b}var n=k("snap.util.grad.parse",null,d).firstDefined(),p;if(!n)return null;n.params.unshift(a);p="l"==n.type.toLowerCase()?b.apply(0,n.params):q.apply(0,n.params);n.type!=n.type.toLowerCase()&&e(p.node,{gradientUnits:"userSpaceOnUse"});
+var h=n.stops,n=h.length,u=0,w=0;n--;for(var v=0;v<n;v++)"offset"in h[v]&&f(v,h[v].offset);h[n].offset=h[n].offset||100;f(n,h[n].offset);for(v=0;v<=n;v++){var y=h[v];p.addStop(y.color,y.offset)}return p}function b(b,k,p,q,w){b=a._.make("linearGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{x1:k,y1:p,x2:q,y2:w});return b}function q(b,k,p,q,w,h){b=a._.make("radialGradient",b);b.stops=d;b.addStop=n;b.getBBox=u;null!=k&&e(b.node,{cx:k,cy:p,r:q});null!=w&&null!=h&&e(b.node,{fx:w,fy:h});
+return b}var e=a._.$;w.gradient=function(a){return p(this.defs,a)};w.gradientLinear=function(a,d,e,f){return b(this.defs,a,d,e,f)};w.gradientRadial=function(a,b,d,e,f){return q(this.defs,a,b,d,e,f)};w.toString=function(){var b=this.node.ownerDocument,d=b.createDocumentFragment(),b=b.createElement("div"),e=this.node.cloneNode(!0);d.appendChild(b);b.appendChild(e);a._.$(e,{xmlns:"http://www.w3.org/2000/svg"});b=b.innerHTML;d.removeChild(d.firstChild);return b};w.clear=function(){for(var a=this.node.firstChild,
+b;a;)b=a.nextSibling,"defs"!=a.tagName?a.parentNode.removeChild(a):w.clear.call({node:a}),a=b}})()});C.plugin(function(a,k,y,M){function A(a){var b=A.ps=A.ps||{};b[a]?b[a].sleep=100:b[a]={sleep:100};setTimeout(function(){for(var d in b)b[L](d)&&d!=a&&(b[d].sleep--,!b[d].sleep&&delete b[d])});return b[a]}function w(a,b,d,e){null==a&&(a=b=d=e=0);null==b&&(b=a.y,d=a.width,e=a.height,a=a.x);return{x:a,y:b,width:d,w:d,height:e,h:e,x2:a+d,y2:b+e,cx:a+d/2,cy:b+e/2,r1:F.min(d,e)/2,r2:F.max(d,e)/2,r0:F.sqrt(d*
+d+e*e)/2,path:s(a,b,d,e),vb:[a,b,d,e].join(" ")}}function z(){return this.join(",").replace(N,"$1")}function d(a){a=C(a);a.toString=z;return a}function f(a,b,d,h,f,k,l,n,p){if(null==p)return e(a,b,d,h,f,k,l,n);if(0>p||e(a,b,d,h,f,k,l,n)<p)p=void 0;else{var q=0.5,O=1-q,s;for(s=e(a,b,d,h,f,k,l,n,O);0.01<Z(s-p);)q/=2,O+=(s<p?1:-1)*q,s=e(a,b,d,h,f,k,l,n,O);p=O}return u(a,b,d,h,f,k,l,n,p)}function n(b,d){function e(a){return+(+a).toFixed(3)}return a._.cacher(function(a,h,l){a instanceof k&&(a=a.attr("d"));
+a=I(a);for(var n,p,D,q,O="",s={},c=0,t=0,r=a.length;t<r;t++){D=a[t];if("M"==D[0])n=+D[1],p=+D[2];else{q=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6]);if(c+q>h){if(d&&!s.start){n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c);O+=["C"+e(n.start.x),e(n.start.y),e(n.m.x),e(n.m.y),e(n.x),e(n.y)];if(l)return O;s.start=O;O=["M"+e(n.x),e(n.y)+"C"+e(n.n.x),e(n.n.y),e(n.end.x),e(n.end.y),e(D[5]),e(D[6])].join();c+=q;n=+D[5];p=+D[6];continue}if(!b&&!d)return n=f(n,p,D[1],D[2],D[3],D[4],D[5],D[6],h-c)}c+=q;n=+D[5];p=+D[6]}O+=
+D.shift()+D}s.end=O;return n=b?c:d?s:u(n,p,D[0],D[1],D[2],D[3],D[4],D[5],1)},null,a._.clone)}function u(a,b,d,e,h,f,k,l,n){var p=1-n,q=ma(p,3),s=ma(p,2),c=n*n,t=c*n,r=q*a+3*s*n*d+3*p*n*n*h+t*k,q=q*b+3*s*n*e+3*p*n*n*f+t*l,s=a+2*n*(d-a)+c*(h-2*d+a),t=b+2*n*(e-b)+c*(f-2*e+b),x=d+2*n*(h-d)+c*(k-2*h+d),c=e+2*n*(f-e)+c*(l-2*f+e);a=p*a+n*d;b=p*b+n*e;h=p*h+n*k;f=p*f+n*l;l=90-180*F.atan2(s-x,t-c)/S;return{x:r,y:q,m:{x:s,y:t},n:{x:x,y:c},start:{x:a,y:b},end:{x:h,y:f},alpha:l}}function p(b,d,e,h,f,n,k,l){a.is(b,
+"array")||(b=[b,d,e,h,f,n,k,l]);b=U.apply(null,b);return w(b.min.x,b.min.y,b.max.x-b.min.x,b.max.y-b.min.y)}function b(a,b,d){return b>=a.x&&b<=a.x+a.width&&d>=a.y&&d<=a.y+a.height}function q(a,d){a=w(a);d=w(d);return b(d,a.x,a.y)||b(d,a.x2,a.y)||b(d,a.x,a.y2)||b(d,a.x2,a.y2)||b(a,d.x,d.y)||b(a,d.x2,d.y)||b(a,d.x,d.y2)||b(a,d.x2,d.y2)||(a.x<d.x2&&a.x>d.x||d.x<a.x2&&d.x>a.x)&&(a.y<d.y2&&a.y>d.y||d.y<a.y2&&d.y>a.y)}function e(a,b,d,e,h,f,n,k,l){null==l&&(l=1);l=(1<l?1:0>l?0:l)/2;for(var p=[-0.1252,
+0.1252,-0.3678,0.3678,-0.5873,0.5873,-0.7699,0.7699,-0.9041,0.9041,-0.9816,0.9816],q=[0.2491,0.2491,0.2335,0.2335,0.2032,0.2032,0.1601,0.1601,0.1069,0.1069,0.0472,0.0472],s=0,c=0;12>c;c++)var t=l*p[c]+l,r=t*(t*(-3*a+9*d-9*h+3*n)+6*a-12*d+6*h)-3*a+3*d,t=t*(t*(-3*b+9*e-9*f+3*k)+6*b-12*e+6*f)-3*b+3*e,s=s+q[c]*F.sqrt(r*r+t*t);return l*s}function l(a,b,d){a=I(a);b=I(b);for(var h,f,l,n,k,s,r,O,x,c,t=d?0:[],w=0,v=a.length;w<v;w++)if(x=a[w],"M"==x[0])h=k=x[1],f=s=x[2];else{"C"==x[0]?(x=[h,f].concat(x.slice(1)),
+h=x[6],f=x[7]):(x=[h,f,h,f,k,s,k,s],h=k,f=s);for(var G=0,y=b.length;G<y;G++)if(c=b[G],"M"==c[0])l=r=c[1],n=O=c[2];else{"C"==c[0]?(c=[l,n].concat(c.slice(1)),l=c[6],n=c[7]):(c=[l,n,l,n,r,O,r,O],l=r,n=O);var z;var K=x,B=c;z=d;var H=p(K),J=p(B);if(q(H,J)){for(var H=e.apply(0,K),J=e.apply(0,B),H=~~(H/8),J=~~(J/8),U=[],A=[],F={},M=z?0:[],P=0;P<H+1;P++){var C=u.apply(0,K.concat(P/H));U.push({x:C.x,y:C.y,t:P/H})}for(P=0;P<J+1;P++)C=u.apply(0,B.concat(P/J)),A.push({x:C.x,y:C.y,t:P/J});for(P=0;P<H;P++)for(K=
+0;K<J;K++){var Q=U[P],L=U[P+1],B=A[K],C=A[K+1],N=0.001>Z(L.x-Q.x)?"y":"x",S=0.001>Z(C.x-B.x)?"y":"x",R;R=Q.x;var Y=Q.y,V=L.x,ea=L.y,fa=B.x,ga=B.y,ha=C.x,ia=C.y;if(W(R,V)<X(fa,ha)||X(R,V)>W(fa,ha)||W(Y,ea)<X(ga,ia)||X(Y,ea)>W(ga,ia))R=void 0;else{var $=(R*ea-Y*V)*(fa-ha)-(R-V)*(fa*ia-ga*ha),aa=(R*ea-Y*V)*(ga-ia)-(Y-ea)*(fa*ia-ga*ha),ja=(R-V)*(ga-ia)-(Y-ea)*(fa-ha);if(ja){var $=$/ja,aa=aa/ja,ja=+$.toFixed(2),ba=+aa.toFixed(2);R=ja<+X(R,V).toFixed(2)||ja>+W(R,V).toFixed(2)||ja<+X(fa,ha).toFixed(2)||
+ja>+W(fa,ha).toFixed(2)||ba<+X(Y,ea).toFixed(2)||ba>+W(Y,ea).toFixed(2)||ba<+X(ga,ia).toFixed(2)||ba>+W(ga,ia).toFixed(2)?void 0:{x:$,y:aa}}else R=void 0}R&&F[R.x.toFixed(4)]!=R.y.toFixed(4)&&(F[R.x.toFixed(4)]=R.y.toFixed(4),Q=Q.t+Z((R[N]-Q[N])/(L[N]-Q[N]))*(L.t-Q.t),B=B.t+Z((R[S]-B[S])/(C[S]-B[S]))*(C.t-B.t),0<=Q&&1>=Q&&0<=B&&1>=B&&(z?M++:M.push({x:R.x,y:R.y,t1:Q,t2:B})))}z=M}else z=z?0:[];if(d)t+=z;else{H=0;for(J=z.length;H<J;H++)z[H].segment1=w,z[H].segment2=G,z[H].bez1=x,z[H].bez2=c;t=t.concat(z)}}}return t}
+function r(a){var b=A(a);if(b.bbox)return C(b.bbox);if(!a)return w();a=I(a);for(var d=0,e=0,h=[],f=[],l,n=0,k=a.length;n<k;n++)l=a[n],"M"==l[0]?(d=l[1],e=l[2],h.push(d),f.push(e)):(d=U(d,e,l[1],l[2],l[3],l[4],l[5],l[6]),h=h.concat(d.min.x,d.max.x),f=f.concat(d.min.y,d.max.y),d=l[5],e=l[6]);a=X.apply(0,h);l=X.apply(0,f);h=W.apply(0,h);f=W.apply(0,f);f=w(a,l,h-a,f-l);b.bbox=C(f);return f}function s(a,b,d,e,h){if(h)return[["M",+a+ +h,b],["l",d-2*h,0],["a",h,h,0,0,1,h,h],["l",0,e-2*h],["a",h,h,0,0,1,
+-h,h],["l",2*h-d,0],["a",h,h,0,0,1,-h,-h],["l",0,2*h-e],["a",h,h,0,0,1,h,-h],["z"] ];a=[["M",a,b],["l",d,0],["l",0,e],["l",-d,0],["z"] ];a.toString=z;return a}function x(a,b,d,e,h){null==h&&null==e&&(e=d);a=+a;b=+b;d=+d;e=+e;if(null!=h){var f=Math.PI/180,l=a+d*Math.cos(-e*f);a+=d*Math.cos(-h*f);var n=b+d*Math.sin(-e*f);b+=d*Math.sin(-h*f);d=[["M",l,n],["A",d,d,0,+(180<h-e),0,a,b] ]}else d=[["M",a,b],["m",0,-e],["a",d,e,0,1,1,0,2*e],["a",d,e,0,1,1,0,-2*e],["z"] ];d.toString=z;return d}function G(b){var e=
+A(b);if(e.abs)return d(e.abs);Q(b,"array")&&Q(b&&b[0],"array")||(b=a.parsePathString(b));if(!b||!b.length)return[["M",0,0] ];var h=[],f=0,l=0,n=0,k=0,p=0;"M"==b[0][0]&&(f=+b[0][1],l=+b[0][2],n=f,k=l,p++,h[0]=["M",f,l]);for(var q=3==b.length&&"M"==b[0][0]&&"R"==b[1][0].toUpperCase()&&"Z"==b[2][0].toUpperCase(),s,r,w=p,c=b.length;w<c;w++){h.push(s=[]);r=b[w];p=r[0];if(p!=p.toUpperCase())switch(s[0]=p.toUpperCase(),s[0]){case "A":s[1]=r[1];s[2]=r[2];s[3]=r[3];s[4]=r[4];s[5]=r[5];s[6]=+r[6]+f;s[7]=+r[7]+
+l;break;case "V":s[1]=+r[1]+l;break;case "H":s[1]=+r[1]+f;break;case "R":for(var t=[f,l].concat(r.slice(1)),u=2,v=t.length;u<v;u++)t[u]=+t[u]+f,t[++u]=+t[u]+l;h.pop();h=h.concat(P(t,q));break;case "O":h.pop();t=x(f,l,r[1],r[2]);t.push(t[0]);h=h.concat(t);break;case "U":h.pop();h=h.concat(x(f,l,r[1],r[2],r[3]));s=["U"].concat(h[h.length-1].slice(-2));break;case "M":n=+r[1]+f,k=+r[2]+l;default:for(u=1,v=r.length;u<v;u++)s[u]=+r[u]+(u%2?f:l)}else if("R"==p)t=[f,l].concat(r.slice(1)),h.pop(),h=h.concat(P(t,
+q)),s=["R"].concat(r.slice(-2));else if("O"==p)h.pop(),t=x(f,l,r[1],r[2]),t.push(t[0]),h=h.concat(t);else if("U"==p)h.pop(),h=h.concat(x(f,l,r[1],r[2],r[3])),s=["U"].concat(h[h.length-1].slice(-2));else for(t=0,u=r.length;t<u;t++)s[t]=r[t];p=p.toUpperCase();if("O"!=p)switch(s[0]){case "Z":f=+n;l=+k;break;case "H":f=s[1];break;case "V":l=s[1];break;case "M":n=s[s.length-2],k=s[s.length-1];default:f=s[s.length-2],l=s[s.length-1]}}h.toString=z;e.abs=d(h);return h}function h(a,b,d,e){return[a,b,d,e,d,
+e]}function J(a,b,d,e,h,f){var l=1/3,n=2/3;return[l*a+n*d,l*b+n*e,l*h+n*d,l*f+n*e,h,f]}function K(b,d,e,h,f,l,n,k,p,s){var r=120*S/180,q=S/180*(+f||0),c=[],t,x=a._.cacher(function(a,b,c){var d=a*F.cos(c)-b*F.sin(c);a=a*F.sin(c)+b*F.cos(c);return{x:d,y:a}});if(s)v=s[0],t=s[1],l=s[2],u=s[3];else{t=x(b,d,-q);b=t.x;d=t.y;t=x(k,p,-q);k=t.x;p=t.y;F.cos(S/180*f);F.sin(S/180*f);t=(b-k)/2;v=(d-p)/2;u=t*t/(e*e)+v*v/(h*h);1<u&&(u=F.sqrt(u),e*=u,h*=u);var u=e*e,w=h*h,u=(l==n?-1:1)*F.sqrt(Z((u*w-u*v*v-w*t*t)/
+(u*v*v+w*t*t)));l=u*e*v/h+(b+k)/2;var u=u*-h*t/e+(d+p)/2,v=F.asin(((d-u)/h).toFixed(9));t=F.asin(((p-u)/h).toFixed(9));v=b<l?S-v:v;t=k<l?S-t:t;0>v&&(v=2*S+v);0>t&&(t=2*S+t);n&&v>t&&(v-=2*S);!n&&t>v&&(t-=2*S)}if(Z(t-v)>r){var c=t,w=k,G=p;t=v+r*(n&&t>v?1:-1);k=l+e*F.cos(t);p=u+h*F.sin(t);c=K(k,p,e,h,f,0,n,w,G,[t,c,l,u])}l=t-v;f=F.cos(v);r=F.sin(v);n=F.cos(t);t=F.sin(t);l=F.tan(l/4);e=4/3*e*l;l*=4/3*h;h=[b,d];b=[b+e*r,d-l*f];d=[k+e*t,p-l*n];k=[k,p];b[0]=2*h[0]-b[0];b[1]=2*h[1]-b[1];if(s)return[b,d,k].concat(c);
+c=[b,d,k].concat(c).join().split(",");s=[];k=0;for(p=c.length;k<p;k++)s[k]=k%2?x(c[k-1],c[k],q).y:x(c[k],c[k+1],q).x;return s}function U(a,b,d,e,h,f,l,k){for(var n=[],p=[[],[] ],s,r,c,t,q=0;2>q;++q)0==q?(r=6*a-12*d+6*h,s=-3*a+9*d-9*h+3*l,c=3*d-3*a):(r=6*b-12*e+6*f,s=-3*b+9*e-9*f+3*k,c=3*e-3*b),1E-12>Z(s)?1E-12>Z(r)||(s=-c/r,0<s&&1>s&&n.push(s)):(t=r*r-4*c*s,c=F.sqrt(t),0>t||(t=(-r+c)/(2*s),0<t&&1>t&&n.push(t),s=(-r-c)/(2*s),0<s&&1>s&&n.push(s)));for(r=q=n.length;q--;)s=n[q],c=1-s,p[0][q]=c*c*c*a+3*
+c*c*s*d+3*c*s*s*h+s*s*s*l,p[1][q]=c*c*c*b+3*c*c*s*e+3*c*s*s*f+s*s*s*k;p[0][r]=a;p[1][r]=b;p[0][r+1]=l;p[1][r+1]=k;p[0].length=p[1].length=r+2;return{min:{x:X.apply(0,p[0]),y:X.apply(0,p[1])},max:{x:W.apply(0,p[0]),y:W.apply(0,p[1])}}}function I(a,b){var e=!b&&A(a);if(!b&&e.curve)return d(e.curve);var f=G(a),l=b&&G(b),n={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},k={x:0,y:0,bx:0,by:0,X:0,Y:0,qx:null,qy:null},p=function(a,b,c){if(!a)return["C",b.x,b.y,b.x,b.y,b.x,b.y];a[0]in{T:1,Q:1}||(b.qx=b.qy=null);
+switch(a[0]){case "M":b.X=a[1];b.Y=a[2];break;case "A":a=["C"].concat(K.apply(0,[b.x,b.y].concat(a.slice(1))));break;case "S":"C"==c||"S"==c?(c=2*b.x-b.bx,b=2*b.y-b.by):(c=b.x,b=b.y);a=["C",c,b].concat(a.slice(1));break;case "T":"Q"==c||"T"==c?(b.qx=2*b.x-b.qx,b.qy=2*b.y-b.qy):(b.qx=b.x,b.qy=b.y);a=["C"].concat(J(b.x,b.y,b.qx,b.qy,a[1],a[2]));break;case "Q":b.qx=a[1];b.qy=a[2];a=["C"].concat(J(b.x,b.y,a[1],a[2],a[3],a[4]));break;case "L":a=["C"].concat(h(b.x,b.y,a[1],a[2]));break;case "H":a=["C"].concat(h(b.x,
+b.y,a[1],b.y));break;case "V":a=["C"].concat(h(b.x,b.y,b.x,a[1]));break;case "Z":a=["C"].concat(h(b.x,b.y,b.X,b.Y))}return a},s=function(a,b){if(7<a[b].length){a[b].shift();for(var c=a[b];c.length;)q[b]="A",l&&(u[b]="A"),a.splice(b++,0,["C"].concat(c.splice(0,6)));a.splice(b,1);v=W(f.length,l&&l.length||0)}},r=function(a,b,c,d,e){a&&b&&"M"==a[e][0]&&"M"!=b[e][0]&&(b.splice(e,0,["M",d.x,d.y]),c.bx=0,c.by=0,c.x=a[e][1],c.y=a[e][2],v=W(f.length,l&&l.length||0))},q=[],u=[],c="",t="",x=0,v=W(f.length,
+l&&l.length||0);for(;x<v;x++){f[x]&&(c=f[x][0]);"C"!=c&&(q[x]=c,x&&(t=q[x-1]));f[x]=p(f[x],n,t);"A"!=q[x]&&"C"==c&&(q[x]="C");s(f,x);l&&(l[x]&&(c=l[x][0]),"C"!=c&&(u[x]=c,x&&(t=u[x-1])),l[x]=p(l[x],k,t),"A"!=u[x]&&"C"==c&&(u[x]="C"),s(l,x));r(f,l,n,k,x);r(l,f,k,n,x);var w=f[x],z=l&&l[x],y=w.length,U=l&&z.length;n.x=w[y-2];n.y=w[y-1];n.bx=$(w[y-4])||n.x;n.by=$(w[y-3])||n.y;k.bx=l&&($(z[U-4])||k.x);k.by=l&&($(z[U-3])||k.y);k.x=l&&z[U-2];k.y=l&&z[U-1]}l||(e.curve=d(f));return l?[f,l]:f}function P(a,
+b){for(var d=[],e=0,h=a.length;h-2*!b>e;e+=2){var f=[{x:+a[e-2],y:+a[e-1]},{x:+a[e],y:+a[e+1]},{x:+a[e+2],y:+a[e+3]},{x:+a[e+4],y:+a[e+5]}];b?e?h-4==e?f[3]={x:+a[0],y:+a[1]}:h-2==e&&(f[2]={x:+a[0],y:+a[1]},f[3]={x:+a[2],y:+a[3]}):f[0]={x:+a[h-2],y:+a[h-1]}:h-4==e?f[3]=f[2]:e||(f[0]={x:+a[e],y:+a[e+1]});d.push(["C",(-f[0].x+6*f[1].x+f[2].x)/6,(-f[0].y+6*f[1].y+f[2].y)/6,(f[1].x+6*f[2].x-f[3].x)/6,(f[1].y+6*f[2].y-f[3].y)/6,f[2].x,f[2].y])}return d}y=k.prototype;var Q=a.is,C=a._.clone,L="hasOwnProperty",
+N=/,?([a-z]),?/gi,$=parseFloat,F=Math,S=F.PI,X=F.min,W=F.max,ma=F.pow,Z=F.abs;M=n(1);var na=n(),ba=n(0,1),V=a._unit2px;a.path=A;a.path.getTotalLength=M;a.path.getPointAtLength=na;a.path.getSubpath=function(a,b,d){if(1E-6>this.getTotalLength(a)-d)return ba(a,b).end;a=ba(a,d,1);return b?ba(a,b).end:a};y.getTotalLength=function(){if(this.node.getTotalLength)return this.node.getTotalLength()};y.getPointAtLength=function(a){return na(this.attr("d"),a)};y.getSubpath=function(b,d){return a.path.getSubpath(this.attr("d"),
+b,d)};a._.box=w;a.path.findDotsAtSegment=u;a.path.bezierBBox=p;a.path.isPointInsideBBox=b;a.path.isBBoxIntersect=q;a.path.intersection=function(a,b){return l(a,b)};a.path.intersectionNumber=function(a,b){return l(a,b,1)};a.path.isPointInside=function(a,d,e){var h=r(a);return b(h,d,e)&&1==l(a,[["M",d,e],["H",h.x2+10] ],1)%2};a.path.getBBox=r;a.path.get={path:function(a){return a.attr("path")},circle:function(a){a=V(a);return x(a.cx,a.cy,a.r)},ellipse:function(a){a=V(a);return x(a.cx||0,a.cy||0,a.rx,
+a.ry)},rect:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height,a.rx,a.ry)},image:function(a){a=V(a);return s(a.x||0,a.y||0,a.width,a.height)},line:function(a){return"M"+[a.attr("x1")||0,a.attr("y1")||0,a.attr("x2"),a.attr("y2")]},polyline:function(a){return"M"+a.attr("points")},polygon:function(a){return"M"+a.attr("points")+"z"},deflt:function(a){a=a.node.getBBox();return s(a.x,a.y,a.width,a.height)}};a.path.toRelative=function(b){var e=A(b),h=String.prototype.toLowerCase;if(e.rel)return d(e.rel);
+a.is(b,"array")&&a.is(b&&b[0],"array")||(b=a.parsePathString(b));var f=[],l=0,n=0,k=0,p=0,s=0;"M"==b[0][0]&&(l=b[0][1],n=b[0][2],k=l,p=n,s++,f.push(["M",l,n]));for(var r=b.length;s<r;s++){var q=f[s]=[],x=b[s];if(x[0]!=h.call(x[0]))switch(q[0]=h.call(x[0]),q[0]){case "a":q[1]=x[1];q[2]=x[2];q[3]=x[3];q[4]=x[4];q[5]=x[5];q[6]=+(x[6]-l).toFixed(3);q[7]=+(x[7]-n).toFixed(3);break;case "v":q[1]=+(x[1]-n).toFixed(3);break;case "m":k=x[1],p=x[2];default:for(var c=1,t=x.length;c<t;c++)q[c]=+(x[c]-(c%2?l:
+n)).toFixed(3)}else for(f[s]=[],"m"==x[0]&&(k=x[1]+l,p=x[2]+n),q=0,c=x.length;q<c;q++)f[s][q]=x[q];x=f[s].length;switch(f[s][0]){case "z":l=k;n=p;break;case "h":l+=+f[s][x-1];break;case "v":n+=+f[s][x-1];break;default:l+=+f[s][x-2],n+=+f[s][x-1]}}f.toString=z;e.rel=d(f);return f};a.path.toAbsolute=G;a.path.toCubic=I;a.path.map=function(a,b){if(!b)return a;var d,e,h,f,l,n,k;a=I(a);h=0;for(l=a.length;h<l;h++)for(k=a[h],f=1,n=k.length;f<n;f+=2)d=b.x(k[f],k[f+1]),e=b.y(k[f],k[f+1]),k[f]=d,k[f+1]=e;return a};
+a.path.toString=z;a.path.clone=d});C.plugin(function(a,v,y,C){var A=Math.max,w=Math.min,z=function(a){this.items=[];this.bindings={};this.length=0;this.type="set";if(a)for(var f=0,n=a.length;f<n;f++)a[f]&&(this[this.items.length]=this.items[this.items.length]=a[f],this.length++)};v=z.prototype;v.push=function(){for(var a,f,n=0,k=arguments.length;n<k;n++)if(a=arguments[n])f=this.items.length,this[f]=this.items[f]=a,this.length++;return this};v.pop=function(){this.length&&delete this[this.length--];
+return this.items.pop()};v.forEach=function(a,f){for(var n=0,k=this.items.length;n<k&&!1!==a.call(f,this.items[n],n);n++);return this};v.animate=function(d,f,n,u){"function"!=typeof n||n.length||(u=n,n=L.linear);d instanceof a._.Animation&&(u=d.callback,n=d.easing,f=n.dur,d=d.attr);var p=arguments;if(a.is(d,"array")&&a.is(p[p.length-1],"array"))var b=!0;var q,e=function(){q?this.b=q:q=this.b},l=0,r=u&&function(){l++==this.length&&u.call(this)};return this.forEach(function(a,l){k.once("snap.animcreated."+
+a.id,e);b?p[l]&&a.animate.apply(a,p[l]):a.animate(d,f,n,r)})};v.remove=function(){for(;this.length;)this.pop().remove();return this};v.bind=function(a,f,k){var u={};if("function"==typeof f)this.bindings[a]=f;else{var p=k||a;this.bindings[a]=function(a){u[p]=a;f.attr(u)}}return this};v.attr=function(a){var f={},k;for(k in a)if(this.bindings[k])this.bindings[k](a[k]);else f[k]=a[k];a=0;for(k=this.items.length;a<k;a++)this.items[a].attr(f);return this};v.clear=function(){for(;this.length;)this.pop()};
+v.splice=function(a,f,k){a=0>a?A(this.length+a,0):a;f=A(0,w(this.length-a,f));var u=[],p=[],b=[],q;for(q=2;q<arguments.length;q++)b.push(arguments[q]);for(q=0;q<f;q++)p.push(this[a+q]);for(;q<this.length-a;q++)u.push(this[a+q]);var e=b.length;for(q=0;q<e+u.length;q++)this.items[a+q]=this[a+q]=q<e?b[q]:u[q-e];for(q=this.items.length=this.length-=f-e;this[q];)delete this[q++];return new z(p)};v.exclude=function(a){for(var f=0,k=this.length;f<k;f++)if(this[f]==a)return this.splice(f,1),!0;return!1};
+v.insertAfter=function(a){for(var f=this.items.length;f--;)this.items[f].insertAfter(a);return this};v.getBBox=function(){for(var a=[],f=[],k=[],u=[],p=this.items.length;p--;)if(!this.items[p].removed){var b=this.items[p].getBBox();a.push(b.x);f.push(b.y);k.push(b.x+b.width);u.push(b.y+b.height)}a=w.apply(0,a);f=w.apply(0,f);k=A.apply(0,k);u=A.apply(0,u);return{x:a,y:f,x2:k,y2:u,width:k-a,height:u-f,cx:a+(k-a)/2,cy:f+(u-f)/2}};v.clone=function(a){a=new z;for(var f=0,k=this.items.length;f<k;f++)a.push(this.items[f].clone());
+return a};v.toString=function(){return"Snap\u2018s set"};v.type="set";a.set=function(){var a=new z;arguments.length&&a.push.apply(a,Array.prototype.slice.call(arguments,0));return a}});C.plugin(function(a,v,y,C){function A(a){var b=a[0];switch(b.toLowerCase()){case "t":return[b,0,0];case "m":return[b,1,0,0,1,0,0];case "r":return 4==a.length?[b,0,a[2],a[3] ]:[b,0];case "s":return 5==a.length?[b,1,1,a[3],a[4] ]:3==a.length?[b,1,1]:[b,1]}}function w(b,d,f){d=q(d).replace(/\.{3}|\u2026/g,b);b=a.parseTransformString(b)||
+[];d=a.parseTransformString(d)||[];for(var k=Math.max(b.length,d.length),p=[],v=[],h=0,w,z,y,I;h<k;h++){y=b[h]||A(d[h]);I=d[h]||A(y);if(y[0]!=I[0]||"r"==y[0].toLowerCase()&&(y[2]!=I[2]||y[3]!=I[3])||"s"==y[0].toLowerCase()&&(y[3]!=I[3]||y[4]!=I[4])){b=a._.transform2matrix(b,f());d=a._.transform2matrix(d,f());p=[["m",b.a,b.b,b.c,b.d,b.e,b.f] ];v=[["m",d.a,d.b,d.c,d.d,d.e,d.f] ];break}p[h]=[];v[h]=[];w=0;for(z=Math.max(y.length,I.length);w<z;w++)w in y&&(p[h][w]=y[w]),w in I&&(v[h][w]=I[w])}return{from:u(p),
+to:u(v),f:n(p)}}function z(a){return a}function d(a){return function(b){return+b.toFixed(3)+a}}function f(b){return a.rgb(b[0],b[1],b[2])}function n(a){var b=0,d,f,k,n,h,p,q=[];d=0;for(f=a.length;d<f;d++){h="[";p=['"'+a[d][0]+'"'];k=1;for(n=a[d].length;k<n;k++)p[k]="val["+b++ +"]";h+=p+"]";q[d]=h}return Function("val","return Snap.path.toString.call(["+q+"])")}function u(a){for(var b=[],d=0,f=a.length;d<f;d++)for(var k=1,n=a[d].length;k<n;k++)b.push(a[d][k]);return b}var p={},b=/[a-z]+$/i,q=String;
+p.stroke=p.fill="colour";v.prototype.equal=function(a,b){return k("snap.util.equal",this,a,b).firstDefined()};k.on("snap.util.equal",function(e,k){var r,s;r=q(this.attr(e)||"");var x=this;if(r==+r&&k==+k)return{from:+r,to:+k,f:z};if("colour"==p[e])return r=a.color(r),s=a.color(k),{from:[r.r,r.g,r.b,r.opacity],to:[s.r,s.g,s.b,s.opacity],f:f};if("transform"==e||"gradientTransform"==e||"patternTransform"==e)return k instanceof a.Matrix&&(k=k.toTransformString()),a._.rgTransform.test(k)||(k=a._.svgTransform2string(k)),
+w(r,k,function(){return x.getBBox(1)});if("d"==e||"path"==e)return r=a.path.toCubic(r,k),{from:u(r[0]),to:u(r[1]),f:n(r[0])};if("points"==e)return r=q(r).split(a._.separator),s=q(k).split(a._.separator),{from:r,to:s,f:function(a){return a}};aUnit=r.match(b);s=q(k).match(b);return aUnit&&aUnit==s?{from:parseFloat(r),to:parseFloat(k),f:d(aUnit)}:{from:this.asPX(e),to:this.asPX(e,k),f:z}})});C.plugin(function(a,v,y,C){var A=v.prototype,w="createTouch"in C.doc;v="click dblclick mousedown mousemove mouseout mouseover mouseup touchstart touchmove touchend touchcancel".split(" ");
+var z={mousedown:"touchstart",mousemove:"touchmove",mouseup:"touchend"},d=function(a,b){var d="y"==a?"scrollTop":"scrollLeft",e=b&&b.node?b.node.ownerDocument:C.doc;return e[d in e.documentElement?"documentElement":"body"][d]},f=function(){this.returnValue=!1},n=function(){return this.originalEvent.preventDefault()},u=function(){this.cancelBubble=!0},p=function(){return this.originalEvent.stopPropagation()},b=function(){if(C.doc.addEventListener)return function(a,b,e,f){var k=w&&z[b]?z[b]:b,l=function(k){var l=
+d("y",f),q=d("x",f);if(w&&z.hasOwnProperty(b))for(var r=0,u=k.targetTouches&&k.targetTouches.length;r<u;r++)if(k.targetTouches[r].target==a||a.contains(k.targetTouches[r].target)){u=k;k=k.targetTouches[r];k.originalEvent=u;k.preventDefault=n;k.stopPropagation=p;break}return e.call(f,k,k.clientX+q,k.clientY+l)};b!==k&&a.addEventListener(b,l,!1);a.addEventListener(k,l,!1);return function(){b!==k&&a.removeEventListener(b,l,!1);a.removeEventListener(k,l,!1);return!0}};if(C.doc.attachEvent)return function(a,
+b,e,h){var k=function(a){a=a||h.node.ownerDocument.window.event;var b=d("y",h),k=d("x",h),k=a.clientX+k,b=a.clientY+b;a.preventDefault=a.preventDefault||f;a.stopPropagation=a.stopPropagation||u;return e.call(h,a,k,b)};a.attachEvent("on"+b,k);return function(){a.detachEvent("on"+b,k);return!0}}}(),q=[],e=function(a){for(var b=a.clientX,e=a.clientY,f=d("y"),l=d("x"),n,p=q.length;p--;){n=q[p];if(w)for(var r=a.touches&&a.touches.length,u;r--;){if(u=a.touches[r],u.identifier==n.el._drag.id||n.el.node.contains(u.target)){b=
+u.clientX;e=u.clientY;(a.originalEvent?a.originalEvent:a).preventDefault();break}}else a.preventDefault();b+=l;e+=f;k("snap.drag.move."+n.el.id,n.move_scope||n.el,b-n.el._drag.x,e-n.el._drag.y,b,e,a)}},l=function(b){a.unmousemove(e).unmouseup(l);for(var d=q.length,f;d--;)f=q[d],f.el._drag={},k("snap.drag.end."+f.el.id,f.end_scope||f.start_scope||f.move_scope||f.el,b);q=[]};for(y=v.length;y--;)(function(d){a[d]=A[d]=function(e,f){a.is(e,"function")&&(this.events=this.events||[],this.events.push({name:d,
+f:e,unbind:b(this.node||document,d,e,f||this)}));return this};a["un"+d]=A["un"+d]=function(a){for(var b=this.events||[],e=b.length;e--;)if(b[e].name==d&&(b[e].f==a||!a)){b[e].unbind();b.splice(e,1);!b.length&&delete this.events;break}return this}})(v[y]);A.hover=function(a,b,d,e){return this.mouseover(a,d).mouseout(b,e||d)};A.unhover=function(a,b){return this.unmouseover(a).unmouseout(b)};var r=[];A.drag=function(b,d,f,h,n,p){function u(r,v,w){(r.originalEvent||r).preventDefault();this._drag.x=v;
+this._drag.y=w;this._drag.id=r.identifier;!q.length&&a.mousemove(e).mouseup(l);q.push({el:this,move_scope:h,start_scope:n,end_scope:p});d&&k.on("snap.drag.start."+this.id,d);b&&k.on("snap.drag.move."+this.id,b);f&&k.on("snap.drag.end."+this.id,f);k("snap.drag.start."+this.id,n||h||this,v,w,r)}if(!arguments.length){var v;return this.drag(function(a,b){this.attr({transform:v+(v?"T":"t")+[a,b]})},function(){v=this.transform().local})}this._drag={};r.push({el:this,start:u});this.mousedown(u);return this};
+A.undrag=function(){for(var b=r.length;b--;)r[b].el==this&&(this.unmousedown(r[b].start),r.splice(b,1),k.unbind("snap.drag.*."+this.id));!r.length&&a.unmousemove(e).unmouseup(l);return this}});C.plugin(function(a,v,y,C){y=y.prototype;var A=/^\s*url\((.+)\)/,w=String,z=a._.$;a.filter={};y.filter=function(d){var f=this;"svg"!=f.type&&(f=f.paper);d=a.parse(w(d));var k=a._.id(),u=z("filter");z(u,{id:k,filterUnits:"userSpaceOnUse"});u.appendChild(d.node);f.defs.appendChild(u);return new v(u)};k.on("snap.util.getattr.filter",
+function(){k.stop();var d=z(this.node,"filter");if(d)return(d=w(d).match(A))&&a.select(d[1])});k.on("snap.util.attr.filter",function(d){if(d instanceof v&&"filter"==d.type){k.stop();var f=d.node.id;f||(z(d.node,{id:d.id}),f=d.id);z(this.node,{filter:a.url(f)})}d&&"none"!=d||(k.stop(),this.node.removeAttribute("filter"))});a.filter.blur=function(d,f){null==d&&(d=2);return a.format('<feGaussianBlur stdDeviation="{def}"/>',{def:null==f?d:[d,f]})};a.filter.blur.toString=function(){return this()};a.filter.shadow=
+function(d,f,k,u,p){"string"==typeof k&&(p=u=k,k=4);"string"!=typeof u&&(p=u,u="#000");null==k&&(k=4);null==p&&(p=1);null==d&&(d=0,f=2);null==f&&(f=d);u=a.color(u||"#000");return a.format('<feGaussianBlur in="SourceAlpha" stdDeviation="{blur}"/><feOffset dx="{dx}" dy="{dy}" result="offsetblur"/><feFlood flood-color="{color}"/><feComposite in2="offsetblur" operator="in"/><feComponentTransfer><feFuncA type="linear" slope="{opacity}"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>',
+{color:u,dx:d,dy:f,blur:k,opacity:p})};a.filter.shadow.toString=function(){return this()};a.filter.grayscale=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {b} {h} 0 0 0 0 0 1 0"/>',{a:0.2126+0.7874*(1-d),b:0.7152-0.7152*(1-d),c:0.0722-0.0722*(1-d),d:0.2126-0.2126*(1-d),e:0.7152+0.2848*(1-d),f:0.0722-0.0722*(1-d),g:0.2126-0.2126*(1-d),h:0.0722+0.9278*(1-d)})};a.filter.grayscale.toString=function(){return this()};a.filter.sepia=
+function(d){null==d&&(d=1);return a.format('<feColorMatrix type="matrix" values="{a} {b} {c} 0 0 {d} {e} {f} 0 0 {g} {h} {i} 0 0 0 0 0 1 0"/>',{a:0.393+0.607*(1-d),b:0.769-0.769*(1-d),c:0.189-0.189*(1-d),d:0.349-0.349*(1-d),e:0.686+0.314*(1-d),f:0.168-0.168*(1-d),g:0.272-0.272*(1-d),h:0.534-0.534*(1-d),i:0.131+0.869*(1-d)})};a.filter.sepia.toString=function(){return this()};a.filter.saturate=function(d){null==d&&(d=1);return a.format('<feColorMatrix type="saturate" values="{amount}"/>',{amount:1-
+d})};a.filter.saturate.toString=function(){return this()};a.filter.hueRotate=function(d){return a.format('<feColorMatrix type="hueRotate" values="{angle}"/>',{angle:d||0})};a.filter.hueRotate.toString=function(){return this()};a.filter.invert=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="table" tableValues="{amount} {amount2}"/><feFuncG type="table" tableValues="{amount} {amount2}"/><feFuncB type="table" tableValues="{amount} {amount2}"/></feComponentTransfer>',{amount:d,
+amount2:1-d})};a.filter.invert.toString=function(){return this()};a.filter.brightness=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}"/><feFuncG type="linear" slope="{amount}"/><feFuncB type="linear" slope="{amount}"/></feComponentTransfer>',{amount:d})};a.filter.brightness.toString=function(){return this()};a.filter.contrast=function(d){null==d&&(d=1);return a.format('<feComponentTransfer><feFuncR type="linear" slope="{amount}" intercept="{amount2}"/><feFuncG type="linear" slope="{amount}" intercept="{amount2}"/><feFuncB type="linear" slope="{amount}" intercept="{amount2}"/></feComponentTransfer>',
+{amount:d,amount2:0.5-d/2})};a.filter.contrast.toString=function(){return this()}});return C});
+
+]]> </script>
+<script> <![CDATA[
+
+(function (glob, factory) {
+    // AMD support
+    if (typeof define === "function" && define.amd) {
+        // Define as an anonymous module
+        define("Gadfly", ["Snap.svg"], function (Snap) {
+            return factory(Snap);
+        });
+    } else {
+        // Browser globals (glob is window)
+        // Snap adds itself to window
+        glob.Gadfly = factory(glob.Snap);
+    }
+}(this, function (Snap) {
+
+var Gadfly = {};
+
+// Get an x/y coordinate value in pixels
+var xPX = function(fig, x) {
+    var client_box = fig.node.getBoundingClientRect();
+    return x * fig.node.viewBox.baseVal.width / client_box.width;
+};
+
+var yPX = function(fig, y) {
+    var client_box = fig.node.getBoundingClientRect();
+    return y * fig.node.viewBox.baseVal.height / client_box.height;
+};
+
+
+Snap.plugin(function (Snap, Element, Paper, global) {
+    // Traverse upwards from a snap element to find and return the first
+    // note with the "plotroot" class.
+    Element.prototype.plotroot = function () {
+        var element = this;
+        while (!element.hasClass("plotroot") && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.svgroot = function () {
+        var element = this;
+        while (element.node.nodeName != "svg" && element.parent() != null) {
+            element = element.parent();
+        }
+        return element;
+    };
+
+    Element.prototype.plotbounds = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x0: bbox.x,
+            x1: bbox.x + bbox.width,
+            y0: bbox.y,
+            y1: bbox.y + bbox.height
+        };
+    };
+
+    Element.prototype.plotcenter = function () {
+        var root = this.plotroot()
+        var bbox = root.select(".guide.background").node.getBBox();
+        return {
+            x: bbox.x + bbox.width / 2,
+            y: bbox.y + bbox.height / 2
+        };
+    };
+
+    // Emulate IE style mouseenter/mouseleave events, since Microsoft always
+    // does everything right.
+    // See: http://www.dynamic-tools.net/toolbox/isMouseLeaveOrEnter/
+    var events = ["mouseenter", "mouseleave"];
+
+    for (i in events) {
+        (function (event_name) {
+            var event_name = events[i];
+            Element.prototype[event_name] = function (fn, scope) {
+                if (Snap.is(fn, "function")) {
+                    var fn2 = function (event) {
+                        if (event.type != "mouseover" && event.type != "mouseout") {
+                            return;
+                        }
+
+                        var reltg = event.relatedTarget ? event.relatedTarget :
+                            event.type == "mouseout" ? event.toElement : event.fromElement;
+                        while (reltg && reltg != this.node) reltg = reltg.parentNode;
+
+                        if (reltg != this.node) {
+                            return fn.apply(this, event);
+                        }
+                    };
+
+                    if (event_name == "mouseenter") {
+                        this.mouseover(fn2, scope);
+                    } else {
+                        this.mouseout(fn2, scope);
+                    }
+                }
+                return this;
+            };
+        })(events[i]);
+    }
+
+
+    Element.prototype.mousewheel = function (fn, scope) {
+        if (Snap.is(fn, "function")) {
+            var el = this;
+            var fn2 = function (event) {
+                fn.apply(el, [event]);
+            };
+        }
+
+        this.node.addEventListener(
+            /Firefox/i.test(navigator.userAgent) ? "DOMMouseScroll" : "mousewheel",
+            fn2);
+
+        return this;
+    };
+
+
+    // Snap's attr function can be too slow for things like panning/zooming.
+    // This is a function to directly update element attributes without going
+    // through eve.
+    Element.prototype.attribute = function(key, val) {
+        if (val === undefined) {
+            return this.node.getAttribute(key);
+        } else {
+            this.node.setAttribute(key, val);
+            return this;
+        }
+    };
+
+    Element.prototype.init_gadfly = function() {
+        this.mouseenter(Gadfly.plot_mouseover)
+            .mouseleave(Gadfly.plot_mouseout)
+            .dblclick(Gadfly.plot_dblclick)
+            .mousewheel(Gadfly.guide_background_scroll)
+            .drag(Gadfly.guide_background_drag_onmove,
+                  Gadfly.guide_background_drag_onstart,
+                  Gadfly.guide_background_drag_onend);
+        this.mouseenter(function (event) {
+            init_pan_zoom(this.plotroot());
+        });
+        return this;
+    };
+});
+
+
+// When the plot is moused over, emphasize the grid lines.
+Gadfly.plot_mouseover = function(event) {
+    var root = this.plotroot();
+
+    var keyboard_zoom = function(event) {
+        if (event.which == 187) { // plus
+            increase_zoom_by_position(root, 0.1, true);
+        } else if (event.which == 189) { // minus
+            increase_zoom_by_position(root, -0.1, true);
+        }
+    };
+    root.data("keyboard_zoom", keyboard_zoom);
+    window.addEventListener("keyup", keyboard_zoom);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    xgridlines.data("unfocused_strokedash",
+                    xgridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+    ygridlines.data("unfocused_strokedash",
+                    ygridlines.attribute("stroke-dasharray").replace(/(\d)(,|$)/g, "$1mm$2"));
+
+    // emphasize grid lines
+    var destcolor = root.data("focused_xgrid_color");
+    xgridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("focused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", "none")
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // reveal zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 1.0}, 250);
+};
+
+// Reset pan and zoom on double click
+Gadfly.plot_dblclick = function(event) {
+  set_plot_pan_zoom(this.plotroot(), 0.0, 0.0, 1.0);
+};
+
+// Unemphasize grid lines on mouse out.
+Gadfly.plot_mouseout = function(event) {
+    var root = this.plotroot();
+
+    window.removeEventListener("keyup", root.data("keyboard_zoom"));
+    root.data("keyboard_zoom", undefined);
+
+    var xgridlines = root.select(".xgridlines"),
+        ygridlines = root.select(".ygridlines");
+
+    var destcolor = root.data("unfocused_xgrid_color");
+
+    xgridlines.attribute("stroke-dasharray", xgridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    destcolor = root.data("unfocused_ygrid_color");
+    ygridlines.attribute("stroke-dasharray", ygridlines.data("unfocused_strokedash"))
+              .selectAll("path")
+              .animate({stroke: destcolor}, 250);
+
+    // hide zoom slider
+    root.select(".zoomslider")
+        .animate({opacity: 0.0}, 250);
+};
+
+
+var set_geometry_transform = function(root, tx, ty, scale) {
+    var xscalable = root.hasClass("xscalable"),
+        yscalable = root.hasClass("yscalable");
+
+    var old_scale = root.data("scale");
+
+    var xscale = xscalable ? scale : 1.0,
+        yscale = yscalable ? scale : 1.0;
+
+    tx = xscalable ? tx : 0.0;
+    ty = yscalable ? ty : 0.0;
+
+    var t = new Snap.Matrix().translate(tx, ty).scale(xscale, yscale);
+
+    root.selectAll(".geometry, image")
+        .forEach(function (element, i) {
+            element.transform(t);
+        });
+
+    bounds = root.plotbounds();
+
+    if (yscalable) {
+        var xfixed_t = new Snap.Matrix().translate(0, ty).scale(1.0, yscale);
+        root.selectAll(".xfixed")
+            .forEach(function (element, i) {
+                element.transform(xfixed_t);
+            });
+
+        root.select(".ylabels")
+            .transform(xfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1, 1/scale, cx, cy).add(st);
+                    element.transform(unscale_t);
+
+                    var y = cy * scale + ty;
+                    element.attr("visibility",
+                        bounds.y0 <= y && y <= bounds.y1 ? "visible" : "hidden");
+                }
+            });
+    }
+
+    if (xscalable) {
+        var yfixed_t = new Snap.Matrix().translate(tx, 0).scale(xscale, 1.0);
+        var xtrans = new Snap.Matrix().translate(tx, 0);
+        root.selectAll(".yfixed")
+            .forEach(function (element, i) {
+                element.transform(yfixed_t);
+            });
+
+        root.select(".xlabels")
+            .transform(yfixed_t)
+            .selectAll("text")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var cx = element.asPX("x"),
+                        cy = element.asPX("y");
+                    var st = element.data("static_transform");
+                    unscale_t = new Snap.Matrix();
+                    unscale_t.scale(1/scale, 1, cx, cy).add(st);
+
+                    element.transform(unscale_t);
+
+                    var x = cx * scale + tx;
+                    element.attr("visibility",
+                        bounds.x0 <= x && x <= bounds.x1 ? "visible" : "hidden");
+                    }
+            });
+    }
+
+    // we must unscale anything that is scale invariance: widths, raiduses, etc.
+    var size_attribs = ["font-size"];
+    var unscaled_selection = ".geometry, .geometry *";
+    if (xscalable) {
+        size_attribs.push("rx");
+        unscaled_selection += ", .xgridlines";
+    }
+    if (yscalable) {
+        size_attribs.push("ry");
+        unscaled_selection += ", .ygridlines";
+    }
+
+    root.selectAll(unscaled_selection)
+        .forEach(function (element, i) {
+            // circle need special help
+            if (element.node.nodeName == "circle") {
+                var cx = element.attribute("cx"),
+                    cy = element.attribute("cy");
+                unscale_t = new Snap.Matrix().scale(1/xscale, 1/yscale,
+                                                        cx, cy);
+                element.transform(unscale_t);
+                return;
+            }
+
+            for (i in size_attribs) {
+                var key = size_attribs[i];
+                var val = parseFloat(element.attribute(key));
+                if (val !== undefined && val != 0 && !isNaN(val)) {
+                    element.attribute(key, val * old_scale / scale);
+                }
+            }
+        });
+};
+
+
+// Find the most appropriate tick scale and update label visibility.
+var update_tickscale = function(root, scale, axis) {
+    if (!root.hasClass(axis + "scalable")) return;
+
+    var tickscales = root.data(axis + "tickscales");
+    var best_tickscale = 1.0;
+    var best_tickscale_dist = Infinity;
+    for (tickscale in tickscales) {
+        var dist = Math.abs(Math.log(tickscale) - Math.log(scale));
+        if (dist < best_tickscale_dist) {
+            best_tickscale_dist = dist;
+            best_tickscale = tickscale;
+        }
+    }
+
+    if (best_tickscale != root.data(axis + "tickscale")) {
+        root.data(axis + "tickscale", best_tickscale);
+        var mark_inscale_gridlines = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        var mark_inscale_labels = function (element, i) {
+            var inscale = element.attr("gadfly:scale") == best_tickscale;
+            element.attribute("gadfly:inscale", inscale);
+            element.attr("visibility", inscale ? "visible" : "hidden");
+        };
+
+        root.select("." + axis + "gridlines").selectAll("path").forEach(mark_inscale_gridlines);
+        root.select("." + axis + "labels").selectAll("text").forEach(mark_inscale_labels);
+    }
+};
+
+
+var set_plot_pan_zoom = function(root, tx, ty, scale) {
+    var old_scale = root.data("scale");
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    // compute the viewport derived from tx, ty, and scale
+    var x_min = -width * scale - (scale * width - width),
+        x_max = width * scale,
+        y_min = -height * scale - (scale * height - height),
+        y_max = height * scale;
+
+    var x0 = bounds.x0 - scale * bounds.x0,
+        y0 = bounds.y0 - scale * bounds.y0;
+
+    var tx = Math.max(Math.min(tx - x0, x_max), x_min),
+        ty = Math.max(Math.min(ty - y0, y_max), y_min);
+
+    tx += x0;
+    ty += y0;
+
+    // when the scale change, we may need to alter which set of
+    // ticks is being displayed
+    if (scale != old_scale) {
+        update_tickscale(root, scale, "x");
+        update_tickscale(root, scale, "y");
+    }
+
+    set_geometry_transform(root, tx, ty, scale);
+
+    root.data("scale", scale);
+    root.data("tx", tx);
+    root.data("ty", ty);
+};
+
+
+var scale_centered_translation = function(root, scale) {
+    var bounds = root.plotbounds();
+
+    var width = bounds.x1 - bounds.x0,
+        height = bounds.y1 - bounds.y0;
+
+    var tx0 = root.data("tx"),
+        ty0 = root.data("ty");
+
+    var scale0 = root.data("scale");
+
+    // how off from center the current view is
+    var xoff = tx0 - (bounds.x0 * (1 - scale0) + (width * (1 - scale0)) / 2),
+        yoff = ty0 - (bounds.y0 * (1 - scale0) + (height * (1 - scale0)) / 2);
+
+    // rescale offsets
+    xoff = xoff * scale / scale0;
+    yoff = yoff * scale / scale0;
+
+    // adjust for the panel position being scaled
+    var x_edge_adjust = bounds.x0 * (1 - scale),
+        y_edge_adjust = bounds.y0 * (1 - scale);
+
+    return {
+        x: xoff + x_edge_adjust + (width - width * scale) / 2,
+        y: yoff + y_edge_adjust + (height - height * scale) / 2
+    };
+};
+
+
+// Initialize data for panning zooming if it isn't already.
+var init_pan_zoom = function(root) {
+    if (root.data("zoompan-ready")) {
+        return;
+    }
+
+    // The non-scaling-stroke trick. Rather than try to correct for the
+    // stroke-width when zooming, we force it to a fixed value.
+    var px_per_mm = root.node.getCTM().a;
+
+    // Drag events report deltas in pixels, which we'd like to convert to
+    // millimeters.
+    root.data("px_per_mm", px_per_mm);
+
+    root.selectAll("path")
+        .forEach(function (element, i) {
+        sw = element.asPX("stroke-width") * px_per_mm;
+        if (sw > 0) {
+            element.attribute("stroke-width", sw);
+            element.attribute("vector-effect", "non-scaling-stroke");
+        }
+    });
+
+    // Store ticks labels original tranformation
+    root.selectAll(".xlabels > text, .ylabels > text")
+        .forEach(function (element, i) {
+            var lm = element.transform().localMatrix;
+            element.data("static_transform",
+                new Snap.Matrix(lm.a, lm.b, lm.c, lm.d, lm.e, lm.f));
+        });
+
+    var xgridlines = root.select(".xgridlines");
+    var ygridlines = root.select(".ygridlines");
+    var xlabels = root.select(".xlabels");
+    var ylabels = root.select(".ylabels");
+
+    if (root.data("tx") === undefined) root.data("tx", 0);
+    if (root.data("ty") === undefined) root.data("ty", 0);
+    if (root.data("scale") === undefined) root.data("scale", 1.0);
+    if (root.data("xtickscales") === undefined) {
+
+        // index all the tick scales that are listed
+        var xtickscales = {};
+        var ytickscales = {};
+        var add_x_tick_scales = function (element, i) {
+            xtickscales[element.attribute("gadfly:scale")] = true;
+        };
+        var add_y_tick_scales = function (element, i) {
+            ytickscales[element.attribute("gadfly:scale")] = true;
+        };
+
+        if (xgridlines) xgridlines.selectAll("path").forEach(add_x_tick_scales);
+        if (ygridlines) ygridlines.selectAll("path").forEach(add_y_tick_scales);
+        if (xlabels) xlabels.selectAll("text").forEach(add_x_tick_scales);
+        if (ylabels) ylabels.selectAll("text").forEach(add_y_tick_scales);
+
+        root.data("xtickscales", xtickscales);
+        root.data("ytickscales", ytickscales);
+        root.data("xtickscale", 1.0);
+    }
+
+    var min_scale = 1.0, max_scale = 1.0;
+    for (scale in xtickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    for (scale in ytickscales) {
+        min_scale = Math.min(min_scale, scale);
+        max_scale = Math.max(max_scale, scale);
+    }
+    root.data("min_scale", min_scale);
+    root.data("max_scale", max_scale);
+
+    // store the original positions of labels
+    if (xlabels) {
+        xlabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("x", element.asPX("x"));
+               });
+    }
+
+    if (ylabels) {
+        ylabels.selectAll("text")
+               .forEach(function (element, i) {
+                   element.data("y", element.asPX("y"));
+               });
+    }
+
+    // mark grid lines and ticks as in or out of scale.
+    var mark_inscale = function (element, i) {
+        element.attribute("gadfly:inscale", element.attribute("gadfly:scale") == 1.0);
+    };
+
+    if (xgridlines) xgridlines.selectAll("path").forEach(mark_inscale);
+    if (ygridlines) ygridlines.selectAll("path").forEach(mark_inscale);
+    if (xlabels) xlabels.selectAll("text").forEach(mark_inscale);
+    if (ylabels) ylabels.selectAll("text").forEach(mark_inscale);
+
+    // figure out the upper ond lower bounds on panning using the maximum
+    // and minum grid lines
+    var bounds = root.plotbounds();
+    var pan_bounds = {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 0.0,
+        y1: 0.0
+    };
+
+    if (xgridlines) {
+        xgridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.x1 - bbox.x < pan_bounds.x0) {
+                        pan_bounds.x0 = bounds.x1 - bbox.x;
+                    }
+                    if (bounds.x0 - bbox.x > pan_bounds.x1) {
+                        pan_bounds.x1 = bounds.x0 - bbox.x;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    if (ygridlines) {
+        ygridlines
+            .selectAll("path")
+            .forEach(function (element, i) {
+                if (element.attribute("gadfly:inscale") == "true") {
+                    var bbox = element.node.getBBox();
+                    if (bounds.y1 - bbox.y < pan_bounds.y0) {
+                        pan_bounds.y0 = bounds.y1 - bbox.y;
+                    }
+                    if (bounds.y0 - bbox.y > pan_bounds.y1) {
+                        pan_bounds.y1 = bounds.y0 - bbox.y;
+                    }
+                    element.attr("visibility", "visible");
+                }
+            });
+    }
+
+    // nudge these values a little
+    pan_bounds.x0 -= 5;
+    pan_bounds.x1 += 5;
+    pan_bounds.y0 -= 5;
+    pan_bounds.y1 += 5;
+    root.data("pan_bounds", pan_bounds);
+
+    root.data("zoompan-ready", true)
+};
+
+
+// drag actions, i.e. zooming and panning
+var pan_action = {
+    start: function(root, x, y, event) {
+        root.data("dx", 0);
+        root.data("dy", 0);
+        root.data("tx0", root.data("tx"));
+        root.data("ty0", root.data("ty"));
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var px_per_mm = root.data("px_per_mm");
+        dx /= px_per_mm;
+        dy /= px_per_mm;
+
+        var tx0 = root.data("tx"),
+            ty0 = root.data("ty");
+
+        var dx0 = root.data("dx"),
+            dy0 = root.data("dy");
+
+        root.data("dx", dx);
+        root.data("dy", dy);
+
+        dx = dx - dx0;
+        dy = dy - dy0;
+
+        var tx = tx0 + dx,
+            ty = ty0 + dy;
+
+        set_plot_pan_zoom(root, tx, ty, root.data("scale"));
+    },
+    end: function(root, event) {
+
+    },
+    cancel: function(root) {
+        set_plot_pan_zoom(root, root.data("tx0"), root.data("ty0"), root.data("scale"));
+    }
+};
+
+var zoom_box;
+var zoom_action = {
+    start: function(root, x, y, event) {
+        var bounds = root.plotbounds();
+        var width = bounds.x1 - bounds.x0,
+            height = bounds.y1 - bounds.y0;
+        var ratio = width / height;
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        x = xscalable ? x / px_per_mm : bounds.x0;
+        y = yscalable ? y / px_per_mm : bounds.y0;
+        var w = xscalable ? 0 : width;
+        var h = yscalable ? 0 : height;
+        zoom_box = root.rect(x, y, w, h).attr({
+            "fill": "#000",
+            "opacity": 0.25
+        });
+        zoom_box.data("ratio", ratio);
+    },
+    update: function(root, dx, dy, x, y, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var px_per_mm = root.data("px_per_mm");
+        var bounds = root.plotbounds();
+        if (yscalable) {
+            y /= px_per_mm;
+            y = Math.max(bounds.y0, y);
+            y = Math.min(bounds.y1, y);
+        } else {
+            y = bounds.y1;
+        }
+        if (xscalable) {
+            x /= px_per_mm;
+            x = Math.max(bounds.x0, x);
+            x = Math.min(bounds.x1, x);
+        } else {
+            x = bounds.x1;
+        }
+
+        dx = x - zoom_box.attr("x");
+        dy = y - zoom_box.attr("y");
+        if (xscalable && yscalable) {
+            var ratio = zoom_box.data("ratio");
+            var width = Math.min(Math.abs(dx), ratio * Math.abs(dy));
+            var height = Math.min(Math.abs(dy), Math.abs(dx) / ratio);
+            dx = width * dx / Math.abs(dx);
+            dy = height * dy / Math.abs(dy);
+        }
+        var xoffset = 0,
+            yoffset = 0;
+        if (dx < 0) {
+            xoffset = dx;
+            dx = -1 * dx;
+        }
+        if (dy < 0) {
+            yoffset = dy;
+            dy = -1 * dy;
+        }
+        if (isNaN(dy)) {
+            dy = 0.0;
+        }
+        if (isNaN(dx)) {
+            dx = 0.0;
+        }
+        zoom_box.transform("T" + xoffset + "," + yoffset);
+        zoom_box.attr("width", dx);
+        zoom_box.attr("height", dy);
+    },
+    end: function(root, event) {
+        var xscalable = root.hasClass("xscalable"),
+            yscalable = root.hasClass("yscalable");
+        var zoom_bounds = zoom_box.getBBox();
+        if (zoom_bounds.width * zoom_bounds.height <= 0) {
+            return;
+        }
+        var plot_bounds = root.plotbounds();
+        var zoom_factor = 1.0;
+        if (yscalable) {
+            zoom_factor = (plot_bounds.y1 - plot_bounds.y0) / zoom_bounds.height;
+        } else {
+            zoom_factor = (plot_bounds.x1 - plot_bounds.x0) / zoom_bounds.width;
+        }
+        var tx = (root.data("tx") - zoom_bounds.x) * zoom_factor + plot_bounds.x0,
+            ty = (root.data("ty") - zoom_bounds.y) * zoom_factor + plot_bounds.y0;
+        set_plot_pan_zoom(root, tx, ty, root.data("scale") * zoom_factor);
+        zoom_box.remove();
+    },
+    cancel: function(root) {
+        zoom_box.remove();
+    }
+};
+
+
+Gadfly.guide_background_drag_onstart = function(x, y, event) {
+    var root = this.plotroot();
+    var scalable = root.hasClass("xscalable") || root.hasClass("yscalable");
+    var zoomable = !event.altKey && !event.ctrlKey && event.shiftKey && scalable;
+    var panable = !event.altKey && !event.ctrlKey && !event.shiftKey && scalable;
+    var drag_action = zoomable ? zoom_action :
+                      panable  ? pan_action :
+                                 undefined;
+    root.data("drag_action", drag_action);
+    if (drag_action) {
+        var cancel_drag_action = function(event) {
+            if (event.which == 27) { // esc key
+                drag_action.cancel(root);
+                root.data("drag_action", undefined);
+            }
+        };
+        window.addEventListener("keyup", cancel_drag_action);
+        root.data("cancel_drag_action", cancel_drag_action);
+        drag_action.start(root, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.update(root, dx, dy, x, y, event);
+    }
+};
+
+
+Gadfly.guide_background_drag_onend = function(event) {
+    var root = this.plotroot();
+    window.removeEventListener("keyup", root.data("cancel_drag_action"));
+    root.data("cancel_drag_action", undefined);
+    var drag_action = root.data("drag_action");
+    if (drag_action) {
+        drag_action.end(root, event);
+    }
+    root.data("drag_action", undefined);
+};
+
+
+Gadfly.guide_background_scroll = function(event) {
+    if (event.shiftKey) {
+        increase_zoom_by_position(this.plotroot(), 0.001 * event.wheelDelta);
+        event.preventDefault();
+    }
+};
+
+
+Gadfly.zoomslider_button_mouseover = function(event) {
+    this.select(".button_logo")
+         .animate({fill: this.data("mouseover_color")}, 100);
+};
+
+
+Gadfly.zoomslider_button_mouseout = function(event) {
+     this.select(".button_logo")
+         .animate({fill: this.data("mouseout_color")}, 100);
+};
+
+
+Gadfly.zoomslider_zoomout_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), -0.1, true);
+};
+
+
+Gadfly.zoomslider_zoomin_click = function(event) {
+    increase_zoom_by_position(this.plotroot(), 0.1, true);
+};
+
+
+Gadfly.zoomslider_track_click = function(event) {
+    // TODO
+};
+
+
+// Map slider position x to scale y using the function y = a*exp(b*x)+c.
+// The constants a, b, and c are solved using the constraint that the function
+// should go through the points (0; min_scale), (0.5; 1), and (1; max_scale).
+var scale_from_slider_position = function(position, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return a * Math.exp(b * position) + c;
+}
+
+// inverse of scale_from_slider_position
+var slider_position_from_scale = function(scale, min_scale, max_scale) {
+    var a = (1 - 2 * min_scale + min_scale * min_scale) / (min_scale + max_scale - 2),
+        b = 2 * Math.log((max_scale - 1) / (1 - min_scale)),
+        c = (min_scale * max_scale - 1) / (min_scale + max_scale - 2);
+    return 1 / b * Math.log((scale - c) / a);
+}
+
+var increase_zoom_by_position = function(root, delta_position, animate) {
+    var scale = root.data("scale"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale");
+    var position = slider_position_from_scale(scale, min_scale, max_scale);
+    position += delta_position;
+    scale = scale_from_slider_position(position, min_scale, max_scale);
+    set_zoom(root, scale, animate);
+}
+
+var set_zoom = function(root, scale, animate) {
+    var min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("scale");
+    var new_scale = Math.max(min_scale, Math.min(scale, max_scale));
+    if (animate) {
+        Snap.animate(
+            old_scale,
+            new_scale,
+            function (new_scale) {
+                update_plot_scale(root, new_scale);
+            },
+            200);
+    } else {
+        update_plot_scale(root, new_scale);
+    }
+}
+
+
+var update_plot_scale = function(root, new_scale) {
+    var trans = scale_centered_translation(root, new_scale);
+    set_plot_pan_zoom(root, trans.x, trans.y, new_scale);
+
+    root.selectAll(".zoomslider_thumb")
+        .forEach(function (element, i) {
+            var min_pos = element.data("min_pos"),
+                max_pos = element.data("max_pos"),
+                min_scale = root.data("min_scale"),
+                max_scale = root.data("max_scale");
+            var xmid = (min_pos + max_pos) / 2;
+            var xpos = slider_position_from_scale(new_scale, min_scale, max_scale);
+            element.transform(new Snap.Matrix().translate(
+                Math.max(min_pos, Math.min(
+                         max_pos, min_pos + (max_pos - min_pos) * xpos)) - xmid, 0));
+    });
+};
+
+
+Gadfly.zoomslider_thumb_dragmove = function(dx, dy, x, y, event) {
+    var root = this.plotroot();
+    var min_pos = this.data("min_pos"),
+        max_pos = this.data("max_pos"),
+        min_scale = root.data("min_scale"),
+        max_scale = root.data("max_scale"),
+        old_scale = root.data("old_scale");
+
+    var px_per_mm = root.data("px_per_mm");
+    dx /= px_per_mm;
+    dy /= px_per_mm;
+
+    var xmid = (min_pos + max_pos) / 2;
+    var xpos = slider_position_from_scale(old_scale, min_scale, max_scale) +
+                   dx / (max_pos - min_pos);
+
+    // compute the new scale
+    var new_scale = scale_from_slider_position(xpos, min_scale, max_scale);
+    new_scale = Math.min(max_scale, Math.max(min_scale, new_scale));
+
+    update_plot_scale(root, new_scale);
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragstart = function(x, y, event) {
+    this.animate({fill: this.data("mouseover_color")}, 100);
+    var root = this.plotroot();
+
+    // keep track of what the scale was when we started dragging
+    root.data("old_scale", root.data("scale"));
+    event.stopPropagation();
+};
+
+
+Gadfly.zoomslider_thumb_dragend = function(event) {
+    this.animate({fill: this.data("mouseout_color")}, 100);
+    event.stopPropagation();
+};
+
+
+var toggle_color_class = function(root, color_class, ison) {
+    var guides = root.selectAll(".guide." + color_class + ",.guide ." + color_class);
+    var geoms = root.selectAll(".geometry." + color_class + ",.geometry ." + color_class);
+    if (ison) {
+        guides.animate({opacity: 0.5}, 250);
+        geoms.animate({opacity: 0.0}, 250);
+    } else {
+        guides.animate({opacity: 1.0}, 250);
+        geoms.animate({opacity: 1.0}, 250);
+    }
+};
+
+
+Gadfly.colorkey_swatch_click = function(event) {
+    var root = this.plotroot();
+    var color_class = this.data("color_class");
+
+    if (event.shiftKey) {
+        root.selectAll(".colorkey text")
+            .forEach(function (element) {
+                var other_color_class = element.data("color_class");
+                if (other_color_class != color_class) {
+                    toggle_color_class(root, other_color_class,
+                                       element.attr("opacity") == 1.0);
+                }
+            });
+    } else {
+        toggle_color_class(root, color_class, this.attr("opacity") == 1.0);
+    }
+};
+
+
+return Gadfly;
+
+}));
+
+
+//@ sourceURL=gadfly.js
+
+(function (glob, factory) {
+    // AMD support
+      if (typeof require === "function" && typeof define === "function" && define.amd) {
+        require(["Snap.svg", "Gadfly"], function (Snap, Gadfly) {
+            factory(Snap, Gadfly);
+        });
+      } else {
+          factory(glob.Snap, glob.Gadfly);
+      }
+})(window, function (Snap, Gadfly) {
+    var fig = Snap("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f");
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-4")
+   .drag(function() {}, function() {}, function() {});
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-8")
+   .init_gadfly();
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-11")
+   .plotroot().data("unfocused_ygrid_color", "#D0D0E0")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-11")
+   .plotroot().data("focused_ygrid_color", "#A0A0A0")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-12")
+   .plotroot().data("unfocused_xgrid_color", "#D0D0E0")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-12")
+   .plotroot().data("focused_xgrid_color", "#A0A0A0")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-18")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-18")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-18")
+   .click(Gadfly.zoomslider_zoomin_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-20")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-20")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-20")
+   .click(Gadfly.zoomslider_track_click);
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21")
+   .data("max_pos", 96.01)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21")
+   .data("min_pos", 79.01)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-21")
+   .drag(Gadfly.zoomslider_thumb_dragmove,
+     Gadfly.zoomslider_thumb_dragstart,
+     Gadfly.zoomslider_thumb_dragend)
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-22")
+   .data("mouseover_color", "#CD5C5C")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-22")
+   .data("mouseout_color", "#6A6A6A")
+;
+fig.select("#fig-fe4c9d5103ad4b66bf1dfb9bc798bf6f-element-22")
+   .click(Gadfly.zoomslider_zoomout_click)
+.mouseenter(Gadfly.zoomslider_button_mouseover)
+.mouseleave(Gadfly.zoomslider_button_mouseout)
+;
+    });
+]]> </script>
+</svg>
+
+
