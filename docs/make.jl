@@ -7,8 +7,7 @@ makedocs(
     modules = [StateSpace],
     pages = ["Documentation" => "index.md",
              "Interface" => "interface.md",
-             "Examples" => [joinpath("examples",x) for x in readdir("docs/src/examples") if endswith(x, "md")]
-            ]
+             "Examples" => "examples.md" ]
 )
 
 # Documenter can also automatically deploy documentation to gh-pages.
