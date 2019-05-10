@@ -1,7 +1,9 @@
 StateSpace.jl
 =============
 
-[![Build Status](https://travis-ci.org/ElOceanografo/StateSpace.jl.svg?branch=master)](https://travis-ci.org/ElOceanografo/StateSpace.jl)
+[![Build Status](https://travis-ci.org/npsmc/StateSpace.jl.svg?branch=master)](https://travis-ci.org/npsmc/StateSpace.jl)
+[![](https://img.shields.io/badge/docs-dev-blue.svg)](https://npsmc.github.io/StateSpace.jl/dev)
+
 
 A Julia package for state space modeling
 ----------------------------------------
