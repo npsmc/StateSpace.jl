@@ -9,10 +9,10 @@ abstract type NonlinearKalmanFilter <: AbstractKalmanFilter end
 
 # LinearGaussianSSM     LinearKalmanFilter
 #
-# NonlinearGaussianSSM    NonlinearKalmanFilter
-#                         NonlinearFilter
+# NonlinearGaussianSSM  NonlinearKalmanFilter
+#                       NonlinearFilter
 #
-# NonlinearSSM             NonlinearFilter
+# NonlinearSSM          NonlinearFilter
 
 ######################################################################
 # Kalman filter
@@ -33,11 +33,9 @@ function update_kalman(pred, y, G, W)
 
     @show K
     mean_update = mean(pred) + K * innovation
-    cov_update = (Matrix(I, size(cov(pred))) - K * G) * cov(pred)
+    cov_update  = Symmetric((Matrix(I, size(cov(pred))) - K * G) * cov(pred))
 
-    @assert issymmetric(cov_update)
-
-    return MvNormal(mean_update, cov_update)
+    MvNormal(mean_update, cov_update)
 
 end
 
@@ -47,7 +45,7 @@ function update( m      :: LinearGaussianSSM,
                  filter :: KalmanFilter, 
                  t      :: Real = 0.0)
 
-    return update_kalman(pred, y, m.G(t), m.W(t))
+    update_kalman(pred, y, m.G(t), m.W(t))
 
 end
 
@@ -56,7 +54,7 @@ function update( m    :: LinearGaussianSSM,
                  y    :: Vector, 
                  t    :: Real = 0.0)
 
-    return update(m, pred, y, KalmanFilter(), t)
+    update(m, pred, y, KalmanFilter(), t)
 
 end
 
@@ -65,7 +63,7 @@ function update!( m      :: LinearGaussianSSM,
                   y      :: Vector;
                   u      :: Vector = zeros(m.nu), 
                   filter :: KalmanFilter=KalmanFilter(), 
-                  t      :: Real=0.0)
+                  t      :: Float64=0.0)
 
     x_pred = predict(m, fs.state[end], u=u, t=t)
     x_filt = update_kalman(x_pred, y, m.G(t), m.W(t))
@@ -88,7 +86,7 @@ function update( m      :: NonlinearGaussianSSM,
                  pred   :: AbstractMvNormal, 
                  y      :: Vector,
                  filter :: NonlinearKalmanFilter=EKF(), 
-                 t      :: Real=0.0)
+                 t      :: Float64=0.0)
 
     G = observation_matrix(m, pred, t)
     W = m.W(t)
@@ -101,7 +99,7 @@ function update!( m      :: NonlinearGaussianSSM,
                   y      :: Vector;
                   u      :: Vector = zeros(m.nu), 
                   filter :: NonlinearKalmanFilter=EKF(), 
-                  t      :: Real = 0.0)
+                  t      :: Float64 = 0.0)
 
     x_pred = predict(m, fs.state[end], u=u, t=t-1)
     G = observation_matrix(m, x_pred, t)
@@ -119,9 +117,9 @@ end
 
 struct UnscentedKalmanFilter <: NonlinearKalmanFilter
 
-    α :: Real
-    β :: Real
-    κ :: Real
+    α :: Float64
+    β :: Float64
+    κ :: Float64
 
     function UnscentedKalmanFilter()
 
@@ -321,9 +319,9 @@ function update( m        :: AbstractGaussianSSM,
         innovation_cov = G * P * G' + W
         K = P * G' * inv(innovation_cov)
         ensemble_updated[:, i] = ensemble[:, i] + K * innovation
-        cov_update = (Matrix(I,size(P)) - K * G) * P
+        cov_update = Symmetric((Matrix(I,size(P)) - K * G) * P)
     end
-    return ensemble_updated
+    ensemble_updated
 end
 
 import Base.filter
@@ -350,7 +348,7 @@ function filter( m      :: AbstractGaussianSSM,
         end
         loglik += logpdf(x_pred, mean(x_filtered[i]))
     end
-    return FilteredState(y, x_filtered, loglik, false)
+    FilteredState(y, x_filtered, loglik, false)
 end
 
 function filter( m              :: AbstractGaussianSSM, 
@@ -380,7 +378,7 @@ function filter( m              :: AbstractGaussianSSM,
         for j in 1:kf.nparticles
             loglik += logpdf(x_filtered[1], ensemble[:, j])
         end
-        if ! any(isnan(y[:, 1]))
+        if !any(isnan(y[:, 1]))
             for j in 1:kf.nparticles
                 loglik += logpdf(observe(m, x_filtered[1], times[1]), y[:,1])
             end
@@ -397,6 +395,6 @@ function filter( m              :: AbstractGaussianSSM,
                 end
             end
         end
-        return FilteredState(y, x_filtered, u, times, loglik, false)
+        FilteredState(y, x_filtered, u, times, loglik, false)
     end
 end
