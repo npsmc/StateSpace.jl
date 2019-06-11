@@ -48,7 +48,7 @@ function _filter(m      :: AbstractGaussianSSM,
                  times  :: Vector{T}, 
                  filter :: AbstractKalmanFilter) where T
 
-    x_filtered = Array(AbstractMvNormal, size(y, 2))
+    x_filtered = Array{AbstractMvNormal}(size(y, 2))
     loglik = 0.0
     x_pred = predict(m, x0, u=u[:, 1], t=times[1])
     x_filtered[1] = update(m, x_pred, y[:, 1], filter, 1)
